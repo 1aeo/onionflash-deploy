@@ -1,4 +1,5 @@
 import io
+from contextlib import redirect_stdout
 import json
 import os
 from pathlib import Path
@@ -187,6 +188,15 @@ output_dir = "build/public"
             (public / "index.html").write_text("custom-sensitive-value")
             with self.assertRaisesRegex(ValueError, "Credential"):
                 self.publisher.validate(public)
+
+    def test_status_remains_readable_during_a_running_job(self):
+        publish.atomic_json(self.publisher.state / "publication.json", {"version_id": "observed-version", "manifest": {"private": "omit"}})
+        output = io.StringIO()
+        with publish.lock(self.publisher.state / "run.lock"), patch("publish.Publisher", return_value=self.publisher), patch("sys.argv", ["publish.py", "status"]), redirect_stdout(output):
+            self.assertEqual(publish.main(), 0)
+        self.assertIn('"running": true', output.getvalue())
+        self.assertIn("observed-version", output.getvalue())
+        self.assertNotIn('"manifest"', output.getvalue())
 
 
 if __name__ == "__main__":

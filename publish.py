@@ -540,15 +540,24 @@ def main():
         handler = RotatingFileHandler(publisher.state / "run.log", maxBytes=1048576, backupCount=3)
         handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
         LOG.addHandler(handler)
+        if args.command == "status":
+            running = False
+            try:
+                with lock(publisher.state / "run.lock", nonblocking=True):
+                    pass
+            except BlockingIOError:
+                running = True
+            print(json.dumps({"running": running}))
+            # Receipts are atomically replaced, so inspection need not block or
+            # suppress status while the collector holds the exclusive job lock.
+            for filename in ["publication.json", "publication-hold.json", "backup.json", "last-run.json"]:
+                path = publisher.state / filename
+                if path.exists():
+                    data = json.loads(path.read_text())
+                    data.pop("manifest", None)
+                    print(json.dumps({filename: data}, indent=2))
+            return 0
         with lock(publisher.state / "run.lock", nonblocking=True):
-            if args.command == "status":
-                for filename in ["publication.json", "publication-hold.json", "backup.json", "last-run.json"]:
-                    path = publisher.state / filename
-                    if path.exists():
-                        data = json.loads(path.read_text())
-                        data.pop("manifest", None)
-                        print(json.dumps({filename: data}, indent=2))
-                return 0
             if args.command in {"check", "run"}:
                 command = "check" if args.command == "check" else "run"
                 subprocess.run([str(publisher.path(publisher.cfg["app_python"])), "-m", "onionflash", command, "--config", str(publisher.app_config)], check=True)
