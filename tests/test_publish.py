@@ -2,11 +2,14 @@ import io
 from contextlib import redirect_stdout
 import json
 import os
+import socket
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
 from urllib.error import HTTPError, URLError
+import httpx
+from onionflash.transport import HttpClient
 
 import publish
 
@@ -31,6 +34,15 @@ database = "state/news.sqlite3"
 output_dir = "build/public"
 ''')
         self.publisher = publish.Publisher(self.directory / "deployment.toml")
+        self.addCleanup(self.publisher.close)
+
+    def use_http(self, handler):
+        waits = []
+        resolver = lambda host, port, *args: [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("8.8.8.8", port))]
+        self.publisher._http_client = HttpClient(self.publisher.http_settings(),
+            transport=httpx.MockTransport(handler), resolver=resolver, sleep=waits.append,
+            same_origin_redirects=True)
+        return waits
 
     def public_tree(self):
         directory = self.directory / "public"
@@ -92,29 +104,46 @@ output_dir = "build/public"
     def test_retry_is_exponential_and_bounded(self):
         self.publisher.net.update(attempts=3, backoff_seconds=2, backoff_cap_seconds=3, jitter_seconds=0)
         attempts = []
-        def fail():
+        def fail(request):
             attempts.append(1)
-            raise URLError("connection unavailable")
-        with patch("publish.time.sleep") as sleep:
-            with self.assertRaises(RuntimeError):
-                self.publisher.retry(fail)
+            raise httpx.ConnectError("connection unavailable", request=request)
+        waits = self.use_http(fail)
+        with self.assertRaises(URLError):
+            self.publisher.request("https://example.com")
         self.assertEqual(len(attempts), 3)
-        self.assertEqual([x.args[0] for x in sleep.call_args_list], [2, 3])
+        self.assertEqual(waits, [2, 3])
 
     def test_permanent_errors_are_not_retried(self):
-        error = HTTPError("https://example.com", 401, "unauthorized", {}, io.BytesIO())
-        with patch("publish.time.sleep") as sleep:
-            with self.assertRaises(HTTPError):
-                self.publisher.retry(lambda: (_ for _ in ()).throw(error))
-        sleep.assert_not_called()
+        waits = self.use_http(lambda request: httpx.Response(401))
+        with self.assertRaises(HTTPError):
+            self.publisher.request("https://example.com")
+        self.assertEqual(waits, [])
 
     def test_retry_after_is_capped(self):
         self.publisher.net.update(attempts=2, backoff_cap_seconds=3, jitter_seconds=0)
-        error = HTTPError("https://example.com", 429, "rate limited", {"Retry-After": "999999"}, io.BytesIO())
-        with patch("publish.time.sleep") as sleep:
-            with self.assertRaises(RuntimeError):
-                self.publisher.retry(lambda: (_ for _ in ()).throw(error))
-        sleep.assert_called_once_with(3)
+        waits = self.use_http(lambda request: httpx.Response(429, headers={"Retry-After": "999999"}))
+        with self.assertRaises(HTTPError):
+            self.publisher.request("https://example.com")
+        self.assertEqual(waits, [3])
+
+    def test_shared_transport_keeps_api_auth_on_same_origin_only(self):
+        calls = []
+        def handler(request):
+            calls.append(request)
+            return httpx.Response(302, headers={"Location": "https://other.example/"})
+        self.use_http(handler)
+        with self.assertRaisesRegex(ValueError, "cross-origin"):
+            self.publisher.request("https://example.com/", token="test-credential")
+        self.assertEqual(len(calls), 1)
+
+    def test_shared_transport_supports_route_cleanup_delete(self):
+        calls = []
+        def handler(request):
+            calls.append(request)
+            return httpx.Response(200, json={"success": True, "result": None})
+        self.use_http(handler)
+        self.assertIsNone(self.publisher.api("/test-route", method="DELETE"))
+        self.assertEqual(calls[0].method, "DELETE")
 
     def test_credentials_file_is_literal_and_private(self):
         path = self.directory / "literal.env"

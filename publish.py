@@ -5,28 +5,27 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
+import errno
 import fcntl
-from email.utils import parsedate_to_datetime
 import hashlib
 import json
 import logging
 from logging.handlers import RotatingFileHandler
+import math
 import os
 from pathlib import Path
-import random
 import re
 import shlex
 import shutil
-import sqlite3
 import subprocess
 import sys
 import tarfile
 import tempfile
 import time
 import tomllib
+import uuid
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlsplit, urljoin
-from urllib.request import Request, build_opener, HTTPRedirectHandler
+from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parent
 LOG = logging.getLogger("onionflash.deploy")
@@ -44,13 +43,37 @@ def public_path_allowed(relative):
 def atomic_json(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    temporary = path.with_name(path.name + ".tmp")
-    with open(temporary, "w", encoding="utf-8") as stream:
-        json.dump(value, stream, indent=2, sort_keys=True)
-        stream.write("\n")
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(temporary, path)
+    fd, temporary = tempfile.mkstemp(prefix="." + path.name + "-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, indent=2, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        sync_directory(path.parent)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def sync_directory(path):
+    """Persist directory entries where the platform supports directory fsync."""
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        if exc.errno not in {errno.EINVAL, errno.ENOTSUP, errno.EBADF}:
+            raise
+
+
+def read_json(path, default=None):
+    try:
+        return json.loads(Path(path).read_text())
+    except FileNotFoundError:
+        return default
 
 
 def load_env(path):
@@ -75,6 +98,10 @@ def load_env(path):
         os.environ.setdefault(key, tokens[0] if tokens else "")
 
 
+class BusyLock(BlockingIOError):
+    """Only lock acquisition failures, not I/O failures inside a locked job."""
+
+
 @contextmanager
 def lock(path, shared=False, nonblocking=False):
     path = Path(path)
@@ -83,18 +110,27 @@ def lock(path, shared=False, nonblocking=False):
         flags = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
         if nonblocking:
             flags |= fcntl.LOCK_NB
-        fcntl.flock(stream, flags)
+        try:
+            fcntl.flock(stream, flags)
+        except BlockingIOError:
+            raise BusyLock("Another Onion Flash deployment is running") from None
         try:
             yield
         finally:
             fcntl.flock(stream, fcntl.LOCK_UN)
 
 
-class SameOriginRedirect(HTTPRedirectHandler):
-    def redirect_request(self, request, fp, code, msg, headers, newurl):
-        if urlsplit(newurl).netloc != urlsplit(request.full_url).netloc or urlsplit(newurl).scheme != "https":
-            raise ValueError("Cross-origin or insecure redirect refused")
-        return super().redirect_request(request, fp, code, msg, headers, newurl)
+@contextmanager
+def job_log(path):
+    """Only use inside the job lock, including handler setup and teardown."""
+    handler = RotatingFileHandler(path, maxBytes=1048576, backupCount=3)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    LOG.addHandler(handler)
+    try:
+        yield
+    finally:
+        LOG.removeHandler(handler)
+        handler.close()
 
 
 class Publisher:
@@ -123,7 +159,8 @@ class Publisher:
             raise ValueError("Invalid Worker name")
         self.net = self.cfg["network"]
         for key in ["attempts", "timeout_seconds", "backoff_seconds", "backoff_cap_seconds", "jitter_seconds", "max_response_bytes"]:
-            if not isinstance(self.net[key], (int, float)) or self.net[key] < 0:
+            if (isinstance(self.net[key], bool) or not isinstance(self.net[key], (int, float)) or
+                    not math.isfinite(self.net[key]) or self.net[key] < 0):
                 raise ValueError("Invalid network parameter: " + key)
         if (type(self.net["attempts"]) is not int or not 1 <= self.net["attempts"] <= 10 or
                 self.net["timeout_seconds"] <= 0 or type(self.net["max_response_bytes"]) is not int or
@@ -136,7 +173,7 @@ class Publisher:
         self.api_base = self.cf["api_base_url"].rstrip("/")
         if urlsplit(self.api_base).scheme != "https":
             raise ValueError("Cloudflare API endpoint must use HTTPS")
-        self.opener = build_opener(SameOriginRedirect())
+        self._http_client = None
         self.node = ROOT / "node_modules/node/bin/node"
         self.wrangler = ROOT / "node_modules/wrangler/bin/wrangler.js"
 
@@ -164,45 +201,42 @@ class Publisher:
             names.update(v for k, v in section.items() if k in {"api_token_env", "zone_token_env", "access_key_env", "secret_key_env", "api_key_env"})
         return [os.environ[name] for name in names if len(os.environ.get(name, "")) >= 8]
 
-    def delay(self, attempt, retry_after=""):
-        delay = self.net["backoff_seconds"] * 2 ** attempt
-        if retry_after:
-            try:
-                advised = float(retry_after) if retry_after.isdigit() else (parsedate_to_datetime(retry_after) - datetime.now(timezone.utc)).total_seconds()
-                delay = max(delay, advised)
-            except (TypeError, ValueError, OverflowError):
-                pass
-        delay += random.uniform(0, self.net["jitter_seconds"])
-        time.sleep(min(self.net["backoff_cap_seconds"], max(0, delay)))
+    def http_settings(self):
+        return {"timeout_seconds": self.net["timeout_seconds"],
+                "connect_timeout_seconds": self.net["timeout_seconds"],
+                "total_timeout_seconds": self.net["timeout_seconds"],
+                "retry_attempts": self.net["attempts"], "requests_per_minute": 0,
+                "backoff_base_seconds": self.net["backoff_seconds"],
+                "backoff_cap_seconds": self.net["backoff_cap_seconds"],
+                "backoff_jitter_seconds": self.net["jitter_seconds"],
+                "max_retry_after_seconds": self.net["backoff_cap_seconds"],
+                "max_response_bytes": self.net["max_response_bytes"], "max_redirects": 10,
+                "user_agent": "OnionFlashPublisher/0.1"}
 
-    def retry(self, function):
-        for attempt in range(int(self.net["attempts"])):
-            try:
-                return function()
-            except HTTPError as exc:
-                if exc.code not in {408, 425, 429, 500, 502, 503, 504}:
-                    raise
-                retry_after = exc.headers.get("Retry-After", "")
-            except (URLError, TimeoutError, ConnectionError):
-                retry_after = ""
-            if attempt + 1 == self.net["attempts"]:
-                raise RuntimeError("Dependency unavailable after bounded retries")
-            self.delay(attempt, retry_after)
+    def delay(self, attempt, retry_after=""):
+        from onionflash.transport import retry_delay
+        time.sleep(retry_delay(attempt, self.http_settings(), retry_after))
 
     def request(self, url, method="GET", data=None, token=None):
-        headers = {"User-Agent": "OnionFlashPublisher/0.1", "Accept-Encoding": "identity"}
+        # Lazy import keeps install.py usable before the app is installed.
+        from onionflash.transport import FetchError, HttpClient
+        if self._http_client is None:
+            self._http_client = HttpClient(self.http_settings(), same_origin_redirects=True)
+        headers = {"Accept-Encoding": "identity"}
         if token:
             headers["Authorization"] = "Bearer " + token
-        if data is not None:
-            data = json.dumps(data).encode()
-            headers["Content-Type"] = "application/json"
-        def perform():
-            with self.opener.open(Request(url, headers=headers, data=data, method=method), timeout=self.net["timeout_seconds"]) as response:
-                body = response.read(int(self.net["max_response_bytes"]) + 1)
-                if len(body) > self.net["max_response_bytes"]:
-                    raise ValueError("Response exceeds byte limit")
-                return body
-        return self.retry(perform)
+        try:
+            return self._http_client.request(method, url, headers=headers, json_body=data).body
+        except FetchError as exc:
+            if exc.status:
+                raise HTTPError(url, exc.status, str(exc), {}, None) from None
+            if exc.retryable:
+                raise URLError(str(exc)) from None
+            raise ValueError(str(exc)) from None
+
+    def close(self):
+        if self._http_client is not None:
+            self._http_client.close()
 
     def api(self, suffix, method="GET", data=None, zone=False):
         token = self.secret(self.cf.get("zone_token_env", "CLOUDFLARE_ZONE_TOKEN")) if zone else self.token
@@ -333,7 +367,112 @@ class Publisher:
             if self.current_version() != version:
                 raise
 
+    def control_config(self):
+        target = self.state / "wrangler-control.json"
+        atomic_json(target, {"name": self.cf["worker_name"], "account_id": self.account,
+                             "compatibility_date": self.cf["compatibility_date"]})
+        return target
+
+    def verify_receipt(self, receipt):
+        self.verify(receipt["origin_url"], receipt["manifest"])
+        if (self.state / "routes.json").exists():
+            self.verify(self.base_url, receipt["manifest"])
+
+    def commit_receipt(self, receipt):
+        version = receipt["version_id"]
+        if not re.fullmatch(r"[0-9a-f-]{36}", version):
+            raise ValueError("Invalid receipt version identity")
+        # A current pointer must never reference an unarchived publication.
+        atomic_json(self.state / "receipts" / (version + ".json"), receipt)
+        atomic_json(self.state / "publication.json", receipt)
+
+    def finish_transition(self, journal, outcome):
+        journal = {**journal, "outcome": outcome, "finished_at": datetime.now(timezone.utc).isoformat()}
+        atomic_json(self.state / "last-transition.json", journal)
+        (self.state / "transition.json").unlink(missing_ok=True)
+        sync_directory(self.state)
+
+    def complete_transition(self, journal):
+        receipt = dict(journal["target"])
+        if journal["kind"] == "publish":
+            archived = read_json(self.state / "receipts" / (receipt["version_id"] + ".json"), {})
+            receipt["published_at"] = archived.get("published_at", datetime.now(timezone.utc).isoformat())
+        self.commit_receipt(receipt)
+        if journal["kind"] == "rollback":
+            atomic_json(self.state / "rollback.json", {"version_id": receipt["version_id"], "timestamp": time.time()})
+            atomic_json(self.state / "publication-hold.json", {"reason": "rollback completed", "to": receipt["version_id"], "timestamp": time.time()})
+        self.finish_transition({**journal, "target": receipt}, "committed")
+        return receipt
+
+    def restore_transition(self, journal):
+        actual = self.current_version()
+        before = journal["before_version"]
+        if actual not in {before, journal["target"]["version_id"]}:
+            raise ValueError("Unknown external version; transition retained for investigation")
+        if actual != before:
+            self.activate(before, self.control_config())
+        receipt = journal.get("before_receipt")
+        if receipt:
+            self.verify_receipt(receipt)
+            self.commit_receipt(receipt)
+        else:
+            (self.state / "publication.json").unlink(missing_ok=True)
+        self.finish_transition(journal, "restored-before")
+        return receipt
+
+    def transition(self, target, before_version, before_receipt, kind="publish"):
+        if read_json(self.state / "transition.json"):
+            raise ValueError("An unfinished transition exists; run reconcile first")
+        if self.current_version() != before_version:
+            raise ValueError("Active Worker version changed before activation")
+        journal = {"kind": kind, "before_version": before_version,
+                   "before_receipt": before_receipt, "target": target,
+                   "started_at": datetime.now(timezone.utc).isoformat()}
+        atomic_json(self.state / "transition.json", journal)
+        # Interruptions, including process termination, leave this journal for
+        # reconciliation. All metadata is gathered before the external mutation.
+        try:
+            self.activate(target["version_id"], self.control_config())
+            self.verify_receipt(target)
+            return self.complete_transition(journal)
+        except Exception:
+            atomic_json(self.state / "publication-hold.json", {"reason": "version transition failed", "timestamp": time.time()})
+            try:
+                self.restore_transition(journal)
+            except Exception as recovery_error:
+                raise RuntimeError("Transition uncertain; run reconcile: " + self.clean_error(recovery_error)) from recovery_error
+            raise
+
+    def reconcile(self):
+        journal = read_json(self.state / "transition.json")
+        if not journal:
+            return None
+        actual = self.current_version()
+        if actual == journal["target"]["version_id"]:
+            try:
+                self.verify_receipt(journal["target"])
+            except Exception:
+                atomic_json(self.state / "publication-hold.json", {"reason": "reconciled target failed verification", "timestamp": time.time()})
+                return self.restore_transition(journal)
+            return self.complete_transition(journal)
+        if actual == journal["before_version"]:
+            return self.restore_transition(journal)
+        raise ValueError("Unknown external version; transition retained for investigation")
+
+    def rollback(self):
+        if read_json(self.state / "transition.json"):
+            raise ValueError("Run reconcile before requesting another rollback")
+        receipt = read_json(self.state / "publication.json", {})
+        previous = receipt.get("previous_version_id")
+        restored = read_json(self.state / "receipts" / (str(previous) + ".json"))
+        if not previous or not restored:
+            raise ValueError("No verified previous publication exists; use hold to pause publication")
+        atomic_json(self.state / "publication-hold.json", {"reason": "rollback requested", "from": receipt["version_id"], "to": previous, "timestamp": time.time()})
+        return self.transition(restored, receipt["version_id"], receipt, "rollback")
+
     def publish(self):
+        if not (self.state / "publication-hold.json").exists():
+            self.reconcile()
         if (self.state / "publication-hold.json").exists():
             raise ValueError("Publication is on hold; inspect status and use the explicit resume command")
         if not self.public.is_dir():
@@ -346,7 +485,7 @@ class Publisher:
             manifest = self.validate(stage)
             identity = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
             previous_path = self.state / "publication.json"
-            previous = json.loads(previous_path.read_text()) if previous_path.exists() else {}
+            previous = read_json(previous_path, {})
             if previous.get("content_hash") == identity:
                 if self.current_version() != previous.get("version_id"):
                     raise ValueError("Active Worker version differs from the publication receipt; reconcile before publishing")
@@ -370,26 +509,16 @@ class Publisher:
             if parsed.scheme != "https" or not parsed.hostname or not parsed.hostname.endswith(".workers.dev") or parsed.username:
                 raise ValueError("Invalid Cloudflare preview URL")
             self.verify(preview.rstrip("/") + self.base_path, manifest)
-            self.activate(version, config)
-            try:
-                # A workers.dev origin remains available before the hostname route is installed.
-                account_subdomain = self.api(f"/accounts/{self.account}/workers/subdomain")["subdomain"]
-                origin = f"https://{self.cf['worker_name']}.{account_subdomain}.workers.dev" + self.base_path
-                self.verify(origin, manifest)
-                if (self.state / "routes.json").exists():
-                    self.verify(self.base_url, manifest)
-            except Exception:
-                if old_version:
-                    self.activate(old_version, config)
-                raise
+            # Fetch fallible metadata before activation, never after changing production.
+            account_subdomain = self.api(f"/accounts/{self.account}/workers/subdomain")["subdomain"]
+            origin = f"https://{self.cf['worker_name']}.{account_subdomain}.workers.dev" + self.base_path
             receipt = {"version_id": version, "previous_version_id": old_version,
-                       "content_hash": identity, "published_at": datetime.now(timezone.utc).isoformat(),
-                       "manifest": manifest, "preview_url": preview, "origin_url": origin,
+                       "content_hash": identity, "manifest": manifest,
+                       "preview_url": preview, "origin_url": origin,
                        "app_version": self.app_version(),
                        "app_commit": self.git_commit(self.path(self.cfg.get("app_source", "../onionflash"))),
                        "deployment_commit": self.git_commit(ROOT)}
-            atomic_json(previous_path, receipt)
-            atomic_json(self.state / "receipts" / (version + ".json"), receipt)
+            receipt = self.transition(receipt, old_version, previous or None)
             LOG.info("Published version %s (%s files)", version, len(manifest))
             return receipt
 
@@ -435,19 +564,13 @@ class Publisher:
         atomic_json(self.state / "routes.json", {"patterns": patterns, "verified_at": datetime.now(timezone.utc).isoformat()})
         LOG.info("Verified public website and RSS at %s", self.base_url)
 
-    def backup(self):
+    def backup(self, force=False):
         cfg = self.cfg.get("spaces", {})
         if not cfg.get("enabled"):
             return
         for key in ["retention_days", "backup_interval_seconds"]:
             if type(cfg.get(key)) is not int or cfg[key] < 1:
                 raise ValueError("Spaces " + key + " must be a positive integer")
-        marker = self.state / "backup.json"
-        previous = json.loads(marker.read_text()) if marker.exists() else {}
-        if time.time() - previous.get("timestamp", 0) < cfg["backup_interval_seconds"]:
-            return
-        if not self.database.is_file():
-            raise ValueError("No application database to back up")
         if not re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", cfg["bucket"]):
             raise ValueError("Invalid Spaces bucket")
         prefix = cfg["prefix"]
@@ -455,8 +578,17 @@ class Publisher:
             raise ValueError("Backup prefix must be a project-specific name/backups/")
         if urlsplit(cfg["endpoint_url"]).scheme != "https":
             raise ValueError("Spaces endpoint must use HTTPS")
+        destination = {key: cfg[key] for key in ("endpoint_url", "bucket", "prefix")}
+        marker = self.state / "backup.json"
+        previous = read_json(marker, {})
+        age = time.time() - previous.get("timestamp", 0)
+        if not force and previous.get("destination") == destination and 0 <= age < cfg["backup_interval_seconds"]:
+            return
+        if not self.database.is_file():
+            raise ValueError("No application database to back up")
         import boto3
         from botocore.config import Config
+        from onionflash.store import backup_database
         client = boto3.client("s3", endpoint_url=cfg["endpoint_url"], region_name=cfg["region"],
                               aws_access_key_id=self.secret(cfg["access_key_env"]),
                               aws_secret_access_key=self.secret(cfg["secret_key_env"]),
@@ -472,39 +604,57 @@ class Publisher:
                 client.create_bucket(Bucket=cfg["bucket"], ACL="private")
         with tempfile.TemporaryDirectory(prefix="backup-", dir=self.state) as temporary:
             temporary = Path(temporary)
-            # SQLite's backup API gives a consistent WAL-aware copy; never copy the live DB file.
-            with sqlite3.connect(self.database.as_uri() + "?mode=ro", uri=True) as source:
-                with sqlite3.connect(temporary / "onionflash.sqlite3") as target:
-                    source.backup(target, pages=128)
-                    if target.execute("PRAGMA quick_check").fetchone()[0] != "ok":
-                        raise ValueError("Database backup validation failed")
             archive = temporary / "snapshot.tar.gz"
-            with tarfile.open(archive, "w:gz") as tar:
-                tar.add(temporary / "onionflash.sqlite3", arcname="onionflash.sqlite3")
-                for name in ["publication.json"]:
-                    path = self.state / name
-                    if path.is_file():
-                        tar.add(path, arcname=name)
-                with lock(str(self.database) + ".lock", shared=True):
-                    self.validate(self.public)
-                    tar.add(self.public, arcname="public", recursive=True)
+            with lock(str(self.database) + ".lock", shared=True):
+                # One lock keeps the consistent DB copy and generated files at
+                # the same application state; the shared helper closes handles.
+                backup_database(self.database, temporary / "onionflash.sqlite3")
+                public_error = None
+                try:
+                    manifest = self.validate(self.public) if self.public.is_dir() else {}
+                except Exception as exc:
+                    public_error = self.clean_error(exc)
+                    manifest = {}
+                    LOG.warning("Backing up SQLite without invalid generated files: %s", public_error)
+                publication = read_json(self.state / "publication.json", {})
+                atomic_json(temporary / "snapshot-manifest.json", {
+                    "captured_at": datetime.now(timezone.utc).isoformat(), "public_manifest": manifest, "public_error": public_error,
+                    "matches_publication": bool(publication) and manifest == publication.get("manifest")})
+                with tarfile.open(archive, "w:gz") as tar:
+                    tar.add(temporary / "onionflash.sqlite3", arcname="onionflash.sqlite3")
+                    tar.add(temporary / "snapshot-manifest.json", arcname="snapshot-manifest.json")
+                    if publication:
+                        atomic_json(temporary / "publication.json", publication)
+                        tar.add(temporary / "publication.json", arcname="publication.json")
+                    if manifest:
+                        tar.add(self.public, arcname="public", recursive=True)
             with archive.open("rb") as stream:
                 digest = hashlib.file_digest(stream, "sha256").hexdigest()
-            key = prefix + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + digest[:12] + ".tar.gz"
-            client.upload_file(str(archive), cfg["bucket"], key, ExtraArgs={"ACL": "private", "ContentType": "application/gzip", "Metadata": {"sha256": digest}})
-            head = client.head_object(Bucket=cfg["bucket"], Key=key)
-            if head.get("Metadata", {}).get("sha256") != digest or head["ContentLength"] != archive.stat().st_size:
-                raise ValueError("Backup upload verification failed")
-            acl = client.get_object_acl(Bucket=cfg["bucket"], Key=key)
-            if any(grant.get("Grantee", {}).get("Type") == "Group" for grant in acl.get("Grants", [])):
-                raise ValueError("Backup object unexpectedly has a public/group ACL")
-            atomic_json(marker, {"timestamp": time.time(), "key": key, "sha256": digest})
-            # Delete only old objects in this application's dedicated backup namespace.
+            # Unique names ensure failure cleanup cannot remove an older backup.
+            key = prefix + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + digest[:12] + "-" + uuid.uuid4().hex + ".tar.gz"
+            try:
+                client.upload_file(str(archive), cfg["bucket"], key, ExtraArgs={"ACL": "private", "ContentType": "application/gzip", "Metadata": {"sha256": digest}})
+                head = client.head_object(Bucket=cfg["bucket"], Key=key)
+                if head.get("Metadata", {}).get("sha256") != digest or head["ContentLength"] != archive.stat().st_size:
+                    raise ValueError("Backup upload verification failed")
+                acl = client.get_object_acl(Bucket=cfg["bucket"], Key=key)
+                if any(grant.get("Grantee", {}).get("Type") == "Group" for grant in acl.get("Grants", [])):
+                    raise ValueError("Backup object unexpectedly has a public/group ACL")
+            except Exception as failure:
+                try:
+                    client.delete_object(Bucket=cfg["bucket"], Key=key)
+                except Exception as cleanup:
+                    raise RuntimeError("Backup verification/upload failed and cleanup failed for " + key + ": " + self.clean_error(failure) + "; " + self.clean_error(cleanup)) from cleanup
+                raise
             cutoff = datetime.now(timezone.utc) - timedelta(days=cfg["retention_days"])
+            pattern = re.escape(prefix) + r"\d{8}T\d{6}Z-[0-9a-f]{12}(?:-[0-9a-f]{32})?\.tar\.gz"
             for page in client.get_paginator("list_objects_v2").paginate(Bucket=cfg["bucket"], Prefix=prefix):
                 for item in page.get("Contents", []):
-                    if item["Key"] != key and item["LastModified"] < cutoff and re.fullmatch(re.escape(prefix) + r"\d{8}T\d{6}Z-[0-9a-f]{12}\.tar\.gz", item["Key"]):
+                    if item["Key"] != key and item["LastModified"] < cutoff and re.fullmatch(pattern, item["Key"]):
                         client.delete_object(Bucket=cfg["bucket"], Key=item["Key"])
+            # Retention failures remain retryable; a verified newest object is
+            # retained even if cleanup of older objects fails.
+            atomic_json(marker, {"timestamp": time.time(), "key": key, "sha256": digest, "destination": destination})
             LOG.info("Verified private Spaces backup %s", key)
 
     def schedule(self):
@@ -526,93 +676,121 @@ class Publisher:
         LOG.info("Installed a %s-minute cron job", interval)
 
 
+    def application(self, command):
+        subprocess.run([str(self.path(self.cfg["app_python"])), "-m", "onionflash", command,
+                        "--config", str(self.app_config)], check=True)
+
+    def run_cycle(self):
+        result = {"phases": {}, "errors": [], "warnings": []}
+        def attempt(phase, action, required=True):
+            try:
+                action()
+                result["phases"][phase] = "ok"
+                return True
+            except Exception as exc:
+                message = phase + ": " + self.clean_error(exc)
+                result["phases"][phase] = "failed"
+                result["errors" if required else "warnings"].append(message)
+                LOG.error("%s", message)
+                return False
+        if attempt("collection", lambda: self.application("run")):
+            if (self.state / "publication-hold.json").exists():
+                if read_json(self.state / "transition.json"):
+                    message = "publication: unfinished transition; run reconcile before resuming"
+                    result["phases"]["publication"] = "unreconciled"
+                    result["errors"].append(message)
+                    LOG.error("%s", message)
+                else:
+                    result["phases"]["publication"] = "held"
+            else:
+                attempt("publication", self.publish)
+        else:
+            result["phases"]["publication"] = "skipped"
+        # Collection may have changed the DB even when publication cannot run.
+        attempt("backup", self.backup, required=self.cfg.get("spaces", {}).get("required", False))
+        result.update(ok=not result["errors"], degraded=bool(result["warnings"]))
+        return result
+
+    def status(self):
+        try:
+            with lock(self.state / "run.lock", shared=True, nonblocking=True):
+                running = False
+        except BusyLock:
+            running = True
+        print(json.dumps({"running": running}))
+        for name in ["publication.json", "publication-hold.json", "transition.json", "last-transition.json", "backup.json", "last-run.json"]:
+            data = read_json(self.state / name)
+            if data is not None:
+                data.pop("manifest", None)
+                if name in {"transition.json", "last-transition.json"}:
+                    data = {key: data.get(key) for key in ("kind", "outcome", "before_version", "started_at", "finished_at")} | {"target_version": data.get("target", {}).get("version_id")}
+                print(json.dumps({name: data}, indent=2))
+
+    def execute(self, command, force=False):
+        if command == "run":
+            return self.run_cycle()
+        if command == "check":
+            self.application(command)
+            if not self.node.is_file() or not self.wrangler.is_file():
+                raise ValueError("Run install.sh to install the publishing toolchain")
+            print("Application and deployment configuration valid")
+        elif command == "backup":
+            self.backup(force=force)
+        elif command == "hold":
+            atomic_json(self.state / "publication-hold.json", {"reason": "manual hold", "timestamp": time.time()})
+        elif command == "resume":
+            if read_json(self.state / "transition.json"):
+                raise ValueError("Run reconcile before releasing a publication hold")
+            (self.state / "publication-hold.json").unlink(missing_ok=True)
+            sync_directory(self.state)
+        else:
+            {"publish": self.publish, "routes": self.routes, "schedule": self.schedule,
+             "rollback": self.rollback, "reconcile": self.reconcile}[command]()
+        return {"ok": True}
+
+
 def main():
     os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default=str(ROOT / "deployment.toml"))
-    parser.add_argument("command", choices=["check", "run", "publish", "backup", "routes", "schedule", "status", "rollback", "hold", "resume"])
+    parser.add_argument("command", choices=["check", "run", "publish", "backup", "routes", "schedule", "status", "rollback", "hold", "resume", "reconcile"])
+    parser.add_argument("--force", action="store_true", help="Create a backup even when its interval has not elapsed")
     args = parser.parse_args()
+    if args.force and args.command != "backup":
+        parser.error("--force is supported only for backup")
     publisher = None
+    console = logging.StreamHandler()
+    LOG.setLevel(logging.INFO)
+    LOG.addHandler(console)
     try:
         publisher = Publisher(args.config)
-        LOG.setLevel(logging.INFO)
-        LOG.addHandler(logging.StreamHandler())
-        handler = RotatingFileHandler(publisher.state / "run.log", maxBytes=1048576, backupCount=3)
-        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-        LOG.addHandler(handler)
         if args.command == "status":
-            running = False
-            try:
-                with lock(publisher.state / "run.lock", nonblocking=True):
-                    pass
-            except BlockingIOError:
-                running = True
-            print(json.dumps({"running": running}))
-            # Receipts are atomically replaced, so inspection need not block or
-            # suppress status while the collector holds the exclusive job lock.
-            for filename in ["publication.json", "publication-hold.json", "backup.json", "last-run.json"]:
-                path = publisher.state / filename
-                if path.exists():
-                    data = json.loads(path.read_text())
-                    data.pop("manifest", None)
-                    print(json.dumps({filename: data}, indent=2))
+            publisher.status()
             return 0
-        with lock(publisher.state / "run.lock", nonblocking=True):
-            if args.command in {"check", "run"}:
-                command = "check" if args.command == "check" else "run"
-                subprocess.run([str(publisher.path(publisher.cfg["app_python"])), "-m", "onionflash", command, "--config", str(publisher.app_config)], check=True)
-                if args.command == "check":
-                    if not publisher.node.is_file() or not publisher.wrangler.is_file():
-                        raise ValueError("Run install.sh to install the publishing toolchain")
-                    print("Application and deployment configuration valid")
-                    return 0
-            if args.command in {"run", "publish"}:
-                publisher.publish()
-            if args.command in {"run", "backup"}:
-                try:
-                    publisher.backup()
-                except Exception as exc:
-                    if publisher.cfg.get("spaces", {}).get("required") or args.command == "backup":
-                        raise
-                    LOG.error("Backup deferred: %s", publisher.clean_error(exc))
-            if args.command == "routes":
-                publisher.routes()
-            if args.command == "schedule":
-                publisher.schedule()
-            if args.command == "rollback":
-                path = publisher.state / "publication.json"
-                receipt = json.loads(path.read_text())
-                previous = receipt.get("previous_version_id")
-                if not previous:
-                    raise ValueError("No previous version recorded")
-                old_receipt = publisher.state / "receipts" / (previous + ".json")
-                if not old_receipt.is_file():
-                    raise ValueError("No verified previous publication exists; use hold to pause publication")
-                restored = json.loads(old_receipt.read_text())
-                # Persist a hold before changing production; cron must not undo a rollback.
-                atomic_json(publisher.state / "publication-hold.json", {"reason": "manual rollback", "from": receipt["version_id"], "to": previous, "timestamp": time.time()})
-                config = publisher.make_config(publisher.public)
-                publisher.activate(previous, config)
-                publisher.verify(restored["origin_url"], restored["manifest"])
-                if (publisher.state / "routes.json").exists():
-                    publisher.verify(publisher.base_url, restored["manifest"])
-                atomic_json(publisher.state / "rollback.json", {"version_id": previous, "timestamp": time.time()})
-                atomic_json(path, restored)
-            if args.command == "hold":
-                atomic_json(publisher.state / "publication-hold.json", {"reason": "manual hold", "timestamp": time.time()})
-            if args.command == "resume":
-                (publisher.state / "publication-hold.json").unlink(missing_ok=True)
-            atomic_json(publisher.state / "last-run.json", {"ok": True, "command": args.command, "at": datetime.now(timezone.utc).isoformat()})
-        return 0
-    except BlockingIOError:
-        LOG.info("Another Onion Flash deployment is running; skipped")
-        return 0
+        with lock(publisher.state / "run.lock", nonblocking=True), job_log(publisher.state / "run.log"):
+            # Only the job-lock owner opens or rotates the shared log file.
+            try:
+                result = publisher.execute(args.command, force=args.force)
+            except Exception as exc:
+                message = publisher.clean_error(exc)
+                LOG.error("%s", message)
+                result = {"ok": False, "error": message}
+            atomic_json(publisher.state / "last-run.json", {**result, "command": args.command, "at": datetime.now(timezone.utc).isoformat()})
+            return 0 if result["ok"] else 1
+    except BusyLock:
+        if args.command == "run":
+            LOG.info("Another Onion Flash deployment is running; skipped")
+            return 0
+        LOG.error("Another Onion Flash deployment is running; command not performed; retry after completion")
+        return 75
     except Exception as exc:
-        message = publisher.clean_error(exc) if publisher else type(exc).__name__ + ": " + str(exc)
-        LOG.error("%s", message)
-        if publisher:
-            atomic_json(publisher.state / "last-run.json", {"ok": False, "command": args.command, "at": datetime.now(timezone.utc).isoformat(), "error": message})
+        LOG.error("%s", publisher.clean_error(exc) if publisher else type(exc).__name__ + ": " + str(exc))
         return 1
+    finally:
+        if publisher is not None:
+            publisher.close()
+        LOG.removeHandler(console)
+        console.close()
 
 
 if __name__ == "__main__":

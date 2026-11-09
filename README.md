@@ -71,6 +71,14 @@ post-activation check restores the preceding version. Repeated content is not
 uploaded again. An unexpectedly changed active version stops publication instead
 of overwriting someone else's deployment.
 
+Before activation, a private transition journal records the intended version and
+the preceding receipt. A process interruption therefore leaves enough evidence
+for `./deploy.sh reconcile` to verify and finalize the known target, or restore
+the preceding receipt when that version is active. Unknown external versions
+are never overwritten. Failed verification sets a publication hold; inspect the
+status and reconcile before resuming. Archived receipts are written before the
+current-publication pointer.
+
 The public package is an exact allowlist of generated pages, feeds and three
 assets. SQLite, source evidence, credentials, logs and release receipts stay
 outside it. Source timestamps and original first-publication times are preserved.
@@ -85,16 +93,28 @@ bucket; otherwise create it privately first. Bucket creation is checked before u
 
 ```sh
 ./deploy.sh backup
+./deploy.sh backup --force   # Verify a fresh backup immediately
 ```
 
-Backups use SQLite's consistent backup API, validate the database, and package it
-with the generated public files and publication receipt. Every object is uploaded
+Backups hold the application's database lock while creating a consistent SQLite
+copy and snapshotting the generated public files. The archive's
+`snapshot-manifest.json` records those files and whether they match the last
+publication receipt: a held or failed publication can leave a newer local build.
+If generated files fail validation, the archive records the error and omits those
+files while still preserving the validated SQLite backup.
+Every object is uploaded
 with a **private ACL**, checked for size/hash metadata, and checked for accidental
-public/group grants. Defaults are one backup per day and 30 days of retention.
+public/group grants. A failed upload/verification attempts to remove only its new,
+uniquely named object; a cleanup failure is reported explicitly. Defaults are one
+backup per day and 30 days of retention. The interval marker includes the endpoint,
+bucket and prefix, so changing destinations forces a new verified backup.
 Retention only touches this application's strictly named objects under its backup
 prefix; the newest upload is always retained. The SDK uses bounded retries and
 timeouts. A backup outage is recorded and retried later without blocking news
-publication unless `spaces.required = true`.
+publication unless `spaces.required = true`; optional failures appear as degraded
+warnings in job status. Scheduled backups are attempted even when collection or
+publication fails, or publication is deliberately held. Retention failures do not
+advance the interval marker and are retried on a later run.
 
 For recovery, hold publication, download a selected private archive using an S3
 client, compare its SHA-256 with object metadata, and extract it into a new private
@@ -109,6 +129,7 @@ database until recovery is verified. Credentials are never included in backups.
 ./deploy.sh publish    # Publish already generated output; no LLM call
 ./deploy.sh hold       # Pause publication while collection can continue
 ./deploy.sh rollback   # Restore and verify the preceding published version; hold
+./deploy.sh reconcile  # Recover a journaled interrupted version transition
 ./deploy.sh resume     # Explicitly release a publication hold
 ./deploy.sh status
 tail -n 40 state/run.log
@@ -120,7 +141,10 @@ the next scheduled run cannot undo a rollback. Correct the content/code before
 resuming. `state/receipts/` records version identities and exact file hashes.
 
 The installer and scheduled job share a lock. A concurrent scheduled run exits
-without overlapping work. Credentials and state are private; logs rotate at 1 MiB
+without overlapping work. A busy administrative command exits **75** with a clear
+"command not performed" message, so retry it after the running job finishes.
+`status` stays available during a run and does not open or rotate the shared log.
+Credentials and state are private; logs rotate at 1 MiB
 with three backups. The job never pulls new Git commits automatically. To update,
 hold publication, update the two checkouts to reviewed commits, run `install.sh`
 again, verify with `check`, and explicitly resume. Keep previous Git SHAs for code
@@ -140,7 +164,8 @@ node --test tests/test_worker.mjs
 ```
 
 The deployment tests exercise publication boundaries, credential handling,
-backoff, partial route failure, deployment drift, holds and backup retention.
+backoff, partial route failure, deployment drift, interrupted transitions,
+administrative lock contention, holds, backup privacy cleanup and retention.
 The application repository has separate transport, collection, analysis, database
 and renderer tests. Test fixtures are never production news.
 
