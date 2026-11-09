@@ -56,6 +56,8 @@ and read access. A separate zone token is supported. Existing routes owned by a
 different Worker are never replaced.
 
 At `https://example.com/onionflash/`, the assets are mounted at `/onionflash`.
+The publisher packages ordinary asset paths beneath that prefix, so it does not
+require Cloudflare's account-gated `assets.base_path` feature.
 The installed route is `example.com/onionflash*`, because Cloudflare route
 matching includes query strings. The tiny Worker redirects `/onionflash` to
 `/onionflash/` while preserving its query. It serves the application's subtree,

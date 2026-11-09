@@ -255,12 +255,27 @@ class Publisher:
                   "compatibility_date": self.cf["compatibility_date"], "workers_dev": True,
                   "preview_urls": True, "main": str(ROOT / ("bootstrap.mjs" if bootstrap else "worker.mjs"))}
         if not bootstrap:
-            config["assets"] = {"directory": str(directory), "binding": "ASSETS", "base_path": self.base_path,
+            config["assets"] = {"directory": str(directory), "binding": "ASSETS",
                                 "html_handling": "auto-trailing-slash", "not_found_handling": "none"}
             config["vars"] = {"BASE_PATH": self.base_path}
         target = self.state / ("wrangler-bootstrap.json" if bootstrap else "wrangler.json")
         atomic_json(target, config)
         return target
+
+    def prepare_assets(self, public):
+        """Mount files by their asset keys; no account-gated base_path feature."""
+        if not self.base_path:
+            return public
+        assets = public.parent / "cloudflare-assets"
+        if assets.exists():
+            raise ValueError("Asset staging directory must be new")
+        target = assets / self.base_path.lstrip("/")
+        target.parent.mkdir(parents=True)
+        shutil.copytree(public, target)
+        # Cloudflare reads _headers only from the asset root, never serve it as
+        # an ordinary file under the mounted application directory.
+        (target / "_headers").replace(assets / "_headers")
+        return assets
 
     def validate(self, directory):
         files, total = {}, 0
@@ -345,7 +360,7 @@ class Publisher:
                 bootstrap = self.make_config(stage, bootstrap=True)
                 self.command(["deploy", "--config", str(bootstrap)])
                 old_version = self.current_version()
-            config = self.make_config(stage)
+            config = self.make_config(self.prepare_assets(stage))
             metadata = Path(temporary) / "upload.ndjson"
             self.command(["versions", "upload", "--config", str(config), "--preview-alias", "candidate"], metadata)
             records = [json.loads(line) for line in metadata.read_text().splitlines() if line.strip()]

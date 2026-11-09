@@ -66,6 +66,16 @@ output_dir = "build/public"
         self.assertTrue(publish.public_path_allowed("news/abc_123/index.html"))
         self.assertTrue(publish.public_path_allowed("tags/security.xml"))
 
+    def test_subdirectory_assets_use_plain_paths_and_root_headers(self):
+        public = self.public_tree()
+        assets = self.publisher.prepare_assets(public)
+        self.assertTrue((assets / "onionflash/index.html").is_file())
+        self.assertTrue((assets / "_headers").is_file())
+        self.assertFalse((assets / "onionflash/_headers").exists())
+        config = json.loads(self.publisher.make_config(assets).read_text())
+        self.assertNotIn("base_path", config["assets"])
+        self.assertEqual(config["vars"]["BASE_PATH"], "/onionflash")
+
     def test_fractional_retry_limit_is_rejected(self):
         path = self.directory / "deployment.toml"
         path.write_text(path.read_text().replace("attempts = 4", "attempts = 1.5"))
