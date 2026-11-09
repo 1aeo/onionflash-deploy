@@ -1,0 +1,13 @@
+.venv/
+node_modules/
+state/
+build/
+config/
+deployment.toml
+onionflash.toml
+secrets.env
+*.log
+__pycache__/
+*.pyc
+.DS_Store
+.wrangler/
