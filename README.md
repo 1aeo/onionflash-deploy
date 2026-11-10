@@ -29,7 +29,8 @@ Edit the three generated files (all ignored by Git):
    exact addresses in `llm.allowed_networks` and set `allow_http = true` only if
    that endpoint uses HTTP. Source fetching remains restricted to public HTTPS.
 2. **`secrets.env`**: LLM key, Cloudflare account/token, and optionally Spaces keys.
-   Keep mode **600**. Literal `KEY=value` or quoted values are supported; shell
+   Keep mode **600**. `KEY=value` lines use shell-style quoting (a `#` inside a value is
+   kept, so put comments on their own line; `KEY=abc # note` is rejected); shell
    commands and variable expansion are never executed. Set
    `ONIONFLASH_LLM_BASE_URL` if using the example application's environment reference.
 3. **`deployment.toml`**: Worker name, deployment limits, schedule and optional

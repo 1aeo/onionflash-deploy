@@ -84,6 +84,9 @@ base_url = "https://example.com/onionflash/"
 [storage]
 database = "state/news.sqlite3"
 output_dir = "build/public"
+[[sources]]
+id = "test"
+url = "https://example.org/feed.xml"
 ''')
         self.p = publish.Publisher(self.directory / "deployment.toml")
 
@@ -105,7 +108,7 @@ output_dir = "build/public"
             db.execute("INSERT INTO evidence VALUES ('private source evidence')")
             db.commit()
         self.p.public.mkdir(parents=True)
-        for name in publish.PUBLIC_FILES:
+        for name in publish.public_files():
             body = b"generated public content"
             if name == "feed.xml":
                 body = b"<rss version='2.0'><channel><title>News</title></channel></rss>"
