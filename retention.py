@@ -162,6 +162,42 @@ class RetentionStore:
             raise ValueError("Private retention verification receipt does not match")
         return {**result, "destination": dict(self._destination)}
 
+    def _review_pins(self, db):
+        """Materialize unfinished review dependencies without requiring new core APIs."""
+        db.execute("CREATE TEMP TABLE IF NOT EXISTS retention_review_pins(kind TEXT,record_id TEXT,PRIMARY KEY(kind,record_id))")
+        db.execute("DELETE FROM retention_review_pins")
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='review_jobs'").fetchone():
+            return
+        limit = self.cfg["max_bundle_bytes"]
+        for job in db.execute("SELECT item_id,substr(envelope_json,1,?) AS envelope_json FROM review_jobs", (limit + 1,)):
+            pins = [("item", job["item_id"])]
+            raw = job["envelope_json"]
+            if raw is not None:
+                try:
+                    if len(raw) > limit or len(raw.encode("utf-8")) > limit:
+                        raise ValueError
+                    envelope = json.loads(raw)
+                    sources = envelope["binding"]["sources"]
+                    if not isinstance(sources, list):
+                        raise ValueError
+                    for source in sources:
+                        key, table = source["key"], source["table"]
+                        if not isinstance(key, str) or not key or len(key) > 4096:
+                            raise ValueError
+                        if table == "analyses":
+                            pins.append(("analysis", key))
+                        elif table == "items" or (table == "item_lookup" and source["by"] == "id"):
+                            pins.append(("item", key))
+                        elif table == "item_lookup" and source["by"] == "url":
+                            found = db.execute("SELECT id FROM items WHERE url=?", (key,)).fetchone()
+                            if found:
+                                pins.append(("item", found[0]))
+                        else:
+                            raise ValueError
+                except (ValueError, TypeError, KeyError, UnicodeError, RecursionError):
+                    raise ValueError("Cannot verify unfinished review evidence; retention stopped") from None
+            db.executemany("INSERT OR IGNORE INTO retention_review_pins VALUES(?,?)", pins)
+
     def archive_evidence(self, now: datetime | None = None) -> dict:
         if not self.cfg["enabled"]:
             return {"enabled": False}
@@ -173,13 +209,17 @@ class RetentionStore:
         size = len(_json({"format": "onionflash-private-evidence-v1", "records": []}))
         with lock(str(self.database) + ".lock"), closing(self._db()) as db:
             self._initialize(db)
+            self._review_pins(db)
             queries = (
                 ("item", """SELECT * FROM items WHERE status IN ('published','ignored')
                     AND last_seen<? AND NOT EXISTS (
                         SELECT 1 FROM private_archive_refs a WHERE a.kind='item'
                         AND a.record_id=items.id AND a.record_hash=items.content_hash)
+                    AND NOT EXISTS (SELECT 1 FROM retention_review_pins p WHERE p.kind='item' AND p.record_id=items.id)
                     ORDER BY last_seen,id LIMIT ?"""),
-                ("analysis", "SELECT * FROM analyses WHERE created_at<? ORDER BY created_at,cache_key LIMIT ?"),
+                ("analysis", """SELECT * FROM analyses WHERE created_at<?
+                    AND NOT EXISTS (SELECT 1 FROM retention_review_pins p WHERE p.kind='analysis' AND p.record_id=analyses.cache_key)
+                    ORDER BY created_at,cache_key LIMIT ?"""),
             )
             for kind, query in queries:
                 # LIMIT bounds scan work as well as the resulting bundle.
@@ -203,9 +243,16 @@ class RetentionStore:
             return result
         uploaded = self._put_bundle("evidence", {"format": "onionflash-private-evidence-v1", "records": records})
         with lock(str(self.database) + ".lock"), closing(self._db()) as db, db:
+            # Jobs can be created during remote I/O. Recheck their dependencies
+            # under the same write lock as compaction/deletion, not a read-only gap.
+            db.execute("BEGIN IMMEDIATE")
+            self._review_pins(db)
             for record in records:
                 kind, row = record["kind"], record["row"]
                 table, key = ("items", "id") if kind == "item" else ("analyses", "cache_key")
+                if db.execute("SELECT 1 FROM retention_review_pins WHERE kind=? AND record_id=?", (kind, row[key])).fetchone():
+                    result["changed_records_preserved"] += 1
+                    continue
                 current = db.execute("SELECT * FROM " + table + " WHERE " + key + "=?", (row[key],)).fetchone()
                 if current is None or dict(current) != row:
                     result["changed_records_preserved"] += 1

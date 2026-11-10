@@ -228,6 +228,17 @@ class PermanentPublicationTests(unittest.TestCase):
             editorial.correct(store.db, story_id, {"why_it_matters": "Corrected, source-supported wording."},
                               reason="Removed unsupported advice", expect_hash=original["hash"])
             build(self.app_config, store)
+            from onionflash import review_gate
+            review_gate.initialize(store)
+            with store.db:
+                store.db.execute("INSERT INTO review_jobs VALUES(?,?,?,?,?,?,?,?,?,?)", (
+                    "unfinished-review", "writer", "policy", "verify", "{}", None,
+                    '{"private":"pending verification packet"}', None, stamp, stamp))
+                store.db.execute("INSERT INTO review_approvals VALUES(?,?,?,?,?,?,?,?,?)", (
+                    "saved-approval", "candidate", "sources", "policy", "binding", "{}",
+                    '{"private":"saved approval audit"}', stamp, stamp))
+                store.db.execute("INSERT INTO analyses(cache_key,result,created_at,review_record) VALUES(?,?,?,?)", (
+                    "saved-analysis", "{}", stamp, '{"private":"completed review record"}'))
         sync = self.p.archive.sync()
         snapshot = self.root / "initial-snapshot"
         hot = self.p.archive.snapshot_hot(snapshot, sync["generation"])
@@ -246,6 +257,12 @@ class PermanentPublicationTests(unittest.TestCase):
             self.assertGreater(database.execute("SELECT COUNT(*) FROM public_artifacts").fetchone()[0], 0)
             self.assertEqual(database.execute("SELECT locked FROM editorial_controls WHERE story_id=?", (story_id,)).fetchone()[0], 1)
             self.assertEqual(database.execute("SELECT COUNT(*) FROM editorial_revisions WHERE story_id=?", (story_id,)).fetchone()[0], 1)
+            self.assertEqual(database.execute("SELECT stage,record_json FROM review_jobs WHERE item_id='unfinished-review'").fetchone(),
+                             ("verify", '{"private":"pending verification packet"}'))
+            self.assertEqual(database.execute("SELECT review_record_json FROM review_approvals WHERE key='saved-approval'").fetchone()[0],
+                             '{"private":"saved approval audit"}')
+            self.assertEqual(database.execute("SELECT review_record FROM analyses WHERE cache_key='saved-analysis'").fetchone()[0],
+                             '{"private":"completed review record"}')
         with Store(restored) as store:
             before = editorial.show(store.db, story_id)
             with store.db:
