@@ -36,8 +36,8 @@ This repository uses the application only through its public interfaces:
 - `onionflash.store.backup_database`, and the layout constants
   `onionflash.render.ASSET_FILES` and `onionflash.schema.CATEGORIES`;
 - the rendered output, and the publication tables and metadata documented for
-  publishers: `public_artifacts`, `public_render_queue` and the `publication_*`
-  metadata keys.
+  publishers: `public_artifacts`, `public_catalog`, `public_render_queue` and the
+  `publication_*` metadata keys.
 
 Do not read other application tables or parse its private JSON; ask the
 application to expose what is needed instead. The current exceptions are in
