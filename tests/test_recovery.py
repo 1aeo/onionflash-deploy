@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from contextlib import closing, redirect_stdout
 from concurrent.futures import ThreadPoolExecutor
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 from urllib.error import HTTPError, URLError
 
 import publish
@@ -24,8 +24,7 @@ OTHER = "33333333-3333-4333-8333-333333333333"
 def receipt(version, previous=None):
     return {"version_id": version, "previous_version_id": previous,
             "content_hash": version, "published_at": "2026-11-09T10:00:00Z",
-            "manifest": {"index.html": version},
-            "origin_url": "https://news.example.workers.dev/onionflash"}
+            "manifest": {"index.html": version}}
 
 
 class FakeSpaces:
@@ -152,7 +151,7 @@ url = "https://example.org/feed.xml"
         self.assertEqual(publish.read_json(self.p.state / "publication.json")["version_id"], OLD)
         self.assertFalse((self.p.state / "publication-hold.json").exists())
 
-    def test_a_failed_restore_reports_both_failures_and_forces_the_next_upload(self):
+    def test_a_failed_restore_reports_both_failures_and_stops_the_next_run_for_inspection(self):
         self.seed_public()
         publish.atomic_json(self.p.state / "publication.json", receipt(OLD))
         self.fake_cloudflare(OLD, failing_check="live")
@@ -166,6 +165,8 @@ url = "https://example.org/feed.xml"
         current = publish.read_json(self.p.state / "publication.json")
         self.assertEqual(current["version_id"], OLD)
         self.assertNotIn("content_hash", current)
+        with self.assertRaisesRegex(ValueError, rf"inspect before publishing \(live {NEW}, recorded {OLD}\)"):
+            self.p.publish()
 
     def test_an_upload_without_a_reported_version_fails_clearly(self):
         self.seed_public()
@@ -204,6 +205,27 @@ url = "https://example.org/feed.xml"
         self.assertEqual(self.calls, ["deploy --config", "verify live"])
         self.assertEqual((receipt["version_id"], receipt["previous_version_id"]), (NEW, None))
 
+    def test_a_new_worker_that_fails_its_live_check_is_recorded_and_the_next_run_uploads(self):
+        self.seed_public()
+        self.fake_cloudflare(None, failing_check="live")
+        with self.assertRaisesRegex(ValueError, "check failed"):
+            self.p.publish()
+        self.assertEqual(publish.read_json(self.p.state / "publication.json"), {"version_id": NEW})
+        self.fake_cloudflare(NEW)
+        self.p.publish()
+        self.assertEqual(self.calls, ["versions upload", "verify preview", "activate " + NEW, "verify live"])
+
+    def test_a_failed_deploy_records_the_worker_it_created(self):
+        self.seed_public()
+        self.fake_cloudflare(None)
+        def deploy(arguments, metadata=None):
+            self.live[0] = NEW
+            raise RuntimeError("deploy reported an error")
+        with patch.object(self.p, "command", side_effect=deploy):
+            with self.assertRaisesRegex(RuntimeError, "deploy reported"):
+                self.p.publish()
+        self.assertEqual(publish.read_json(self.p.state / "publication.json"), {"version_id": NEW})
+
     def test_failed_check_does_not_roll_back_an_external_version(self):
         self.seed_public()
         self.fake_cloudflare(OLD)
@@ -219,12 +241,14 @@ url = "https://example.org/feed.xml"
 
     def test_changed_content_does_not_replace_an_external_version(self):
         self.seed_public()
-        publish.atomic_json(self.p.state / "publication.json", receipt(OLD))
-        self.fake_cloudflare(OTHER)
-        with self.assertRaisesRegex(ValueError, "differs"):
-            self.p.publish()
-        self.assertEqual(self.calls, [])
-        self.assertEqual(self.live[0], OTHER)
+        for recorded in (receipt(OLD), {}):  # {}: for example, a lost state directory
+            with self.subTest(recorded=recorded.get("version_id")):
+                publish.atomic_json(self.p.state / "publication.json", recorded)
+                self.fake_cloudflare(OTHER)
+                with self.assertRaisesRegex(ValueError, f"differs.*live {OTHER}, recorded {recorded.get('version_id')}"):
+                    self.p.publish()
+                self.assertEqual(self.calls, [])
+                self.assertEqual(self.live[0], OTHER)
 
     def test_external_activation_during_preview_is_preserved(self):
         self.seed_public()
@@ -237,14 +261,6 @@ url = "https://example.org/feed.xml"
         self.assertFalse(any(call.startswith("activate") for call in self.calls))
         self.assertEqual(self.live[0], OTHER)
 
-    def test_new_worker_race_does_not_replace_the_new_external_worker(self):
-        self.seed_public()
-        self.fake_cloudflare(None)
-        with patch.object(self.p, "current_version", side_effect=[None, OTHER]):
-            with self.assertRaisesRegex(ValueError, "appeared outside"):
-                self.p.publish()
-        self.assertEqual(self.calls, [])
-
     def test_fallible_provenance_is_collected_before_activation(self):
         self.seed_public()
         self.fake_cloudflare(OLD)
@@ -253,17 +269,16 @@ url = "https://example.org/feed.xml"
                 self.p.publish()
         self.assertEqual(self.calls, [])
 
-    def test_rollback_preserves_the_previous_archive_root_and_publication_date(self):
-        old = receipt(OLD)
-        old["archive"] = {"manifest_sha256": "a" * 64, "generation": "1", "origin": "https://example.org/public/"}
+    def test_rollback_restores_the_previous_receipt_and_forces_the_next_upload(self):
+        old = dict(receipt(OLD), published_at="2026-11-08T10:00:00Z",
+                   archive={"manifest_sha256": "a" * 64, "generation": "1", "origin": "https://example.org/public/"})
         publish.atomic_json(self.p.state / "receipts" / (OLD + ".json"), old)
         publish.atomic_json(self.p.state / "publication.json", receipt(NEW, OLD))
         with patch.object(self.p, "activate"), patch.object(self.p, "current_version", return_value=NEW):
             self.p.rollback()
-        current = publish.read_json(self.p.state / "publication.json")
-        self.assertEqual(current["archive"], old["archive"])
-        self.assertEqual(current["published_at"], old["published_at"])
-        self.assertNotIn("content_hash", current)
+        old.pop("content_hash")
+        self.assertEqual(publish.read_json(self.p.state / "publication.json"),
+                         {**old, "rolled_back_from": NEW, "rolled_back_at": ANY})
 
     def test_rollback_holds_before_activation_and_forces_the_next_upload(self):
         publish.atomic_json(self.p.state / "publication.json", receipt(NEW, OLD))
@@ -294,15 +309,6 @@ url = "https://example.org/feed.xml"
         activate.assert_not_called()
         self.assertFalse((self.p.state / "publication-hold.json").exists())
         self.assertEqual(publish.read_json(self.p.state / "publication.json"), original)
-
-    def test_manual_rollback_rechecks_the_version_after_local_preparation(self):
-        publish.atomic_json(self.p.state / "publication.json", receipt(NEW, OLD))
-        with patch.object(self.p, "current_version", side_effect=[NEW, OTHER]), patch.object(self.p, "activate") as activate:
-            with self.assertRaisesRegex(ValueError, "changed before rollback"):
-                self.p.rollback()
-        activate.assert_not_called()
-        self.assertTrue((self.p.state / "publication-hold.json").exists())
-        self.assertEqual(publish.read_json(self.p.state / "publication.json")["version_id"], NEW)
 
     def seed_backup(self):
         self.p.cfg["spaces"].update(enabled=True)

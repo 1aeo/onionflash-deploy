@@ -98,24 +98,18 @@ The separate Worker guarantees hostname redirects even when an incoming path
 matches a static asset. The canonical site keeps its existing asset delivery,
 and the redirect itself requires no browser JavaScript.
 
+## Publication
+
 Publication uploads an immutable version, checks its preview hashes, activates
 it, and verifies the live site: the production hostname once routed, otherwise the
 `workers.dev` origin. A failed live check reactivates the preceding version and
-fails that run; the next scheduled run tries again. Unchanged content is not
-uploaded, but the active version is checked before taking that shortcut. A new Worker is deployed directly, since it
-has no live version to protect. An active version that differs from the recorded
-publication, or changes during preview checks, stops publication for inspection.
-
-Permanent-storage deployments use the same linear flow. Small per-version
-receipts preserve the immutable archive root and verification hashes for rollback
-and private history retention; there is no transition journal or `reconcile`
-command. An interrupted attempt clears the content shortcut. If activation did
-not occur, the next run uploads and verifies again. If the live version changed
-without a completed receipt, publication stops for operator inspection rather
-than guessing whether that change belongs to this process. An external version
-change during verification is left intact rather than rolled back.
-Manual rollback also checks the recorded active version before preparation and
-again before activation, so it will not replace a concurrent external deployment.
+fails that run; if that restore succeeds, the next scheduled run tries again. A new
+Worker is deployed directly, since it has no live version to protect; it is recorded
+even if that deployment or its live check fails, so the next run uploads and checks
+again. Unchanged content is not uploaded, but the active version is checked before
+taking that shortcut, and an interrupted attempt clears it. An active version that
+differs from the recorded publication, or changes during preview or live checks,
+stops publication for inspection (see [Operations](#operations)).
 
 Failures inside a run are recorded in `state/run.log` and `state/last-run.json`;
 errors raised before the run starts, such as an invalid configuration or credential
@@ -208,10 +202,21 @@ tail -n 40 state/run.log
 ```
 
 Rollback reactivates the version recorded as the previous publication and holds
-publication, so the next scheduled run cannot undo it. Correct the content or code
+publication, so the next scheduled run cannot undo it. It refuses to run when the
+active version differs from the recorded publication. Correct the content or code
 before resuming; the first publication after resuming uploads again.
 `state/publication.json` records the live version, its predecessor and the exact
-file hashes.
+file hashes; `state/receipts/` keeps such a record for each published version,
+including any permanent-storage root, for rollback and retention.
+
+A run that fails with "Active Worker version differs from the publication receipt"
+names the live and recorded versions. A failed restore, a run interrupted after
+activation, a lost `state/` directory or a deployment made outside this publisher
+can cause it, and neither `rollback` nor `resume` clears it. Hold publication and
+inspect the live version. To discard it, deploy the recorded version again from the
+Worker's deployments in the Cloudflare dashboard (or with `wrangler versions deploy`).
+To keep it, replace `state/publication.json` with `{"version_id": "<live version>"}`,
+so the next run uploads and checks a new version. Then resume.
 
 The installer and scheduled job share a lock. A concurrent scheduled run exits
 without overlapping work. A busy administrative command exits **75** with a clear

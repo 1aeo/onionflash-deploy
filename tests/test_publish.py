@@ -297,7 +297,7 @@ url = "https://example.org/feed.xml"
         api.assert_not_called()
 
         with patch.object(p, "validate", return_value=manifest), patch.object(p, "current_version", return_value="external"), patch.object(p, "command") as command:
-            with self.assertRaisesRegex(ValueError, "differs"):
+            with self.assertRaisesRegex(ValueError, "differs.*live external, recorded expected"):
                 p.publish()
         command.assert_not_called()
 
