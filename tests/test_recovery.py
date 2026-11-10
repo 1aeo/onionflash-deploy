@@ -226,6 +226,21 @@ url = "https://example.org/feed.xml"
                 self.p.publish()
         self.assertEqual(publish.read_json(self.p.state / "publication.json"), {"version_id": NEW})
 
+    def test_a_failed_deploy_keeps_its_error_when_the_version_lookup_also_fails(self):
+        self.seed_public()
+        self.fake_cloudflare(None)
+        lookups = iter([None])  # the check before deploying succeeds; the one after fails
+        def current_version():
+            for version in lookups:
+                return version
+            raise RuntimeError("version lookup failed")
+        def deploy(arguments, metadata=None):
+            raise RuntimeError("deploy reported an error")
+        with patch.object(self.p, "command", side_effect=deploy), \
+                patch.object(self.p, "current_version", side_effect=current_version):
+            with self.assertRaisesRegex(RuntimeError, "deploy reported"):
+                self.p.publish()
+
     def test_failed_check_does_not_roll_back_an_external_version(self):
         self.seed_public()
         self.fake_cloudflare(OLD)

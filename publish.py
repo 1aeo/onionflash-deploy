@@ -269,6 +269,12 @@ class Publisher:
             raise RuntimeError("Cloudflare API rejected request: " + self.clean_error(response.get("errors")))
         return response.get("result")
 
+    def record_first_version(self):
+        version = self.current_version()
+        if version:
+            atomic_json(self.state / "publication.json", {"version_id": version})
+        return version
+
     def current_version(self):
         try:
             result = self.api(f"/accounts/{self.account}/workers/scripts/{self.cf['worker_name']}/deployments")
@@ -540,12 +546,17 @@ class Publisher:
             if before is None:
                 try:
                     self.command(["deploy", "--config", str(config)])
-                finally:
-                    # Record the Worker this run created even if deploy or the live check
-                    # fails; with no content hash, the next run uploads and checks again.
-                    version = self.current_version()
-                    if version:
-                        atomic_json(self.state / "publication.json", {"version_id": version})
+                except BaseException:
+                    # Record a Worker the failed deploy may still have created, so the
+                    # next run can replace it; the deploy error is the one reported.
+                    try:
+                        self.record_first_version()
+                    except Exception as lookup:
+                        LOG.error("Could not read the Worker version after a failed deploy: %s", self.clean_error(lookup))
+                    raise
+                # Recorded with no content hash, so a failed live check below leaves
+                # the next run to upload and check again.
+                version = self.record_first_version()
                 if not version:
                     raise RuntimeError("Cloudflare did not report the deployed version")
             else:
