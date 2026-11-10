@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 import errno
 import fcntl
+import gzip
 import hashlib
 import json
 import logging
@@ -19,13 +20,11 @@ import shlex
 import shutil
 import subprocess
 import sys
-import tarfile
 import tempfile
 import time
 import tomllib
-import uuid
 from urllib.error import HTTPError
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parent
@@ -489,11 +488,9 @@ class Publisher:
             raise ValueError("Backup prefix must be a project-specific name/backups/")
         if urlsplit(cfg["endpoint_url"]).scheme != "https":
             raise ValueError("Spaces endpoint must use HTTPS")
-        destination = {key: cfg[key] for key in ("endpoint_url", "bucket", "prefix")}
         marker = self.state / "backup.json"
-        previous = read_json(marker, {})
-        age = time.time() - previous.get("timestamp", 0)
-        if not force and previous.get("destination") == destination and 0 <= age < cfg["backup_interval_seconds"]:
+        age = time.time() - read_json(marker, {}).get("timestamp", 0)
+        if not force and 0 <= age < cfg["backup_interval_seconds"]:
             return
         if not self.database.is_file():
             raise ValueError("No application database to back up")
@@ -504,69 +501,34 @@ class Publisher:
                               aws_access_key_id=self.secret(cfg["access_key_env"]),
                               aws_secret_access_key=self.secret(cfg["secret_key_env"]),
                               config=Config(connect_timeout=self.net["timeout_seconds"], read_timeout=self.net["timeout_seconds"],
-                                            retries={"mode": "standard", "max_attempts": int(self.net["attempts"])},
-                                            request_checksum_calculation="when_required", response_checksum_validation="when_required"))
-        if cfg.get("create_bucket"):
-            try:
-                client.head_bucket(Bucket=cfg["bucket"])
-            except client.exceptions.ClientError as exc:
-                if str(exc.response.get("Error", {}).get("Code")) not in {"404", "NoSuchBucket"}:
-                    raise
-                client.create_bucket(Bucket=cfg["bucket"], ACL="private")
+                                            retries={"mode": "standard", "max_attempts": int(self.net["attempts"])}))
+        # Only SQLite: the public site is rebuilt from it with `onionflash build`.
         with tempfile.TemporaryDirectory(prefix="backup-", dir=self.state) as temporary:
-            temporary = Path(temporary)
-            archive = temporary / "snapshot.tar.gz"
+            snapshot = Path(temporary) / "onionflash.sqlite3"
             with lock(str(self.database) + ".lock", shared=True):
-                # One lock keeps the consistent DB copy and generated files at
-                # the same application state; the shared helper closes handles.
-                backup_database(self.database, temporary / "onionflash.sqlite3")
-                public_error = None
-                try:
-                    manifest = self.validate(self.public) if self.public.is_dir() else {}
-                except Exception as exc:
-                    public_error = self.clean_error(exc)
-                    manifest = {}
-                    LOG.warning("Backing up SQLite without invalid generated files: %s", public_error)
-                publication = read_json(self.state / "publication.json", {})
-                atomic_json(temporary / "snapshot-manifest.json", {
-                    "captured_at": datetime.now(timezone.utc).isoformat(), "public_manifest": manifest, "public_error": public_error,
-                    "matches_publication": bool(publication) and manifest == publication.get("manifest")})
-                with tarfile.open(archive, "w:gz") as tar:
-                    tar.add(temporary / "onionflash.sqlite3", arcname="onionflash.sqlite3")
-                    tar.add(temporary / "snapshot-manifest.json", arcname="snapshot-manifest.json")
-                    if publication:
-                        atomic_json(temporary / "publication.json", publication)
-                        tar.add(temporary / "publication.json", arcname="publication.json")
-                    if manifest:
-                        tar.add(self.public, arcname="public", recursive=True)
-            with archive.open("rb") as stream:
-                digest = hashlib.file_digest(stream, "sha256").hexdigest()
-            # Unique names ensure failure cleanup cannot remove an older backup.
-            key = prefix + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + digest[:12] + "-" + uuid.uuid4().hex + ".tar.gz"
-            try:
-                client.upload_file(str(archive), cfg["bucket"], key, ExtraArgs={"ACL": "private", "ContentType": "application/gzip", "Metadata": {"sha256": digest}})
-                head = client.head_object(Bucket=cfg["bucket"], Key=key)
-                if head.get("Metadata", {}).get("sha256") != digest or head["ContentLength"] != archive.stat().st_size:
-                    raise ValueError("Backup upload verification failed")
-                acl = client.get_object_acl(Bucket=cfg["bucket"], Key=key)
-                if any(grant.get("Grantee", {}).get("Type") == "Group" for grant in acl.get("Grants", [])):
-                    raise ValueError("Backup object unexpectedly has a public/group ACL")
-            except Exception as failure:
-                try:
-                    client.delete_object(Bucket=cfg["bucket"], Key=key)
-                except Exception as cleanup:
-                    raise RuntimeError("Backup verification/upload failed and cleanup failed for " + key + ": " + self.clean_error(failure) + "; " + self.clean_error(cleanup)) from cleanup
-                raise
-            cutoff = datetime.now(timezone.utc) - timedelta(days=cfg["retention_days"])
-            pattern = re.escape(prefix) + r"\d{8}T\d{6}Z-[0-9a-f]{12}(?:-[0-9a-f]{32})?\.tar\.gz"
-            for page in client.get_paginator("list_objects_v2").paginate(Bucket=cfg["bucket"], Prefix=prefix):
-                for item in page.get("Contents", []):
-                    if item["Key"] != key and item["LastModified"] < cutoff and re.fullmatch(pattern, item["Key"]):
-                        client.delete_object(Bucket=cfg["bucket"], Key=item["Key"])
-            # Retention failures remain retryable; a verified newest object is
-            # retained even if cleanup of older objects fails.
-            atomic_json(marker, {"timestamp": time.time(), "key": key, "sha256": digest, "destination": destination})
-            LOG.info("Verified private Spaces backup %s", key)
+                backup_database(self.database, snapshot)
+            body = gzip.compress(snapshot.read_bytes())
+        key = prefix + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + ".sqlite3.gz"
+        client.put_object(Bucket=cfg["bucket"], Key=key, Body=body, ACL="private", ContentType="application/gzip")
+        # An anonymous request is the real exposure path; it must be refused,
+        # whatever ACLs or bucket policies say.
+        try:
+            self.request(cfg["endpoint_url"].rstrip("/") + "/" + cfg["bucket"] + "/" + quote(key), "HEAD")
+        except HTTPError as exc:
+            if exc.code != 403:
+                raise ValueError(f"Unexpected anonymous response {exc.code} for the new backup") from None
+        else:
+            client.delete_object(Bucket=cfg["bucket"], Key=key)
+            raise ValueError("The new backup was publicly readable and has been deleted")
+        cutoff = datetime.now(timezone.utc) - timedelta(days=cfg["retention_days"])
+        pattern = re.escape(prefix) + r"\d{8}T\d{6}Z(?:\.sqlite3\.gz|-[0-9a-f]{12}(?:-[0-9a-f]{32})?\.tar\.gz)"
+        for page in client.get_paginator("list_objects_v2").paginate(Bucket=cfg["bucket"], Prefix=prefix):
+            for item in page.get("Contents", []):
+                if item["Key"] != key and item["LastModified"] < cutoff and re.fullmatch(pattern, item["Key"]):
+                    client.delete_object(Bucket=cfg["bucket"], Key=item["Key"])
+        # A retention failure leaves the marker alone, so a later run retries.
+        atomic_json(marker, {"timestamp": time.time(), "key": key})
+        LOG.info("Private Spaces backup %s", key)
 
     def schedule(self):
         interval = self.cfg.get("interval_minutes", 5)
