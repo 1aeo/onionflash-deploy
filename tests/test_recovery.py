@@ -135,7 +135,7 @@ output_dir = "build/public"
         self.assertTrue((self.p.state / "receipts" / (NEW + ".json")).is_file())
         self.assertFalse((self.p.state / "transition.json").exists())
 
-    def test_failed_verification_restores_previous_version_and_holds(self):
+    def test_failed_verification_restores_previous_version_without_holding(self):
         old, new = self.seed_receipts()
         actual = [OLD]
         def activate(version, config):
@@ -150,7 +150,7 @@ output_dir = "build/public"
                 self.p.transition(new, OLD, old)
         self.assertEqual(actual[0], OLD)
         self.assertEqual(json.loads((self.p.state / "publication.json").read_text())["version_id"], OLD)
-        self.assertTrue((self.p.state / "publication-hold.json").is_file())
+        self.assertFalse((self.p.state / "publication-hold.json").is_file())
 
     def test_recovery_never_overwrites_an_external_version_change(self):
         old, new = self.seed_receipts()
@@ -169,7 +169,7 @@ output_dir = "build/public"
         self.assertEqual(activations, [NEW])
         self.assertEqual(actual[0], OTHER)
         self.assertTrue((self.p.state / "transition.json").is_file())
-        self.assertTrue((self.p.state / "publication-hold.json").is_file())
+        self.assertFalse((self.p.state / "publication-hold.json").is_file())
 
     def test_manual_rollback_holds_before_activation_and_preserves_receipt_time(self):
         old, new = self.seed_receipts()
@@ -230,7 +230,7 @@ output_dir = "build/public"
         self.assertEqual(actual[0], OLD)
         self.assertEqual(json.loads((self.p.state / "publication.json").read_text())["version_id"], OLD)
         self.assertFalse((self.p.state / "transition.json").exists())
-        self.assertTrue((self.p.state / "publication-hold.json").is_file())
+        self.assertFalse((self.p.state / "publication-hold.json").is_file())
 
     def test_version_archive_precedes_current_pointer_write(self):
         old, new = self.seed_receipts()
@@ -251,7 +251,7 @@ output_dir = "build/public"
         self.assertLess(writes.index(archive), writes.index(self.p.state / "publication.json"))
 
     def test_publication_failure_does_not_prevent_due_backup(self):
-        with patch.object(self.p, "application"), \
+        with patch.object(self.p, "application", return_value='{"sources_ok": 1}'), \
                 patch.object(self.p, "publish", side_effect=ValueError("Cloudflare unavailable")), \
                 patch.object(self.p, "backup") as backup:
             result = self.p.run_cycle()
@@ -272,7 +272,7 @@ output_dir = "build/public"
 
     def test_publication_hold_still_collects_and_backs_up(self):
         publish.atomic_json(self.p.state / "publication-hold.json", {"reason": "operator hold"})
-        with patch.object(self.p, "application") as application, \
+        with patch.object(self.p, "application", return_value='{"sources_ok": 1}') as application, \
                 patch.object(self.p, "publish") as publish_call, \
                 patch.object(self.p, "backup") as backup:
             result = self.p.run_cycle()
@@ -286,7 +286,7 @@ output_dir = "build/public"
         old, new = self.seed_receipts()
         self.seed_transition(old, new)
         publish.atomic_json(self.p.state / "publication-hold.json", {"reason": "transition failed"})
-        with patch.object(self.p, "application"), patch.object(self.p, "publish") as publication, \
+        with patch.object(self.p, "application", return_value='{"sources_ok": 1}'), patch.object(self.p, "publish") as publication, \
                 patch.object(self.p, "reconcile") as reconciliation, patch.object(self.p, "backup") as backup:
             result = self.p.run_cycle()
         self.assertFalse(result["ok"])
@@ -306,7 +306,7 @@ output_dir = "build/public"
         self.assertEqual(publish.read_json(self.p.state / "publication.json")["version_id"], NEW)
 
     def test_optional_backup_error_is_visible_as_degraded_status(self):
-        with patch.object(self.p, "application"), patch.object(self.p, "publish"), \
+        with patch.object(self.p, "application", return_value='{"sources_ok": 1}'), patch.object(self.p, "publish"), \
                 patch.object(self.p, "backup", side_effect=ValueError("Spaces unavailable")):
             result = self.p.run_cycle()
         self.assertTrue(result["ok"])
@@ -351,13 +351,52 @@ output_dir = "build/public"
     def test_successful_check_replaces_previous_failed_check_receipt(self):
         publish.atomic_json(self.p.state / "last-run.json", {"ok": False, "command": "check", "error": "old failure"})
         with patch("publish.Publisher", return_value=self.p), \
-                patch.object(self.p, "application"), \
+                patch.object(self.p, "application", return_value='{"configuration": "valid"}'), \
+                patch.object(self.p, "node", Path(__file__)), patch.object(self.p, "wrangler", Path(__file__)), \
                 patch("sys.argv", ["publish.py", "check"]), redirect_stdout(io.StringIO()):
             self.assertEqual(publish.main(), 0)
         result = publish.read_json(self.p.state / "last-run.json")
         self.assertTrue(result["ok"])
         self.assertEqual(result["command"], "check")
         self.assertNotIn("error", result)
+
+    def test_app_errors_and_timeouts_are_recorded_not_silent(self):
+        import subprocess
+        failed = subprocess.CompletedProcess([], 2, stdout="", stderr="onionflash: Output ownership marker does not match")
+        with patch("publish.subprocess.run", return_value=failed), patch.object(self.p, "publish"), \
+                patch.object(self.p, "backup"):
+            result = self.p.run_cycle()
+        self.assertEqual(result["phases"]["collection"], "failed")
+        self.assertIn("Output ownership marker", result["errors"][0])
+        with patch("publish.subprocess.run", side_effect=subprocess.TimeoutExpired(["onionflash"], 540)), \
+                patch.object(self.p, "publish") as publication, patch.object(self.p, "backup") as backup:
+            result = self.p.run_cycle()
+        self.assertIn("timed out", result["errors"][0])
+        publication.assert_not_called()
+        backup.assert_called_once()
+
+    def test_run_report_is_kept_in_the_cycle_result(self):
+        import subprocess
+        done = subprocess.CompletedProcess([], 0, stdout='{"sources_ok": 15, "sources_failed": 3}\n', stderr="")
+        with patch("publish.subprocess.run", return_value=done) as run, patch.object(self.p, "publish"), \
+                patch.object(self.p, "backup"):
+            result = self.p.run_cycle()
+        self.assertEqual(result["report"], {"sources_ok": 15, "sources_failed": 3})
+        self.assertGreater(run.call_args.kwargs["timeout"], 0)
+
+    def test_schedule_logs_cron_output_and_wrangler_logs_to_a_directory(self):
+        import subprocess
+        calls = []
+        def fake(arguments, **kwargs):
+            calls.append((arguments, kwargs))
+            return subprocess.CompletedProcess(arguments, 0, stdout="MAILTO=\"\"\n", stderr="")
+        with patch("publish.subprocess.run", side_effect=fake):
+            self.p.schedule()
+            self.p.command(["whoami"])
+        installed = calls[1][1]["input"]
+        self.assertIn("| logger -t onionflash", installed)
+        self.assertNotIn("/dev/null", installed)
+        self.assertTrue(calls[2][1]["env"]["WRANGLER_LOG_PATH"].endswith("wrangler-logs"))
 
     def test_missing_status_record_can_disappear_without_error(self):
         self.assertEqual(publish.read_json(self.directory / "missing.json", {}), {})

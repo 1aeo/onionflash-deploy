@@ -264,7 +264,7 @@ class Publisher:
         env = os.environ.copy()
         env.update(CLOUDFLARE_ACCOUNT_ID=self.account, CLOUDFLARE_API_TOKEN=self.token,
                    WRANGLER_SEND_METRICS="false", WRANGLER_LOG_SANITIZE="true",
-                   WRANGLER_LOG_PATH=str(self.state / "wrangler.log"), CI="true")
+                   WRANGLER_LOG_PATH=str(self.state / "wrangler-logs"), CI="true")
         if metadata:
             env["WRANGLER_OUTPUT_FILE_PATH"] = str(metadata)
         for attempt in range(self.net["attempts"]):
@@ -436,7 +436,8 @@ class Publisher:
             self.verify_receipt(target)
             return self.complete_transition(journal)
         except Exception:
-            atomic_json(self.state / "publication-hold.json", {"reason": "version transition failed", "timestamp": time.time()})
+            # Restore and fail this run; the next run retries. An automatic hold
+            # would freeze publication while every later run reported success.
             try:
                 self.restore_transition(journal)
             except Exception as recovery_error:
@@ -452,7 +453,6 @@ class Publisher:
             try:
                 self.verify_receipt(journal["target"])
             except Exception:
-                atomic_json(self.state / "publication-hold.json", {"reason": "reconciled target failed verification", "timestamp": time.time()})
                 return self.restore_transition(journal)
             return self.complete_transition(journal)
         if actual == journal["before_version"]:
@@ -671,14 +671,29 @@ class Publisher:
         current = re.sub(re.escape(begin) + r".*?" + re.escape(end) + r"\n?", "", current, flags=re.S)
         command = " ".join(shlex.quote(str(x)) for x in [self.path(self.cfg["app_python"]), ROOT / "publish.py", "--config", self.config_path, "run"])
         # The application logs bounded summaries, never credential-bearing command lines.
-        block = f"{begin}\n*/{interval} * * * * {command} >/dev/null 2>&1\n{end}\n"
+        block = f"{begin}\n*/{interval} * * * * {command} 2>&1 | logger -t onionflash\n{end}\n"
         subprocess.run(["crontab", "-"], input=current.rstrip() + "\n" + block, text=True, check=True)
         LOG.info("Installed a %s-minute cron job", interval)
 
 
     def application(self, command):
-        subprocess.run([str(self.path(self.cfg["app_python"])), "-m", "onionflash", command,
-                        "--config", str(self.app_config)], check=True)
+        """Run one app command and return its output; failures carry the app's error."""
+        budget = self.app.get("collection", {}).get("run_budget_seconds", 240)
+        result = subprocess.run([str(self.path(self.cfg["app_python"])), "-m", "onionflash", command,
+                                 "--config", str(self.app_config)], capture_output=True, text=True,
+                                timeout=budget + 300)
+        if result.returncode:
+            detail = result.stderr.strip() or f"exited with status {result.returncode}"
+            raise RuntimeError(self.clean_error(detail[-1000:]))
+        return result.stdout.strip()
+
+    def collect(self, result):
+        report = self.application("run")
+        LOG.info("run: %s", self.clean_error(report.splitlines()[-1] if report else "no report"))
+        try:
+            result["report"] = json.loads(report.splitlines()[-1])
+        except (ValueError, IndexError):
+            result["report"] = None
 
     def run_cycle(self):
         result = {"phases": {}, "errors": [], "warnings": []}
@@ -693,7 +708,7 @@ class Publisher:
                 result["errors" if required else "warnings"].append(message)
                 LOG.error("%s", message)
                 return False
-        if attempt("collection", lambda: self.application("run")):
+        if attempt("collection", lambda: self.collect(result)):
             if (self.state / "publication-hold.json").exists():
                 if read_json(self.state / "transition.json"):
                     message = "publication: unfinished transition; run reconcile before resuming"
@@ -730,7 +745,7 @@ class Publisher:
         if command == "run":
             return self.run_cycle()
         if command == "check":
-            self.application(command)
+            print(self.application(command))
             if not self.node.is_file() or not self.wrangler.is_file():
                 raise ValueError("Run install.sh to install the publishing toolchain")
             print("Application and deployment configuration valid")
