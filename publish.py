@@ -412,6 +412,9 @@ class Publisher:
                     try:
                         self.activate(before, self.control_config())
                     except Exception as restore:
+                        # The live version is unknown now: the next run must upload again.
+                        previous.pop("content_hash", None)
+                        atomic_json(self.state / "publication.json", previous)
                         raise RuntimeError(f"Live check failed ({failure}) and restoring {before} failed: {restore}") from failure
                 raise
             receipt = {"version_id": version, "previous_version_id": before,

@@ -147,8 +147,9 @@ url = "https://example.org/feed.xml"
         self.assertEqual(publish.read_json(self.p.state / "publication.json")["version_id"], OLD)
         self.assertFalse((self.p.state / "publication-hold.json").exists())
 
-    def test_a_failed_restore_reports_both_failures(self):
+    def test_a_failed_restore_reports_both_failures_and_forces_the_next_upload(self):
         self.seed_public()
+        publish.atomic_json(self.p.state / "publication.json", receipt(OLD))
         self.fake_cloudflare(OLD, failing_check="live")
         def activate(version, config):
             if version == OLD:
@@ -156,6 +157,9 @@ url = "https://example.org/feed.xml"
         with patch.object(self.p, "activate", side_effect=activate):
             with self.assertRaisesRegex(RuntimeError, "check failed.*restore unavailable"):
                 self.p.publish()
+        current = publish.read_json(self.p.state / "publication.json")
+        self.assertEqual(current["version_id"], OLD)
+        self.assertNotIn("content_hash", current)
 
     def test_an_upload_without_a_reported_version_fails_clearly(self):
         self.seed_public()
