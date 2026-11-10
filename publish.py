@@ -16,6 +16,7 @@ import math
 import os
 from pathlib import Path
 import re
+import secrets
 import shlex
 import shutil
 import subprocess
@@ -503,7 +504,8 @@ class Publisher:
                               config=Config(connect_timeout=self.net["timeout_seconds"], read_timeout=self.net["timeout_seconds"],
                                             retries={"mode": "standard", "max_attempts": int(self.net["attempts"])}))
         # Only SQLite: the public site is rebuilt from it with `onionflash build`.
-        key = prefix + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + ".sqlite3.gz"
+        # The random part keeps two backups in one second from replacing each other.
+        key = prefix + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + secrets.token_hex(4) + ".sqlite3.gz"
         with tempfile.TemporaryDirectory(prefix="backup-", dir=self.state) as temporary:
             snapshot, compressed = Path(temporary) / "onionflash.sqlite3", Path(temporary) / "onionflash.sqlite3.gz"
             with lock(str(self.database) + ".lock", shared=True):
@@ -525,7 +527,7 @@ class Publisher:
             client.delete_object(Bucket=cfg["bucket"], Key=key)
             raise ValueError(problem + "; it has been deleted")
         cutoff = datetime.now(timezone.utc) - timedelta(days=cfg["retention_days"])
-        pattern = re.escape(prefix) + r"\d{8}T\d{6}Z(?:\.sqlite3\.gz|-[0-9a-f]{12}(?:-[0-9a-f]{32})?\.tar\.gz)"
+        pattern = re.escape(prefix) + r"\d{8}T\d{6}Z(?:(?:-[0-9a-f]{8})?\.sqlite3\.gz|-[0-9a-f]{12}(?:-[0-9a-f]{32})?\.tar\.gz)"
         for page in client.get_paginator("list_objects_v2").paginate(Bucket=cfg["bucket"], Prefix=prefix):
             for item in page.get("Contents", []):
                 if item["Key"] != key and item["LastModified"] < cutoff and re.fullmatch(pattern, item["Key"]):

@@ -386,7 +386,8 @@ url = "https://example.org/feed.xml"
         self.assertEqual(len(client.uploads), 2)
         bucket, key, body, acl = client.uploads[0]
         self.assertEqual(acl, "private")
-        self.assertTrue(key.startswith("onionflash/backups/") and key.endswith(".sqlite3.gz"))
+        self.assertRegex(key, r"^onionflash/backups/\d{8}T\d{6}Z-[0-9a-f]{8}\.sqlite3\.gz$")
+        self.assertNotEqual(key, client.uploads[1][1])  # same-second backups get distinct keys
         restored = self.directory / "restored.sqlite3"
         restored.write_bytes(gzip.decompress(body))
         with closing(sqlite3.connect(restored)) as database:
@@ -408,7 +409,7 @@ url = "https://example.org/feed.xml"
     def test_retention_deletes_only_old_backups_and_its_failure_is_retried(self):
         self.seed_backup()
         old = datetime(2020, 1, 1, tzinfo=timezone.utc)
-        listed = [{"Key": "onionflash/backups/20200101T000000Z.sqlite3.gz", "LastModified": old},
+        listed = [{"Key": "onionflash/backups/20200101T000000Z-0123abcd.sqlite3.gz", "LastModified": old},
                   {"Key": "onionflash/backups/20200101T000000Z-" + "a" * 12 + ".tar.gz", "LastModified": old},
                   {"Key": "onionflash/backups/notes.txt", "LastModified": old}]
         client = FakeSpaces(listed=listed)
