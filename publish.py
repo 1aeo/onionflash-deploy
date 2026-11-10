@@ -354,6 +354,13 @@ class Publisher:
         subdomain = self.api(f"/accounts/{self.account}/workers/subdomain")["subdomain"]
         return f"https://{self.cf['worker_name']}.{subdomain}.workers.dev" + self.base_path
 
+    def forget_content(self, receipt):
+        """Before changing the live version: until a check confirms the result, the
+        recorded content no longer describes the live site, so an interrupted run
+        can never take the unchanged-content shortcut."""
+        receipt.pop("content_hash", None)
+        atomic_json(self.state / "publication.json", receipt)
+
     def rollback(self):
         """Hold publication and reactivate the previous version."""
         receipt = read_json(self.state / "publication.json", {})
@@ -361,6 +368,7 @@ class Publisher:
         if not previous:
             raise ValueError("No previous publication is recorded; use hold to pause publication")
         atomic_json(self.state / "publication-hold.json", {"reason": "rollback requested", "from": receipt["version_id"], "to": previous, "timestamp": time.time()})
+        self.forget_content(receipt)
         self.activate(previous, self.control_config())
         # Without a content hash the next publication after resume uploads again.
         atomic_json(self.state / "publication.json", {"version_id": previous, "rolled_back_from": receipt["version_id"],
@@ -387,6 +395,7 @@ class Publisher:
             # Fetch fallible metadata before activation, never after changing production.
             live = self.base_url if (self.state / "routes.json").exists() else self.origin_url()
             before = self.current_version()
+            self.forget_content(previous)
             if before is None:
                 # A new Worker has no live version to protect: deploy it directly.
                 self.command(["deploy", "--config", str(config)])
@@ -412,9 +421,6 @@ class Publisher:
                     try:
                         self.activate(before, self.control_config())
                     except Exception as restore:
-                        # The live version is unknown now: the next run must upload again.
-                        previous.pop("content_hash", None)
-                        atomic_json(self.state / "publication.json", previous)
                         raise RuntimeError(f"Live check failed ({failure}) and restoring {before} failed: {restore}") from failure
                 raise
             receipt = {"version_id": version, "previous_version_id": before,

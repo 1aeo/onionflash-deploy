@@ -168,6 +168,21 @@ url = "https://example.org/feed.xml"
             with self.assertRaisesRegex(RuntimeError, "did not report the uploaded version"):
                 self.p.publish()
 
+    def test_an_interrupted_publication_or_rollback_cannot_skip_the_next_upload(self):
+        self.seed_public()
+        publish.atomic_json(self.p.state / "publication.json", receipt(OLD))
+        self.fake_cloudflare(OLD)
+        with patch.object(self.p, "activate", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.p.publish()
+        self.assertNotIn("content_hash", publish.read_json(self.p.state / "publication.json"))
+        publish.atomic_json(self.p.state / "publication.json", receipt(NEW, OLD))
+        with patch.object(self.p, "activate", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.p.rollback()
+        self.assertNotIn("content_hash", publish.read_json(self.p.state / "publication.json"))
+        self.assertTrue((self.p.state / "publication-hold.json").is_file())
+
     def test_failed_preview_check_never_activates(self):
         self.seed_public()
         self.fake_cloudflare(OLD, failing_check="preview")
