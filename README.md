@@ -96,8 +96,11 @@ Before activation, a private transition journal records the intended version and
 the preceding receipt. A process interruption therefore leaves enough evidence
 for `./deploy.sh reconcile` to verify and finalize the known target, or restore
 the preceding receipt when that version is active. Unknown external versions
-are never overwritten. Failed verification sets a publication hold; inspect the
-status and reconcile before resuming. Archived receipts are written before the
+are never overwritten. Failed verification restores the preceding version and
+fails that run; the next scheduled run tries again. Failures inside a run are
+recorded in `state/run.log` and `state/last-run.json`; errors raised before the run
+starts, such as an invalid configuration or credential file, go to the console or,
+for scheduled runs, the system log. Archived receipts are written before the
 current-publication pointer.
 
 The public package is an exact allowlist of generated pages, feeds and three
@@ -165,8 +168,11 @@ The installer and scheduled job share a lock. A concurrent scheduled run exits
 without overlapping work. A busy administrative command exits **75** with a clear
 "command not performed" message, so retry it after the running job finishes.
 `status` stays available during a run and does not open or rotate the shared log.
-Credentials and state are private; logs rotate at 1 MiB
-with three backups. The job never pulls new Git commits automatically. To update,
+Credentials and state are private; `state/run.log` rotates at 1 MiB with three
+backups and records each run's report and any application error. The scheduled
+line sends console output to the system log (`logger -t onionflash`), so errors
+raised before `run.log` opens are visible too. Wrangler keeps one log file per run
+in `state/wrangler-logs/` and prunes old ones. The job never pulls new Git commits automatically. To update,
 hold publication, update the two checkouts to reviewed commits, run `install.sh`
 again, verify with `check`, and explicitly resume. Keep previous Git SHAs for code
 rollback. Production installations should use reviewed tags or commit SHAs.
