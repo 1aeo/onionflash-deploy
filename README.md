@@ -121,7 +121,8 @@ database lock; the public site is rebuilt from it with `onionflash build`. Each
 object is uploaded with a **private ACL**, then an unsigned request for it must be
 refused with 403. That checks the actual exposure path, whatever ACLs or bucket
 policies say; a publicly readable object is deleted and the backup fails.
-Defaults are one backup per day and 30 days of retention. Retention only deletes
+Defaults are one backup per day and 30 days of retention; changing the endpoint,
+bucket or prefix triggers a backup on the next run. Retention only deletes
 this application's strictly named objects under its backup prefix and never the
 newest upload. A backup outage is recorded and retried later without blocking
 news publication unless `spaces.required = true`; optional failures appear as

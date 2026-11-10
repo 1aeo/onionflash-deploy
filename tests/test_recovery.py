@@ -359,8 +359,10 @@ url = "https://example.org/feed.xml"
     def anonymous(self, code):
         """Patch the publisher's unsigned request: None means it succeeded, an
         exception is raised as is, and a number is an HTTP status."""
+        self.checked_urls = []
         def request(url, method="GET", data=None, token=None):
             self.assertEqual((method, token), ("HEAD", None))
+            self.checked_urls.append(url)
             if isinstance(code, Exception):
                 raise code
             if code is not None:
@@ -387,8 +389,13 @@ url = "https://example.org/feed.xml"
             self.p.backup()
             self.assertEqual(len(client.uploads), 1)
             self.p.backup(force=True)
-        self.assertEqual(len(client.uploads), 2)
+            self.p.cfg["spaces"]["bucket"] = "another-private-bucket"
+            self.p.backup()  # a new destination does not wait for the interval
+        self.assertEqual(len(client.uploads), 3)
+        self.assertEqual(client.uploads[2][0], "another-private-bucket")
         bucket, key, body, acl = client.uploads[0]
+        # The anonymous check asks for exactly the object that was uploaded.
+        self.assertEqual(self.checked_urls[0], self.p.cfg["spaces"]["endpoint_url"] + "/" + bucket + "/" + key)
         self.assertEqual(acl, "private")
         self.assertRegex(key, r"^onionflash/backups/\d{8}T\d{6}Z-[0-9a-f]{8}\.sqlite3\.gz$")
         self.assertEqual(key[:36], client.uploads[1][1][:36])  # the same second...

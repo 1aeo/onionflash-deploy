@@ -489,9 +489,12 @@ class Publisher:
             raise ValueError("Backup prefix must be a project-specific name/backups/")
         if urlsplit(cfg["endpoint_url"]).scheme != "https":
             raise ValueError("Spaces endpoint must use HTTPS")
+        # A new destination gets a backup right away instead of after the interval.
+        destination = {key: cfg[key] for key in ("endpoint_url", "bucket", "prefix")}
         marker = self.state / "backup.json"
-        age = time.time() - read_json(marker, {}).get("timestamp", 0)
-        if not force and 0 <= age < cfg["backup_interval_seconds"]:
+        previous = read_json(marker, {})
+        age = time.time() - previous.get("timestamp", 0)
+        if not force and previous.get("destination") == destination and 0 <= age < cfg["backup_interval_seconds"]:
             return
         if not self.database.is_file():
             raise ValueError("No application database to back up")
@@ -533,7 +536,7 @@ class Publisher:
                 if item["Key"] != key and item["LastModified"] < cutoff and re.fullmatch(pattern, item["Key"]):
                     client.delete_object(Bucket=cfg["bucket"], Key=item["Key"])
         # A retention failure leaves the marker alone, so a later run retries.
-        atomic_json(marker, {"timestamp": time.time(), "key": key})
+        atomic_json(marker, {"timestamp": time.time(), "key": key, "destination": destination})
         LOG.info("Private Spaces backup %s", key)
 
     def schedule(self):
