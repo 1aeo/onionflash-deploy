@@ -535,6 +535,25 @@ class Publisher:
         atomic_json(self.state / "publication-hold.json", {"reason": "rollback requested", "from": receipt["version_id"], "to": previous, "timestamp": time.time()})
         return self.transition(restored, receipt["version_id"], receipt, "rollback")
 
+    def publication_readiness(self, manifest=None, *, initial_archive=False):
+        """Keep incomplete first migrations and local restores off the live site."""
+        if not self.database.is_file():
+            return  # Legacy standalone generated trees have no publication ledger.
+        import sqlite3
+        from contextlib import closing
+        with lock(str(self.database) + ".lock", shared=True), closing(sqlite3.connect(self.database.as_uri() + "?mode=ro", uri=True)) as db:
+            if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='public_artifacts'").fetchone():
+                return
+            pending = db.execute("SELECT value FROM metadata WHERE key='publication_build_pending'").fetchone()
+            if pending and pending[0] == "1":
+                raise ValueError("Publication build is incomplete; existing site retained")
+            if initial_archive and db.execute("SELECT 1 FROM public_render_queue WHERE last_error IS NULL LIMIT 1").fetchone():
+                raise ValueError("Initial permanent-storage migration still has articles pending")
+            if manifest is not None:
+                for path, sha in db.execute("SELECT path,sha256 FROM public_artifacts"):
+                    if manifest.get(path) != sha:
+                        raise ValueError("Local publication snapshot is incomplete: " + path)
+
     def publish(self):
         if not (self.state / "publication-hold.json").exists():
             self.reconcile()
@@ -555,7 +574,8 @@ class Publisher:
                 generation = synchronized["generation"]
                 # Never cut over an existing permalink before its permanent copy
                 # is verified. Later bounded backfills can add unpublished history.
-                if previous and not previous.get("archive"):
+                if not previous.get("archive"):
+                    self.publication_readiness(initial_archive=True)
                     legacy_articles = [path for path in previous.get("manifest", {})
                                        if re.fullmatch(r"news/[A-Za-z0-9_-]{1,64}/index\.html", path)]
                     self.archive.manifest(legacy_articles, generation)
@@ -570,6 +590,10 @@ class Publisher:
                 with lock(str(self.database) + ".lock", shared=True):
                     shutil.copytree(self.public, stage, symlinks=True)
                 manifest = self.validate(stage)
+                self.publication_readiness(manifest)
+                if any(re.fullmatch(r"news/[A-Za-z0-9_-]{1,64}/index\.html", path) and path not in manifest
+                       for path in previous.get("manifest", {})):
+                    raise ValueError("A previously published article is missing from the local snapshot")
             identity = self.publication_identity(manifest, archive_info)
             if previous.get("content_hash") == identity:
                 if self.current_version() != previous.get("version_id"):

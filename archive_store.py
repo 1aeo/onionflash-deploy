@@ -407,6 +407,17 @@ class ArchiveStore:
                 stream.write(data)
         return digest.hexdigest(), size
 
+    def _invalidate_dirty_root(self, db):
+        # This runs inside the same transaction that marks a shard dirty. If a
+        # later upload fails, clean/new shards must not reuse the previous root.
+        if db.execute("SELECT 1 FROM archive_shards WHERE dirty!=0 LIMIT 1").fetchone():
+            self._set_meta(db, archive_manifest_sha256="", archive_manifest_generation="")
+
+    def _root_document(self, db):
+        import json
+        shards = dict(db.execute("SELECT shard,sha256 FROM archive_shards ORDER BY shard"))
+        return json.dumps({"schema": 1, "shard_chars": self.cfg["shard_prefix_chars"], "shards": shards}, separators=(",", ":"), sort_keys=True)
+
     def _prepare_manifest(self, generation, directory):
         import json
         with self._database() as db:
@@ -419,6 +430,7 @@ class ArchiveStore:
                     if re.fullmatch(r"page/[1-9][0-9]{0,8}/index\.html", path):
                         db.execute("DELETE FROM archive_index WHERE path=?", (path,))
                         db.execute("INSERT INTO archive_shards(shard,dirty) VALUES(?,1) ON CONFLICT(shard) DO UPDATE SET dirty=1", (shard,))
+                self._invalidate_dirty_root(db)
             changed = db.execute(
                 "SELECT p.path,p.sha256,p.size,p.content_type FROM archive_dirty_paths d JOIN public_artifacts p ON p.path=d.path "
                 "LEFT JOIN archive_index a ON a.path=p.path "
@@ -433,12 +445,18 @@ class ArchiveStore:
                                (row["path"], row["sha256"], row["size"], row["content_type"], shard))
                     db.execute("INSERT INTO archive_shards(shard,dirty) VALUES(?,1) ON CONFLICT(shard) DO UPDATE SET dirty=1", (shard,))
                 db.execute("DELETE FROM archive_dirty_paths")
+                self._invalidate_dirty_root(db)
             dirty = [row[0] for row in db.execute("SELECT shard FROM archive_shards WHERE dirty=1 ORDER BY shard")]
             previous_root = self._meta(db, "archive_manifest_sha256")
             if not dirty and previous_root:
+                # Bind the cached identity to the actual committed shard set,
+                # including when recovering state produced by an older build.
+                expected_root = hashlib.sha256(self._root_document(db).encode()).hexdigest()
                 with db:
-                    self._set_meta(db, archive_manifest_generation=generation)
-                return previous_root
+                    if previous_root == expected_root:
+                        self._set_meta(db, archive_manifest_generation=generation)
+                        return previous_root
+                    self._set_meta(db, archive_manifest_sha256="", archive_manifest_generation="")
         for shard in dirty:
             path = directory / ("manifest-" + shard + ".json")
             with self._database(shared=True) as db:
@@ -462,8 +480,7 @@ class ArchiveStore:
         with self._database(shared=True) as db:
             if not self._same_generation(db, generation) or db.execute("SELECT COUNT(*) FROM archive_shards WHERE dirty!=0").fetchone()[0]:
                 return None
-            shards = dict(db.execute("SELECT shard,sha256 FROM archive_shards ORDER BY shard"))
-            sha, size = self._write_manifest(path, [json.dumps({"schema": 1, "shard_chars": self.cfg["shard_prefix_chars"], "shards": shards}, separators=(",", ":"), sort_keys=True)])
+            sha, size = self._write_manifest(path, [self._root_document(db)])
         self._public_immutable(path, self.cfg["public_prefix"] + "manifests/" + sha + ".json", sha, size, "application/json")
         with self._database() as db:
             if not self._same_generation(db, generation):

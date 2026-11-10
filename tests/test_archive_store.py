@@ -153,6 +153,70 @@ class ArchiveTests(unittest.TestCase):
         self.assertTrue(result["ready"])
         self.assertEqual(self.s3.puts.count(self.archive.cfg["public_prefix"] + "objects/" + sha), 1)
 
+    def test_failed_root_upload_rebuilds_from_committed_new_shards(self):
+        path = "feed.xml"
+        old_sha = self.artifact(path, b"<rss>old</rss>")
+        old = self.archive.sync()
+        new_sha = self.artifact(path, b"<rss>corrected</rss>")
+        self.generation(2)
+        upload = self.archive._public_immutable
+        attempted_roots = []
+        def fail_root(file, key, sha, size, mime="application/octet-stream"):
+            if file.name == "manifest-root.json":
+                attempted_roots.append(sha)
+                raise RuntimeError("root upload failed after shards committed")
+            return upload(file, key, sha, size, mime)
+        with patch.object(self.archive, "_public_immutable", side_effect=fail_root):
+            with self.assertRaisesRegex(RuntimeError, "root upload failed"):
+                self.archive.sync()
+        self.assertEqual(self.db.execute("SELECT count(*) FROM archive_shards WHERE dirty!=0").fetchone()[0], 0)
+        self.assertEqual(self.db.execute("SELECT value FROM metadata WHERE key='archive_manifest_sha256'").fetchone()[0], "")
+        self.assertEqual(self.db.execute("SELECT value FROM metadata WHERE key='archive_manifest_generation'").fetchone()[0], "")
+        current = self.archive.sync()
+        self.assertTrue(current["ready"])
+        self.assertEqual(current["manifest_sha256"], attempted_roots[0])
+        self.assertNotEqual(current["manifest_sha256"], old["manifest_sha256"])
+        self.assertEqual(self.lookup(current, path)["sha256"], new_sha)
+        self.assertEqual(self.lookup(old, path)["sha256"], old_sha)
+
+    def test_crash_after_root_upload_resumes_without_reuploading_root(self):
+        path = "news/example/index.html"
+        self.artifact(path, b"old article")
+        old = self.archive.sync()
+        new_sha = self.artifact(path, b"corrected article")
+        self.generation(2)
+        upload = self.archive._public_immutable
+        uploaded_roots = []
+        def crash_after_root(file, key, sha, size, mime="application/octet-stream"):
+            upload(file, key, sha, size, mime)
+            if file.name == "manifest-root.json":
+                uploaded_roots.append(key)
+                raise RuntimeError("crash before root metadata commit")
+        with patch.object(self.archive, "_public_immutable", side_effect=crash_after_root):
+            with self.assertRaisesRegex(RuntimeError, "root metadata"):
+                self.archive.sync()
+        self.assertEqual(self.db.execute("SELECT value FROM metadata WHERE key='archive_manifest_sha256'").fetchone()[0], "")
+        current = self.archive.sync()
+        self.assertTrue(current["ready"])
+        self.assertNotEqual(current["manifest_sha256"], old["manifest_sha256"])
+        self.assertEqual(self.lookup(current, path)["sha256"], new_sha)
+        self.assertEqual(self.s3.puts.count(uploaded_roots[0]), 1)
+
+    def test_stale_cached_root_is_not_rebound_to_a_new_shard_generation(self):
+        path = "feed.json"
+        self.artifact(path, b'{"items":[]}')
+        old = self.archive.sync()
+        new_sha = self.artifact(path, b'{"items":[1]}')
+        self.generation(2)
+        current = self.archive.sync()
+        # Simulate a stale root pointer left by the earlier implementation.
+        self.db.execute("UPDATE metadata SET value=? WHERE key='archive_manifest_sha256'", (old["manifest_sha256"],))
+        self.db.commit()
+        repaired = self.archive.sync()
+        self.assertTrue(repaired["ready"])
+        self.assertEqual(repaired["manifest_sha256"], current["manifest_sha256"])
+        self.assertEqual(self.lookup(repaired, path)["sha256"], new_sha)
+
     def test_public_body_corruption_or_bad_acl_is_not_accepted(self):
         sha = self.artifact("feed.xml", b"<rss/>")
         self.archive.sync()

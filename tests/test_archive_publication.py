@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import shutil
 import tarfile
 import tempfile
 import unittest
@@ -41,6 +42,7 @@ class PermanentPublicationTests(unittest.TestCase):
         cfg = copy.deepcopy(DEFAULTS)
         cfg["site"]["base_url"] = self.p.base_url
         cfg["storage"].update(database=str(self.p.database), output_dir=str(self.p.public))
+        self.app_config = cfg
         with Store(self.p.database) as store:
             build(cfg, store)
 
@@ -68,6 +70,50 @@ class PermanentPublicationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "not been verified"):
                 self.p.publish()
         command.assert_not_called()
+
+    def test_initial_migration_waits_for_the_bounded_article_backfill(self):
+        with Store(self.p.database) as store:
+            store.db.execute("INSERT INTO public_render_queue(story_id) VALUES('still-rendering')")
+            store.db.commit()
+        with patch.object(self.p, "command") as command:
+            with self.assertRaisesRegex(ValueError, "articles pending"):
+                self.p.publish()
+        command.assert_not_called()
+
+    def test_legacy_publication_cannot_drop_a_known_artifact_during_restore(self):
+        self.p.cfg["archive"]["enabled"] = False
+        with Store(self.p.database) as store:
+            store.db.execute("INSERT INTO public_artifacts(path,sha256,size,content_type,updated_at) VALUES(?,?,?,?,?)",
+                             ('news/older/index.html', 'a' * 64, 10, 'text/html', '2026-11-10T00:00:00Z'))
+            store.db.commit()
+        with patch.object(self.p, "command") as command:
+            with self.assertRaisesRegex(ValueError, "snapshot is incomplete"):
+                self.p.publish()
+        command.assert_not_called()
+
+    def test_existing_spaces_copies_remain_ready_during_local_reconstruction(self):
+        with Store(self.p.database) as store:
+            for number in range(3):
+                story = {"id": f"r{number}", "title": "Earlier story", "summary": "An earlier published report.",
+                    "why_it_matters": "", "category": "network", "priority": "normal", "confidence": "reported",
+                    "state": "developing", "tags": ["network"], "sources": [{"url": "https://example.org/report"}],
+                    "published_at": "2025-01-01T00:00:00Z", "updated_at": "2025-01-01T00:00:00Z"}
+                store.db.execute("INSERT INTO stories VALUES(?,?,?,?,?)", (story["id"], story["id"], json.dumps(story), story["published_at"], story["updated_at"]))
+            store.db.commit()
+            build(self.app_config, store)
+        original = self.p.archive.sync()
+        key = "news/r2/index.html"
+        old_sha = self.p.archive.manifest([key], original["generation"])[key]
+        shutil.rmtree(self.p.public)
+        self.app_config["storage"]["render_batch_size"] = 1
+        with Store(self.p.database) as store:
+            result = build(self.app_config, store, force=True)
+        self.assertEqual(result["articles_pending"], 2)
+        self.assertFalse((self.p.public / key).exists())
+        ready = self.p.archive.sync()
+        self.assertTrue(ready["ready"])
+        self.assertEqual(self.p.archive.manifest([key], ready["generation"])[key], old_sha)
+        self.assertIn(self.p.archive.cfg["public_prefix"] + "objects/" + old_sha, self.s3.objects)
 
     def test_prepared_archive_is_bound_to_the_publication_receipt(self):
         commands = []
