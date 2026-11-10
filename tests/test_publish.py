@@ -108,11 +108,13 @@ url = "https://example.org/feed.xml"
         self.assertNotIn("base_path", config["assets"])
         self.assertEqual(config["vars"]["BASE_PATH"], "/onionflash")
 
-    def test_fractional_retry_limit_is_rejected(self):
+    def test_retired_settings_in_an_existing_file_are_ignored(self):
         path = self.directory / "deployment.toml"
-        path.write_text(path.read_text().replace("attempts = 4", "attempts = 1.5"))
-        with self.assertRaises(ValueError):
-            publish.Publisher(path)
+        path.write_text(path.read_text().replace("[cloudflare]\n", '[network]\nattempts = 99\n\n'
+                                                 '[cloudflare]\napi_token_env = "OTHER_NAME"\nverify_paths = ["x"]\n'))
+        p = publish.Publisher(path)
+        self.assertEqual(p.net, publish.NETWORK)
+        self.assertEqual(p.token, os.environ["CLOUDFLARE_API_TOKEN"])
 
     def test_virtualenv_executable_path_preserves_symlink(self):
         binary = self.directory / ".venv/bin/python"
@@ -147,7 +149,9 @@ url = "https://example.org/feed.xml"
     def test_verification_retries_transient_failures_but_not_client_errors(self):
         p = self.publisher
         body = b"live content"
-        manifest = {name: publish.hashlib.sha256(body).hexdigest() for name in p.cf["verify_paths"]}
+        self.assertEqual(publish.VERIFY_PATHS, ("index.html", "feed.xml", "feed.json"))
+        self.assertGreaterEqual(publish.NETWORK["max_response_bytes"], publish.MAX_FILE_BYTES)
+        manifest = {name: publish.hashlib.sha256(body).hexdigest() for name in publish.VERIFY_PATHS}
         transient = [HTTPError("u", 503, "busy", {}, None), URLError("reset"), HTTPError("u", 404, "not yet", {}, None)]
         with patch.object(p, "request", side_effect=transient + [body] * 3), patch("publish.time.sleep") as sleep:
             p.verify("https://example.com/onionflash", manifest)
@@ -212,27 +216,15 @@ url = "https://example.org/feed.xml"
             captured.append(kwargs["env"])
             return subprocess.CompletedProcess(arguments, 0, stdout="{}", stderr="")
         extra = {"DO_SPACES_KEY": "spaces-key-value", "DO_SPACES_SECRET": "spaces-secret-value",
-                 "ONIONFLASH_LLM_API_KEY": "llm-key-value"}
+                 "ONIONFLASH_LLM_API_KEY": "llm-key-value", "CLOUDFLARE_ZONE_TOKEN": "zone-token-value"}
         with patch.dict(os.environ, extra), patch("publish.subprocess.run", side_effect=fake):
             self.publisher.command(["whoami"])
             self.publisher.application("check")
         wrangler, app = captured
         self.assertEqual(wrangler["CLOUDFLARE_API_TOKEN"], self.publisher.token)
-        self.assertFalse({"DO_SPACES_KEY", "DO_SPACES_SECRET", "ONIONFLASH_LLM_API_KEY"} & set(wrangler))
+        self.assertFalse({"CLOUDFLARE_ZONE_TOKEN", "DO_SPACES_KEY", "DO_SPACES_SECRET", "ONIONFLASH_LLM_API_KEY"} & set(wrangler))
         self.assertEqual(app["ONIONFLASH_LLM_API_KEY"], "llm-key-value")
         self.assertFalse({"CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ZONE_TOKEN", "DO_SPACES_KEY", "DO_SPACES_SECRET"} & set(app))
-
-    def test_default_zone_token_stays_out_of_child_processes(self):
-        import subprocess
-        del self.publisher.cf["zone_token_env"]  # api() then falls back to CLOUDFLARE_ZONE_TOKEN
-        captured = []
-        def fake(arguments, **kwargs):
-            captured.append(kwargs["env"])
-            return subprocess.CompletedProcess(arguments, 0, stdout="{}", stderr="")
-        with patch("publish.subprocess.run", side_effect=fake):
-            self.publisher.command(["whoami"])
-            self.publisher.application("check")
-        self.assertTrue(all("CLOUDFLARE_ZONE_TOKEN" not in env for env in captured))
 
     def test_route_conflicts_are_detected_before_any_mutation(self):
         p = self.publisher
@@ -309,15 +301,6 @@ url = "https://example.org/feed.xml"
 
     def test_secret_redaction(self):
         self.assertNotIn(os.environ["CLOUDFLARE_API_TOKEN"], self.publisher.clean_error("failed " + os.environ["CLOUDFLARE_API_TOKEN"]))
-
-    def test_custom_credential_names_are_redacted(self):
-        with patch.dict(os.environ, {"MY_AUTH": "custom-sensitive-value"}):
-            self.publisher.cf["api_token_env"] = "MY_AUTH"
-            self.assertNotIn("custom-sensitive-value", self.publisher.clean_error("custom-sensitive-value"))
-            public = self.public_tree()
-            (public / "index.html").write_text("custom-sensitive-value")
-            with self.assertRaisesRegex(ValueError, "Credential"):
-                self.publisher.validate(public)
 
     def test_status_remains_readable_during_a_running_job(self):
         publish.atomic_json(self.publisher.state / "publication.json", {"version_id": "observed-version", "manifest": {"private": "omit"}})

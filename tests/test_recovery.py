@@ -431,15 +431,6 @@ url = "https://example.org/feed.xml"
     def test_missing_status_record_can_disappear_without_error(self):
         self.assertEqual(publish.read_json(self.directory / "missing.json", {}), {})
 
-    def test_nonfinite_and_boolean_network_values_are_rejected(self):
-        path = self.directory / "deployment.toml"
-        original = path.read_text()
-        for bad in ["nan", "inf", "true"]:
-            with self.subTest(value=bad):
-                path.write_text(original.replace("timeout_seconds = 30", "timeout_seconds = " + bad, 1))
-                with self.assertRaises(ValueError):
-                    publish.Publisher(path)
-
     def anonymous(self, code):
         """Patch the publisher's unsigned request: None means it succeeded, an
         exception is raised as is, and a number is an HTTP status."""

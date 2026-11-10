@@ -17,7 +17,9 @@ Alias: **https://onionflash.1aeo.com/** redirects to the canonical site above.
 ## Quick start
 
 Requirements: Linux or macOS, Python **3.11+** with `venv`/pip, Git, and npm.
-The installer downloads a repository-local, pinned Node.js/Wrangler toolchain.
+The installer runs `npm ci`, which installs the locked Wrangler release and Node.js
+24.21.0 into the repository. The `node` package downloads that binary in its own
+install step, so the lockfile pins its version but does not verify the download.
 Cron is needed only for the optional schedule. Run everything as an ordinary user.
 
 ```sh
@@ -33,12 +35,13 @@ Edit the three generated files (all ignored by Git):
    fallback URLs, and SQLite/output paths. For a LAN LLM, explicitly allow its
    exact addresses in `llm.allowed_networks` and set `allow_http = true` only if
    that endpoint uses HTTP. Source fetching remains restricted to public HTTPS.
-2. **`secrets.env`**: LLM key, Cloudflare account/token, and optionally Spaces keys.
-   Keep mode **600**. `KEY=value` lines use shell-style quoting (a `#` inside a value is
+2. **`secrets.env`**: LLM key, `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN`
+   (plus `CLOUDFLARE_ZONE_TOKEN`/`CLOUDFLARE_ZONE_ID` for `routes`), and optionally
+   `DO_SPACES_KEY`/`DO_SPACES_SECRET`. Keep mode **600**. `KEY=value` lines use shell-style quoting (a `#` inside a value is
    kept, so put comments on their own line; `KEY=abc # note` is rejected); shell
    commands and variable expansion are never executed. Set
    `ONIONFLASH_LLM_BASE_URL` if using the example application's environment reference.
-3. **`deployment.toml`**: Worker name, deployment limits, schedule and optional
+3. **`deployment.toml`**: Worker name, compatibility date, schedule and optional
    Spaces destination. Paths are relative to this file. `spaces.enabled = false`
    is the default. Change the worker name and URL when installing your own copy.
 
@@ -123,7 +126,7 @@ outside it. Source timestamps and original first-publication times are preserved
 ## DigitalOcean Spaces
 
 Set `spaces.enabled = true`, an HTTPS endpoint, region, bucket and private prefix
-in `deployment.toml`. The corresponding environment variable names are configurable.
+in `deployment.toml`, and the two Spaces keys in `secrets.env`.
 Use a dedicated bucket or an isolated prefix such as `onionflash/backups/`, and
 create the bucket privately first.
 
@@ -183,7 +186,7 @@ hold publication, update the two checkouts to reviewed commits, run `install.sh`
 again, verify with `check`, and explicitly resume. Keep previous Git SHAs for code
 rollback. Production installations should use reviewed tags or commit SHAs.
 
-Network limits are in `deployment.example.toml` and the application configuration.
+The publisher's timeouts, retries and size limits are constants in `publish.py`.
 Publication checks retry transient failures and not-yet-propagated files with
 exponential backoff; other client errors fail promptly. Wrangler retries its own API
 calls. LLM and source fallbacks are configured in the application, not hardcoded in
