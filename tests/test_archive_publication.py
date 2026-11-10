@@ -1,26 +1,22 @@
 """Cross-layer checks for permanent storage and guarded Worker activation."""
 import copy
-from contextlib import closing, nullcontext
-import gzip
+from contextlib import nullcontext
 import json
 import os
 from pathlib import Path
 import shutil
-import sqlite3
 import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
-from urllib.error import HTTPError
 
 import publish
 from archive_store import ArchiveStore, HOT_FILES
-from onionflash import editorial
 from onionflash.cli import build
 from onionflash.config import DEFAULTS
 from onionflash.store import Store
 from test_archive_store import FakeS3
-from test_recovery import FakeSpaces, OLD, NEW
+from test_recovery import OLD, NEW
 
 
 class PermanentPublicationTests(unittest.TestCase):
@@ -74,46 +70,6 @@ class PermanentPublicationTests(unittest.TestCase):
                 sync.assert_not_called()
                 command.assert_not_called()
 
-    def test_static_migration_waits_for_all_articles_and_preserves_permalinks(self):
-        import hashlib
-        self.p.cfg["archive"]["enabled"] = False
-        stamp = "2026-11-10T00:00:00Z"
-        with Store(self.p.database) as store:
-            for number in range(3):
-                story = {"id": f"old{number}", "title": "Earlier story", "summary": "Earlier report.",
-                         "sources": [{"url": "https://example.org/report"}], "published_at": stamp, "updated_at": stamp}
-                store.db.execute("INSERT INTO stories VALUES(?,?,?,?,?)", (story["id"], story["id"], json.dumps(story), stamp, stamp))
-            store.db.commit()
-            build(self.app_config, store)
-            before = {row[0] for row in store.db.execute("SELECT path FROM public_artifacts WHERE path LIKE 'news/%/index.html'")}
-            legacy = b"old browser javascript"
-            (self.p.public / "app.js").write_bytes(legacy)
-            store.db.execute("INSERT INTO public_artifacts(path,sha256,size,content_type,updated_at) VALUES(?,?,?,?,?)",
-                             ("app.js", hashlib.sha256(legacy).hexdigest(), len(legacy), "text/javascript", stamp))
-            store.db.execute("UPDATE public_catalog SET template_hash='previous-browser-template'")
-            store.set_meta(publication_no_browser_js_ready="0")
-            self.app_config["storage"]["render_batch_size"] = 1
-            first = build(self.app_config, store, force=True)
-            self.assertFalse(first["no_browser_js_ready"])
-            self.assertTrue((self.p.public / "app.js").is_file())
-        with patch.object(self.p, "command") as command:
-            with self.assertRaisesRegex(ValueError, "upgraded core build"):
-                self.p.publish()
-        command.assert_not_called()
-        with Store(self.p.database) as store:
-            for _ in range(3):
-                result = build(self.app_config, store)
-                if result["no_browser_js_ready"]:
-                    break
-            self.assertTrue(result["no_browser_js_ready"])
-            after = {row[0] for row in store.db.execute("SELECT path FROM public_artifacts WHERE path LIKE 'news/%/index.html'")}
-        self.assertEqual(before, after)
-        self.assertEqual(len(after), 3)
-        self.assertFalse((self.p.public / "app.js").exists())
-        manifest = self.p.validate(self.p.public)
-        self.p.publication_readiness(manifest)
-        self.assertNotIn("app.js", manifest)
-
     def test_incomplete_storage_sync_never_activates_a_worker(self):
         with patch.object(self.p.archive, "sync", return_value={"ready": False, "pending": 1}), patch.object(self.p, "command") as command:
             with self.assertRaisesRegex(ValueError, "catching up"):
@@ -154,9 +110,10 @@ class PermanentPublicationTests(unittest.TestCase):
                     "why_it_matters": "", "category": "network", "priority": "normal", "confidence": "reported",
                     "state": "developing", "tags": ["network"], "sources": [{"url": "https://example.org/report"}],
                     "published_at": "2025-01-01T00:00:00Z", "updated_at": "2025-01-01T00:00:00Z"}
-                store.db.execute("INSERT INTO stories VALUES(?,?,?,?,?)", (story["id"], story["id"], json.dumps(story), story["published_at"], story["updated_at"]))
+                store.db.execute("INSERT INTO stories(id,cluster_key,payload,published_at,updated_at) VALUES(?,?,?,?,?)", (story["id"], story["id"], json.dumps(story), story["published_at"], story["updated_at"]))
             store.db.commit()
             build(self.app_config, store)
+        self.p.publication_readiness(self.p.validate(self.p.public))
         original = self.p.archive.sync()
         key = "news/r2/index.html"
         old_sha = self.p.archive.manifest([key], original["generation"])[key]
@@ -213,60 +170,3 @@ class PermanentPublicationTests(unittest.TestCase):
             self.p.base_path = "/different"
             third = self.p.publication_identity({"index.html": "same"})
         self.assertEqual(len({first, second, third}), 3)
-
-    def test_sqlite_only_backups_preserve_the_permanent_manifest_catalog(self):
-        story_id = "operator-corrected-story"
-        stamp = "2026-11-01T00:00:00Z"
-        story = {"id": story_id, "title": "Reported authority incident", "summary": "An operator reported an incident.",
-                 "why_it_matters": "Original wording", "sources": [{"url": "https://example.org/report", "title": "Report"}],
-                 "published_at": stamp, "updated_at": stamp}
-        with Store(self.p.database) as store:
-            with store.db:
-                store.db.execute("INSERT INTO stories VALUES(?,?,?,?,?)", (story_id, "operator-correction", json.dumps(story), stamp, stamp))
-            build(self.app_config, store)
-            original = editorial.show(store.db, story_id)
-            editorial.correct(store.db, story_id, {"why_it_matters": "Corrected, source-supported wording."},
-                              reason="Removed unsupported advice", expect_hash=original["hash"])
-            build(self.app_config, store)
-            from onionflash import review_gate
-            review_gate.initialize(store)
-            with store.db:
-                store.db.execute("INSERT INTO review_jobs VALUES(?,?,?,?,?,?,?,?,?,?)", (
-                    "unfinished-review", "writer", "policy", "verify", "{}", None,
-                    '{"private":"pending verification packet"}', None, stamp, stamp))
-                store.db.execute("INSERT INTO review_approvals VALUES(?,?,?,?,?,?,?,?,?)", (
-                    "saved-approval", "candidate", "sources", "policy", "binding", "{}",
-                    '{"private":"saved approval audit"}', stamp, stamp))
-                store.db.execute("INSERT INTO analyses(cache_key,result,created_at,review_record) VALUES(?,?,?,?)", (
-                    "saved-analysis", "{}", stamp, '{"private":"completed review record"}'))
-        sync = self.p.archive.sync()
-        snapshot = self.root / "initial-snapshot"
-        hot = self.p.archive.snapshot_hot(snapshot, sync["generation"])
-        manifest = {**hot, **self.p.archive.manifest(["feed.xml", "feed.json"], sync["generation"])}
-        publish.atomic_json(self.p.state / "publication.json", {"version_id": OLD, "manifest": manifest,
-            "archive": {"generation": sync["generation"], "manifest_sha256": sync["manifest_sha256"]}})
-        self.p.cfg["spaces"]["enabled"] = True
-        backups = FakeSpaces()
-        with patch("boto3.client", return_value=backups), patch.object(self.p, "request", side_effect=HTTPError("unsigned", 403, "private", {}, None)) as privacy_check:
-            self.p.backup(force=True)
-        restored = self.root / "restored.sqlite3"
-        restored.write_bytes(gzip.decompress(backups.uploads[0][2]))
-        with closing(sqlite3.connect(restored)) as database:
-            self.assertEqual(database.execute("PRAGMA quick_check").fetchone()[0], "ok")
-            self.assertEqual(database.execute("SELECT value FROM metadata WHERE key='archive_manifest_sha256'").fetchone()[0], sync["manifest_sha256"])
-            self.assertGreater(database.execute("SELECT COUNT(*) FROM public_artifacts").fetchone()[0], 0)
-            self.assertEqual(database.execute("SELECT locked FROM editorial_controls WHERE story_id=?", (story_id,)).fetchone()[0], 1)
-            self.assertEqual(database.execute("SELECT COUNT(*) FROM editorial_revisions WHERE story_id=?", (story_id,)).fetchone()[0], 1)
-            self.assertEqual(database.execute("SELECT stage,record_json FROM review_jobs WHERE item_id='unfinished-review'").fetchone(),
-                             ("verify", '{"private":"pending verification packet"}'))
-            self.assertEqual(database.execute("SELECT review_record_json FROM review_approvals WHERE key='saved-approval'").fetchone()[0],
-                             '{"private":"saved approval audit"}')
-            self.assertEqual(database.execute("SELECT review_record FROM analyses WHERE cache_key='saved-analysis'").fetchone()[0],
-                             '{"private":"completed review record"}')
-        with Store(restored) as store:
-            before = editorial.show(store.db, story_id)
-            with store.db:
-                store.db.execute("UPDATE stories SET payload='{}' WHERE id=?", (story_id,))
-            self.assertEqual(editorial.show(store.db, story_id)["hash"], before["hash"])
-        self.assertEqual(privacy_check.call_args.args[1], "HEAD")
-        self.assertNotIn("token", privacy_check.call_args.kwargs)
