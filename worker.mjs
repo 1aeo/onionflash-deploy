@@ -90,15 +90,13 @@ async function originRequest(url, method, settings, consume) {
     const timer = setTimeout(() => controller.abort(), settings.timeout);
     let response;
     try {
-      response = await fetch(url, { method, redirect: "error", signal: controller.signal,
+      // Workers rejects redirect: "error". With "manual" a 3xx comes back, and consume refuses it as not ok.
+      response = await fetch(url, { method, redirect: "manual", signal: controller.signal,
         // Do not forward cookies, Authorization, Host, Range or arbitrary headers.
         headers: { "Accept-Encoding": "identity" },
         cf: { cacheEverything: true, cacheTtlByStatus: { "200-299": settings.objectTtl, "403-404": 0, "500-599": 0 } },
       });
-      if (response.status >= 300 && response.status < 400) {
-        await response.body?.cancel();
-        throw new Error("Archive redirect is not allowed");
-      }
+      // consume returns refusals rather than throwing, so only failed fetches or reads, 429 and 5xx are retried.
       if (response.status !== 429 && response.status < 500) return await consume(response, controller);
       await response.body?.cancel();
     } catch (failure) {
@@ -167,13 +165,14 @@ function idleBody(response, originController, timeout, expectedSize) {
 
 async function manifest(origin, hash, settings) {
   if (!HASH.test(hash || "")) throw new Error("Invalid manifest identity");
+  // A refused manifest is null, which the root and shard checks reject.
   return originRequest(new URL(`manifests/${hash}.json`, origin), "GET", settings, async response => {
-    if (!response.ok || Number(response.headers.get("content-length")) > settings.manifestBytes) {
+    if (!response.ok) {
       await response.body?.cancel();
-      throw new Error("Archive manifest unavailable");
+      return null;
     }
     const reader = response.body?.getReader();
-    if (!reader) throw new Error("Archive manifest missing");
+    if (!reader) return null;
     const chunks = [];
     let total = 0;
     try {
@@ -181,7 +180,7 @@ async function manifest(origin, hash, settings) {
         const { done, value } = await reader.read();
         if (done) break;
         total += value.byteLength;
-        if (total > settings.manifestBytes) throw new Error("Archive manifest exceeds limit");
+        if (total > settings.manifestBytes) return null;
         chunks.push(value);
       }
     } finally {
@@ -190,7 +189,7 @@ async function manifest(origin, hash, settings) {
     const bytes = new Uint8Array(total);
     let offset = 0;
     for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
-    if (await sha256(bytes) !== hash) throw new Error("Archive manifest hash mismatch");
+    if (await sha256(bytes) !== hash) return null;
     return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
   });
 }
@@ -223,13 +222,9 @@ async function archived(request, env, key) {
     return new Response(null, { status: 304, headers });
   }
   return originRequest(new URL(`objects/${entry.sha256}`, origin), request.method, settings, async (response, originController) => {
-    if (!response.ok) {
+    if (!response.ok || Number(response.headers.get("content-length")) !== entry.size || response.headers.get("x-amz-meta-sha256") !== entry.sha256) {
       await response.body?.cancel();
       return error(response.status === 403 || response.status === 404 ? 404 : 503);
-    }
-    if (Number(response.headers.get("content-length")) !== entry.size || response.headers.get("x-amz-meta-sha256") !== entry.sha256) {
-      await response.body?.cancel();
-      throw new Error("Archive object metadata mismatch");
     }
     if (request.method === "HEAD") {
       if (response.body) {
