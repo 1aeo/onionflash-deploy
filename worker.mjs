@@ -2,7 +2,7 @@
 // immutable manifest selected by this Worker version, so rollbacks stay exact.
 const HASH = /^[a-f0-9]{64}$/;
 const TOPICS = "security|release|dos|directory-authority|relay|protocol|feature|network";
-const HTML_POLICY = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+const HTML_POLICY = "default-src 'none'; script-src 'none'; style-src 'self'; img-src 'self'; connect-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 const DATA_POLICY = "default-src 'none'; script-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
 function integer(env, name, fallback, min, max) {
@@ -13,17 +13,32 @@ function integer(env, name, fallback, min, max) {
   return value;
 }
 
+function topicAllowed(topic, env) {
+  const configured = env.ARCHIVE_TOPICS ?? TOPICS.split("|").join(",");
+  if (typeof configured !== "string" || configured.length > 4096) return false;
+  const topics = configured.split(",");
+  if (topics.length > 100 || topics.some(value => !/^[a-z][a-z0-9-]{0,39}$/.test(value))) return false;
+  return topics.includes(topic);
+}
+
 function archivePath(path, env) {
   if (path === "/feed.xml" || path === "/feed.json") return { key: path.slice(1) };
   const topic = path.match(/^\/tags\/([a-z][a-z0-9-]{0,39})\.xml$/);
-  if (topic) {
-    const configured = env.ARCHIVE_TOPICS ?? TOPICS.split("|").join(",");
-    if (typeof configured !== "string" || configured.length > 4096) return null;
-    const topics = configured.split(",");
-    if (topics.length > 100 || topics.some(value => !/^[a-z][a-z0-9-]{0,39}$/.test(value))) return null;
-    return topics.includes(topic[1]) ? { key: path.slice(1) } : null;
+  if (topic) return topicAllowed(topic[1], env) ? { key: path.slice(1) } : null;
+  let match = path.match(/^\/topics\/([a-z][a-z0-9-]{0,39})(\/|\/index\.html)?$/);
+  if (match) {
+    if (!topicAllowed(match[1], env)) return null;
+    if (match[2] !== "/") return { redirect: `/topics/${match[1]}/` };
+    return { key: `topics/${match[1]}/index.html` };
   }
-  let match = path.match(/^\/news\/([A-Za-z0-9_-]{1,64})(\/|\/index\.html|\/story\.json)?$/);
+  match = path.match(/^\/topics\/([a-z][a-z0-9-]{0,39})\/page\/([1-9][0-9]{0,8})(\/|\/index\.html)?$/);
+  if (match) {
+    if (!topicAllowed(match[1], env)) return null;
+    if (match[2] === "1") return { redirect: `/topics/${match[1]}/` };
+    if (match[3] !== "/") return { redirect: `/topics/${match[1]}/page/${match[2]}/` };
+    return { key: `topics/${match[1]}/page/${match[2]}/index.html` };
+  }
+  match = path.match(/^\/news\/([A-Za-z0-9_-]{1,64})(\/|\/index\.html|\/story\.json)?$/);
   if (match) {
     if (!match[2] || match[2] === "/index.html") return { redirect: `/news/${match[1]}/` };
     return { key: `news/${match[1]}/${match[2] === "/story.json" ? "story.json" : "index.html"}` };

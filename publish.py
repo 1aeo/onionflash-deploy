@@ -46,15 +46,12 @@ SPACES_KEY, SPACES_SECRET = "DO_SPACES_KEY", "DO_SPACES_SECRET"
 def public_files():
     """Fixed files the application renders (story pages and topic feeds vary)."""
     from onionflash.render import ASSET_FILES
-    return {"index.html", "feed.xml", "feed.json", "_headers", *ASSET_FILES}
+    return {"index.html", "feed.xml", "feed.json", "_headers", *ASSET_FILES} - {"app.js"}
 
 
 def public_path_allowed(relative):
-    from onionflash.schema import CATEGORIES
-    return (relative in public_files() or
-            bool(re.fullmatch(r"news/[A-Za-z0-9_-]{1,64}/(?:index\.html|story\.json)", relative)) or
-            bool(re.fullmatch(r"page/[1-9][0-9]{0,8}/index\.html", relative)) or
-            relative in {f"tags/{topic}.xml" for topic in CATEGORIES})
+    from archive_store import archive_path_allowed
+    return relative in public_files() or archive_path_allowed(relative)
 
 
 def atomic_json(path, value):
@@ -324,7 +321,7 @@ class Publisher:
                   "vars": self.worker_vars(archive)}
         if archive:
             config["assets"]["run_worker_first"] = [self.base_path + path for path in (
-                "/news/*", "/page/*", "/feed.xml", "/feed.json", "/tags/*")]
+                "/news/*", "/page/*", "/topics/*", "/feed.xml", "/feed.json", "/tags/*")]
         target = self.state / "wrangler.json"
         atomic_json(target, config)
         return target
@@ -363,6 +360,9 @@ class Publisher:
             body = path.read_bytes()
             if any(secret in body for secret in secrets):
                 raise ValueError("Credential detected in public output")
+            if relative.endswith(".html"):
+                from public_html import validate_static_html
+                validate_static_html(path)
             files[relative] = hashlib.sha256(body).hexdigest()
         if len(files) > MAX_FILES:
             raise ValueError("Public output exceeds file count budget")
@@ -463,14 +463,19 @@ class Publisher:
         from contextlib import closing
         with lock(str(self.database) + ".lock", shared=True), closing(sqlite3.connect(self.database.as_uri() + "?mode=ro", uri=True)) as db:
             if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='public_artifacts'").fetchone():
-                return
+                raise ValueError("Run the upgraded core build before publishing this database")
             pending = db.execute("SELECT value FROM metadata WHERE key='publication_build_pending'").fetchone()
             if pending and pending[0] == "1":
                 raise ValueError("Publication build is incomplete; existing site retained")
+            ready = db.execute("SELECT value FROM metadata WHERE key='publication_no_browser_js_ready'").fetchone()
+            if ready is None or ready[0] != "1":
+                raise ValueError("No-browser-JavaScript migration is incomplete; run the upgraded core build")
             if initial_archive and db.execute("SELECT 1 FROM public_render_queue WHERE last_error IS NULL LIMIT 1").fetchone():
                 raise ValueError("Initial permanent-storage migration still has articles pending")
             if manifest is not None:
                 for path, sha in db.execute("SELECT path,sha256 FROM public_artifacts"):
+                    if path == "app.js":
+                        continue  # Retired in new releases; immutable old versions remain intact.
                     if manifest.get(path) != sha:
                         raise ValueError("Local publication snapshot is incomplete: " + path)
 
@@ -481,6 +486,7 @@ class Publisher:
             raise ValueError("Publication is on hold; inspect status and use the explicit resume command")
         if not self.public.is_dir():
             raise ValueError("Build the public output first")
+        self.publication_readiness()
         previous = read_json(self.state / "publication.json", {})
         archive_info = None
         with tempfile.TemporaryDirectory(prefix="release-", dir=self.state) as temporary:
@@ -504,7 +510,8 @@ class Publisher:
                                 "generation": generation, "origin": self.archive.cfg["public_origin"]}
             else:
                 with lock(str(self.database) + ".lock", shared=True):
-                    shutil.copytree(self.public, stage, symlinks=True)
+                    shutil.copytree(self.public, stage, symlinks=True,
+                                    ignore=lambda directory, names: {"app.js"} if Path(directory) == self.public else set())
                 manifest = self.validate(stage)
                 self.publication_readiness(manifest)
                 if any(re.fullmatch(r"news/[A-Za-z0-9_-]{1,64}/index\.html", path) and path not in manifest

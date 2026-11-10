@@ -55,8 +55,64 @@ class PermanentPublicationTests(unittest.TestCase):
         config = json.loads(self.p.make_config(self.p.prepare_assets(snapshot), archive=info).read_text())
         self.assertEqual(config["vars"]["ARCHIVE_MANIFEST_SHA"], info["manifest_sha256"])
         self.assertIn("/onionflash/news/*", config["assets"]["run_worker_first"])
+        self.assertIn("/onionflash/topics/*", config["assets"]["run_worker_first"])
         self.assertNotIn("/onionflash/*", config["assets"]["run_worker_first"])
         self.assertEqual(set(hot), HOT_FILES)
+        self.assertNotIn("app.js", hot)
+
+    def test_missing_or_pending_static_migration_blocks_before_archive_sync(self):
+        for value in [None, "0"]:
+            with self.subTest(value=value):
+                with Store(self.p.database) as store:
+                    store.db.execute("DELETE FROM metadata WHERE key='publication_no_browser_js_ready'")
+                    if value is not None:
+                        store.set_meta(publication_no_browser_js_ready=value)
+                    store.db.commit()
+                with patch.object(self.p.archive, "sync") as sync, patch.object(self.p, "command") as command:
+                    with self.assertRaisesRegex(ValueError, "upgraded core build"):
+                        self.p.publish()
+                sync.assert_not_called()
+                command.assert_not_called()
+
+    def test_static_migration_waits_for_all_articles_and_preserves_permalinks(self):
+        import hashlib
+        self.p.cfg["archive"]["enabled"] = False
+        stamp = "2026-11-10T00:00:00Z"
+        with Store(self.p.database) as store:
+            for number in range(3):
+                story = {"id": f"old{number}", "title": "Earlier story", "summary": "Earlier report.",
+                         "sources": [{"url": "https://example.org/report"}], "published_at": stamp, "updated_at": stamp}
+                store.db.execute("INSERT INTO stories VALUES(?,?,?,?,?)", (story["id"], story["id"], json.dumps(story), stamp, stamp))
+            store.db.commit()
+            build(self.app_config, store)
+            before = {row[0] for row in store.db.execute("SELECT path FROM public_artifacts WHERE path LIKE 'news/%/index.html'")}
+            legacy = b"old browser javascript"
+            (self.p.public / "app.js").write_bytes(legacy)
+            store.db.execute("INSERT INTO public_artifacts(path,sha256,size,content_type,updated_at) VALUES(?,?,?,?,?)",
+                             ("app.js", hashlib.sha256(legacy).hexdigest(), len(legacy), "text/javascript", stamp))
+            store.db.execute("UPDATE public_catalog SET template_hash='previous-browser-template'")
+            store.set_meta(publication_no_browser_js_ready="0")
+            self.app_config["storage"]["render_batch_size"] = 1
+            first = build(self.app_config, store, force=True)
+            self.assertFalse(first["no_browser_js_ready"])
+            self.assertTrue((self.p.public / "app.js").is_file())
+        with patch.object(self.p, "command") as command:
+            with self.assertRaisesRegex(ValueError, "upgraded core build"):
+                self.p.publish()
+        command.assert_not_called()
+        with Store(self.p.database) as store:
+            for _ in range(3):
+                result = build(self.app_config, store)
+                if result["no_browser_js_ready"]:
+                    break
+            self.assertTrue(result["no_browser_js_ready"])
+            after = {row[0] for row in store.db.execute("SELECT path FROM public_artifacts WHERE path LIKE 'news/%/index.html'")}
+        self.assertEqual(before, after)
+        self.assertEqual(len(after), 3)
+        self.assertFalse((self.p.public / "app.js").exists())
+        manifest = self.p.validate(self.p.public)
+        self.p.publication_readiness(manifest)
+        self.assertNotIn("app.js", manifest)
 
     def test_incomplete_storage_sync_never_activates_a_worker(self):
         with patch.object(self.p.archive, "sync", return_value={"ready": False, "pending": 1}), patch.object(self.p, "command") as command:

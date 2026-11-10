@@ -129,6 +129,18 @@ url = "https://example.org/feed.xml"
         self.assertEqual((receipt["version_id"], receipt["previous_version_id"]), (NEW, OLD))
         self.assertEqual(publish.read_json(self.p.state / "publication.json")["version_id"], NEW)
 
+    def test_new_static_snapshot_omits_retired_script_and_old_receipt_is_unchanged(self):
+        self.seed_public()
+        (self.p.public / "app.js").write_text("legacy javascript")
+        previous = receipt(OLD)
+        previous["manifest"]["app.js"] = "a" * 64
+        publish.atomic_json(self.p.state / "publication.json", previous)
+        self.fake_cloudflare(OLD)
+        result = self.p.publish()
+        self.assertNotIn("app.js", result["manifest"])
+        preserved = publish.read_json(self.p.state / "receipts" / (OLD + ".json"))
+        self.assertEqual(preserved["manifest"]["app.js"], "a" * 64)
+
     def test_failed_live_check_rolls_back_and_fails_without_holding(self):
         self.seed_public()
         publish.atomic_json(self.p.state / "publication.json", receipt(OLD))

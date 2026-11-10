@@ -2,6 +2,7 @@ import base64
 import hashlib
 import io
 import json
+import re
 import sqlite3
 import tempfile
 import tomllib
@@ -70,7 +71,9 @@ class ArchiveTests(unittest.TestCase):
         self.db.executescript("""CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT);
             INSERT INTO metadata VALUES('publication_generation','1');
             INSERT INTO metadata VALUES('publication_build_pending','0');
+            INSERT INTO metadata VALUES('publication_no_browser_js_ready','1');
             CREATE TABLE public_artifacts(path TEXT PRIMARY KEY,sha256 TEXT,size INTEGER,content_type TEXT,updated_at TEXT,uploaded_sha256 TEXT);
+            CREATE TABLE public_catalog(story_id TEXT PRIMARY KEY);
         """)
         self.s3 = FakeS3()
         self.archive = ArchiveStore(self.publisher, self.s3)
@@ -83,6 +86,9 @@ class ArchiveTests(unittest.TestCase):
         target.write_bytes(body)
         sha = hashlib.sha256(body).hexdigest()
         self.db.execute("INSERT INTO public_artifacts VALUES(?,?,?,?,?,NULL) ON CONFLICT(path) DO UPDATE SET sha256=excluded.sha256,size=excluded.size,content_type=excluded.content_type", (path, sha, len(body), content_type(path), "2026-11-10T00:00:00Z"))
+        article = re.fullmatch(r"news/([A-Za-z0-9_-]{1,64})/index\.html", path)
+        if article:
+            self.db.execute("INSERT OR IGNORE INTO public_catalog(story_id) VALUES(?)", (article[1],))
         self.db.commit()
         return sha
 
@@ -302,16 +308,51 @@ class ArchiveTests(unittest.TestCase):
             self.archive.put_private(path, key)
         self.assertEqual(self.s3.puts.count(key), 1)
 
-    def test_missing_source_row_does_not_remove_published_permalink(self):
+    def test_missing_artifact_record_holds_new_root_without_removing_published_permalink(self):
         path = "news/old/index.html"
         self.artifact(path, b"permanent")
         first = self.archive.sync()
         self.db.execute("DELETE FROM public_artifacts WHERE path=?", (path,))
         self.db.commit()
         self.generation(2)
-        second = self.archive.sync()
-        self.assertEqual(second["manifest_sha256"], first["manifest_sha256"])
-        self.assertEqual(self.lookup(second, path)["sha256"], hashlib.sha256(b"permanent").hexdigest())
+        puts = list(self.s3.puts)
+        with self.assertRaisesRegex(ValueError, "Retained article publication records"):
+            self.archive.sync()
+        self.assertEqual(self.s3.puts, puts)
+        self.assertEqual(self.lookup(first, path)["sha256"], hashlib.sha256(b"permanent").hexdigest())
+        self.assertIsNotNone(self.db.execute("SELECT path FROM archive_index WHERE path=?", (path,)).fetchone())
+
+    def test_orphan_scripted_remote_article_cannot_enter_or_reuse_a_new_ready_root(self):
+        path = "news/orphan/index.html"
+        sha = self.artifact(path, b'<script src="../../app.js"></script><p>Old remote article</p>')
+        # An immutable root produced before the static-HTML validator existed.
+        with patch("public_html.validate_static_html"):
+            old = self.archive.sync()
+        self.db.execute("DELETE FROM public_artifacts WHERE path=?", (path,))
+        self.db.execute("DELETE FROM public_catalog WHERE story_id='orphan'")
+        self.db.commit()
+        (self.publisher.public / path).unlink()
+        self.artifact("feed.xml", b"<rss>Unrelated pending change</rss>")
+        self.generation(2)
+        puts = list(self.s3.puts)
+        with self.assertRaisesRegex(ValueError, "Retained article publication records"):
+            self.archive.sync()
+        self.assertEqual(self.s3.puts, puts)  # No object or new root uploaded.
+        with tempfile.TemporaryDirectory(dir=self.publisher.state) as temporary:
+            with self.assertRaisesRegex(ValueError, "Retained article publication records"):
+                self.archive._prepare_manifest("2", Path(temporary))
+        self.assertEqual(self.lookup(old, path)["sha256"], sha)
+        self.assertIn(self.archive.cfg["public_prefix"] + "objects/" + sha, self.s3.objects)
+        self.assertEqual(self.db.execute("SELECT value FROM metadata WHERE key='archive_manifest_sha256'").fetchone()[0], old["manifest_sha256"])
+
+    def test_retained_article_requires_both_catalog_and_artifact_records(self):
+        path = "news/known/index.html"
+        self.artifact(path, b"<p>Accepted article</p>")
+        self.archive.sync()
+        self.db.execute("DELETE FROM public_catalog WHERE story_id='known'")
+        self.db.commit()
+        with self.assertRaisesRegex(ValueError, "Retained article publication records"):
+            self.archive.sync()
 
     def test_obsolete_pagination_path_leaves_active_manifest_but_not_history(self):
         path = "page/3/index.html"
@@ -326,6 +367,78 @@ class ArchiveTests(unittest.TestCase):
         with self.assertRaises(KeyError):
             self.lookup(second, path)
         self.assertIn(self.archive.cfg["public_prefix"] + "objects/" + sha, self.s3.objects)
+
+    def test_topic_html_and_pagination_have_exact_safe_paths(self):
+        from archive_store import archive_path_allowed
+        paths = ["topics/security/index.html", "topics/security/page/2/index.html"]
+        for path in paths:
+            self.assertTrue(archive_path_allowed(path))
+            self.artifact(path, b"<p>Static topic index</p>")
+        for path in ["topics/private/index.html", "topics/security/../private/index.html",
+                     "topics/security/page/0/index.html", "topics/security/page/02/index.html",
+                     "topics/security/page/1000000000/index.html", "topics/security/app.js"]:
+            self.assertFalse(archive_path_allowed(path))
+        before = self.archive.sync()
+        self.db.execute("DELETE FROM public_artifacts WHERE path=?", (paths[1],))
+        self.db.commit()
+        self.generation(2)
+        after = self.archive.sync()
+        self.assertTrue(after["ready"])
+        self.assertEqual(self.lookup(before, paths[1])["content_type"], "text/html; charset=utf-8")
+        self.assertEqual(self.lookup(after, paths[0])["content_type"], "text/html; charset=utf-8")
+        with self.assertRaises(KeyError):
+            self.lookup(after, paths[1])
+
+    def test_retired_script_leaves_new_root_and_hot_snapshot_but_old_root_survives(self):
+        self.artifact("news/permanent/index.html", b"<p>Permanent article</p>")
+        first = self.archive.sync()
+        # Simulate an older all-file archive catalog, including immutable script
+        # bytes and a root which an existing version can still select.
+        script = b"console.log('legacy browser behavior')"
+        script_sha = self.artifact("app.js", script)
+        prefix = self.archive.cfg["public_prefix"]
+        self.s3.objects[prefix + "objects/" + script_sha] = {
+            "body": script, "metadata": {"sha256": script_sha}, "acl": "public-read", "type": "text/javascript", "cache": "immutable"}
+        self.archive._initialize()
+        shard = hashlib.sha256(b"app.js").hexdigest()[:self.archive.cfg["shard_prefix_chars"]]
+        self.db.execute("INSERT INTO archive_index VALUES(?,?,?,?,?)", ("app.js", script_sha, len(script), "text/javascript", shard))
+        self.db.execute("INSERT INTO archive_shards(shard,dirty) VALUES(?,1) ON CONFLICT(shard) DO UPDATE SET dirty=1", (shard,))
+        self.db.commit()
+        with tempfile.TemporaryDirectory(dir=self.publisher.state) as temporary:
+            old_hash = self.archive._prepare_manifest("1", Path(temporary))
+        old = {"manifest_sha256": old_hash}
+        self.assertEqual(self.lookup(old, "app.js")["sha256"], script_sha)
+        existing_objects = dict(self.s3.objects)
+        self.generation(2)
+        current = self.archive.sync()
+        self.assertTrue(current["ready"])
+        self.assertNotEqual(current["manifest_sha256"], old_hash)
+        with self.assertRaises(KeyError):
+            self.lookup(current, "app.js")
+        self.assertEqual(self.lookup(old, "app.js")["sha256"], script_sha)
+        self.assertEqual(self.lookup(first, "news/permanent/index.html"), self.lookup(current, "news/permanent/index.html"))
+        for key, value in existing_objects.items():
+            self.assertEqual(self.s3.objects[key], value)
+        snapshot = self.root / "no-script-hot"
+        self.assertNotIn("app.js", self.archive.snapshot_hot(snapshot, current["generation"]))
+        self.assertFalse((snapshot / "app.js").exists())
+
+    def test_static_migration_gate_prevents_any_archive_upload(self):
+        for value in [None, "0"]:
+            with self.subTest(value=value):
+                self.db.execute("DELETE FROM metadata WHERE key='publication_no_browser_js_ready'")
+                if value is not None:
+                    self.db.execute("INSERT INTO metadata VALUES('publication_no_browser_js_ready',?)", (value,))
+                self.db.commit()
+                with self.assertRaisesRegex(ValueError, "upgraded core build"):
+                    self.archive.sync()
+                self.assertEqual(self.s3.puts, [])
+
+    def test_scripted_archive_html_is_rejected_after_hash_validation(self):
+        self.artifact("topics/security/index.html", b'<p onclick="alert(1)">Bad</p>')
+        with self.assertRaisesRegex(ValueError, "event handler"):
+            self.archive.sync()
+        self.assertEqual(self.s3.puts, [])
 
     def test_transient_storage_failures_use_configured_backoff(self):
         self.s3.fail_puts = 1
@@ -347,8 +460,7 @@ class ArchiveTests(unittest.TestCase):
         self.artifact(path, b"permanent")
         first = self.archive.sync()
         puts = [key for key in self.s3.puts if "/objects/" in key]
-        self.db.execute("DELETE FROM public_artifacts WHERE path=?", (path,))
-        self.db.commit()
+        (self.publisher.public / path).unlink()  # Local rebuild may lag verified ledger records.
         self.archive.cfg["shard_prefix_chars"] = 3
         second = self.archive.sync()
         self.assertTrue(second["ready"])

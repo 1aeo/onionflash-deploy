@@ -20,7 +20,8 @@ from urllib.parse import urlsplit
 from onionflash.render import ASSET_FILES
 from onionflash.schema import CATEGORIES
 
-HOT_FILES = frozenset({"index.html", "_headers", *ASSET_FILES})
+RETIRED_FILES = frozenset({"app.js"})
+HOT_FILES = frozenset({"index.html", "_headers", *ASSET_FILES}) - RETIRED_FILES
 SHA = re.compile(r"[a-f0-9]{64}\Z")
 ALL_USERS = "http://acs.amazonaws.com/groups/global/AllUsers"
 CHUNK = 65536
@@ -36,7 +37,15 @@ def archive_path_allowed(path):
         or re.fullmatch(r"news/[A-Za-z0-9_-]{1,64}/(?:index\.html|story\.json)", path)
         or re.fullmatch(r"page/[1-9][0-9]{0,8}/index\.html", path)
         or path in {f"tags/{topic}.xml" for topic in CATEGORIES}
+        or topic_path_allowed(path)
     )
+
+
+def topic_path_allowed(path):
+    if not isinstance(path, str):
+        return False
+    match = re.fullmatch(r"topics/([a-z][a-z0-9-]{0,39})/(?:page/[1-9][0-9]{0,8}/)?index\.html", path)
+    return bool(match and match[1] in CATEGORIES)
 
 
 def content_type(path):
@@ -195,6 +204,9 @@ class ArchiveStore:
         pending = db.execute("SELECT value FROM metadata WHERE key='publication_build_pending'").fetchone()
         if pending and pending[0] == "1":
             raise ValueError("Public build has not completed")
+        ready = db.execute("SELECT value FROM metadata WHERE key='publication_no_browser_js_ready'").fetchone()
+        if ready is None or ready[0] != "1":
+            raise ValueError("No-browser-JavaScript migration is incomplete; run the upgraded core build")
         row = db.execute("SELECT value FROM metadata WHERE key='publication_generation'").fetchone()
         if row is None:
             raise ValueError("Build the incremental public catalog before publishing")
@@ -209,10 +221,33 @@ class ArchiveStore:
     def _set_meta(db, **values):
         db.executemany("INSERT INTO metadata(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", values.items())
 
+    @staticmethod
+    def _validate_retained_articles(db):
+        """An old remote HTML mapping needs current accepted publication records.
+
+        Local files may be rebuilding, but absent ledger rows cannot establish
+        that an immutable old article has completed the static-template upgrade.
+        Keep its old route/object intact and stop the new publication instead.
+        """
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='archive_index'").fetchone():
+            return
+        if not db.execute("SELECT 1 FROM archive_index WHERE path LIKE 'news/%/index.html' LIMIT 1").fetchone():
+            return
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='public_catalog'").fetchone():
+            raise ValueError("Retained article publication records are missing; restore the accepted catalog before publishing")
+        missing = db.execute("""SELECT 1 FROM archive_index a
+            LEFT JOIN public_artifacts p ON p.path=a.path
+            LEFT JOIN public_catalog c ON c.story_id=substr(a.path,6,length(a.path)-16)
+            WHERE a.path LIKE 'news/%/index.html' AND (p.path IS NULL OR c.story_id IS NULL)
+            LIMIT 1""").fetchone()
+        if missing:
+            raise ValueError("Retained article publication records are missing; restore the accepted catalog and artifact ledger before publishing")
+
     def _initialize(self):
         destination = hashlib.sha256(str((self.cfg["endpoint_url"], self.bucket, self.cfg["public_prefix"])).encode()).hexdigest()
         with self._database() as db:
             self._generation(db)
+            self._validate_retained_articles(db)
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS archive_index (
                     path TEXT PRIMARY KEY, sha256 TEXT NOT NULL, size INTEGER NOT NULL,
@@ -232,11 +267,21 @@ class ArchiveStore:
                     WHEN NEW.path NOT IN ('index.html','style.css','app.js','mark.svg','_headers')
                     AND (OLD.sha256!=NEW.sha256 OR OLD.size!=NEW.size OR OLD.content_type!=NEW.content_type)
                     BEGIN INSERT INTO archive_dirty_paths(path) SELECT NEW.path WHERE NOT EXISTS (SELECT 1 FROM archive_dirty_paths WHERE path=NEW.path); END;
-                CREATE TRIGGER IF NOT EXISTS archive_page_delete AFTER DELETE ON public_artifacts
-                    WHEN OLD.path LIKE 'page/%'
+                DROP TRIGGER IF EXISTS archive_page_delete;
+                CREATE TRIGGER archive_page_delete AFTER DELETE ON public_artifacts
+                    WHEN OLD.path LIKE 'page/%' OR OLD.path LIKE 'topics/%'
                     BEGIN INSERT INTO archive_dirty_paths(path) SELECT OLD.path WHERE NOT EXISTS (SELECT 1 FROM archive_dirty_paths WHERE path=OLD.path); END;
             """)
             with db:
+                # Retire routing entries only. Old content-addressed objects,
+                # immutable manifests and version receipts remain for rollback.
+                for retired in RETIRED_FILES:
+                    row = db.execute("SELECT shard FROM archive_index WHERE path=?", (retired,)).fetchone()
+                    if row:
+                        db.execute("DELETE FROM archive_index WHERE path=?", (retired,))
+                        db.execute("INSERT INTO archive_shards(shard,dirty) VALUES(?,1) ON CONFLICT(shard) DO UPDATE SET dirty=1", (row[0],))
+                    db.execute("DELETE FROM archive_dirty_paths WHERE path=?", (retired,))
+                self._invalidate_dirty_root(db)
                 if self._meta(db, "archive_destination") != destination:
                     if db.execute("SELECT COUNT(*) FROM archive_index a LEFT JOIN public_artifacts p ON p.path=a.path WHERE p.path IS NULL").fetchone()[0]:
                         raise ValueError("Restore missing published artifact records before changing archive destination")
@@ -246,10 +291,10 @@ class ArchiveStore:
                     db.execute("UPDATE public_artifacts SET uploaded_sha256=NULL")
                     db.execute("INSERT OR IGNORE INTO archive_dirty_paths SELECT path FROM public_artifacts WHERE path NOT IN ('index.html','style.css','app.js','mark.svg','_headers')")
                     self._set_meta(db, archive_destination=destination, archive_manifest_sha256="", archive_manifest_generation="")
-                if self._meta(db, "archive_queue_version") != "2":
+                if self._meta(db, "archive_queue_version") != "3":
                     db.execute("INSERT OR IGNORE INTO archive_dirty_paths SELECT path FROM public_artifacts WHERE path NOT IN ('index.html','style.css','app.js','mark.svg','_headers')")
-                    db.execute("INSERT OR IGNORE INTO archive_dirty_paths SELECT a.path FROM archive_index a LEFT JOIN public_artifacts p ON p.path=a.path WHERE p.path IS NULL AND a.path LIKE 'page/%'")
-                    self._set_meta(db, archive_queue_version="2")
+                    db.execute("INSERT OR IGNORE INTO archive_dirty_paths SELECT a.path FROM archive_index a LEFT JOIN public_artifacts p ON p.path=a.path WHERE p.path IS NULL AND (a.path LIKE 'page/%' OR a.path LIKE 'topics/%')")
+                    self._set_meta(db, archive_queue_version="3")
                 shard_chars = str(self.cfg["shard_prefix_chars"])
                 if self._meta(db, "archive_shard_chars") != shard_chars:
                     for (path,) in db.execute("SELECT path FROM archive_index ORDER BY path"):
@@ -261,10 +306,11 @@ class ArchiveStore:
 
     @staticmethod
     def _pending(db):
-        placeholders = ",".join("?" for _ in HOT_FILES)
+        excluded = HOT_FILES | RETIRED_FILES
+        placeholders = ",".join("?" for _ in excluded)
         return db.execute(
             f"SELECT COUNT(*) FROM public_artifacts WHERE path NOT IN ({placeholders}) "
-            "AND (uploaded_sha256 IS NULL OR uploaded_sha256 != sha256)", tuple(HOT_FILES),
+            "AND (uploaded_sha256 IS NULL OR uploaded_sha256 != sha256)", tuple(excluded),
         ).fetchone()[0]
 
     def _file(self, relative):
@@ -304,6 +350,9 @@ class ArchiveStore:
                 target.write(chunk)
         if size != row["size"] or digest.hexdigest() != row["sha256"]:
             raise ValueError("Public artifact hash differs from its catalog")
+        if row["path"].endswith(".html"):
+            from public_html import validate_static_html
+            validate_static_html(destination)
 
     def _acl(self, key, public):
         acl = self._call("get_object_acl", Key=key)
@@ -421,13 +470,14 @@ class ArchiveStore:
     def _prepare_manifest(self, generation, directory):
         import json
         with self._database() as db:
+            self._validate_retained_articles(db)
             if not self._same_generation(db, generation):
                 return None
             with db:
                 for path, shard in db.execute("SELECT a.path,a.shard FROM archive_dirty_paths d JOIN archive_index a ON a.path=d.path LEFT JOIN public_artifacts p ON p.path=d.path WHERE p.path IS NULL ORDER BY a.path"):
                     # Pagination URLs may become obsolete when page size grows;
                     # article permalinks and their immutable history never do.
-                    if re.fullmatch(r"page/[1-9][0-9]{0,8}/index\.html", path):
+                    if re.fullmatch(r"page/[1-9][0-9]{0,8}/index\.html", path) or topic_path_allowed(path):
                         db.execute("DELETE FROM archive_index WHERE path=?", (path,))
                         db.execute("INSERT INTO archive_shards(shard,dirty) VALUES(?,1) ON CONFLICT(shard) DO UPDATE SET dirty=1", (shard,))
                 self._invalidate_dirty_root(db)
@@ -498,12 +548,13 @@ class ArchiveStore:
             snapshot = Path(temporary)
             with self._database(shared=True) as db:
                 generation = self._generation(db)
-                placeholders = ",".join("?" for _ in HOT_FILES)
+                excluded = HOT_FILES | RETIRED_FILES
+                placeholders = ",".join("?" for _ in excluded)
                 rows = db.execute(
                     f"SELECT * FROM public_artifacts WHERE path NOT IN ({placeholders}) "
                     "AND (uploaded_sha256 IS NULL OR uploaded_sha256 != sha256) "
                     "ORDER BY CASE WHEN path LIKE 'news/%' THEN 0 WHEN path LIKE 'page/%' THEN 1 ELSE 2 END,path LIMIT ?",
-                    (*HOT_FILES, self.cfg["max_uploads_per_run"]),
+                    (*excluded, self.cfg["max_uploads_per_run"]),
                 ).fetchall()
                 selected, total = [], 0
                 for raw in rows:
