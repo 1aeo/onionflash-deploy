@@ -47,13 +47,14 @@ Edit the three generated files (all ignored by Git):
 ./deploy.sh run         # Collect, analyze, build, verify preview, publish
 ./deploy.sh routes      # Attach only this application's path to your hostname
 ./deploy.sh schedule    # Install/update this application's cron block
-./deploy.sh status      # Show publication, backup and last-run receipts
+./deploy.sh status      # Show publication, hold, backup and last-run records
 ```
 
 The first run may publish only some stories while its durable analysis queue is
 processed. Each later run continues the queue. Processing limits and the run time
-budget are configurable. `run` does not attach hostname routes; the initial
-publication can be inspected at the origin URL printed by `status` first.
+budget are configurable. `run` does not attach hostname routes; inspect the initial
+publication first at the Worker's `workers.dev` origin (`https://<worker_name>.<account
+subdomain>.workers.dev` plus the site's base path).
 
 ## Cloudflare setup
 
@@ -92,25 +93,29 @@ The separate Worker guarantees hostname redirects even when an incoming path
 matches a static asset. The canonical site keeps its existing asset delivery,
 and the redirect itself requires no browser JavaScript.
 
-Publication uploads an immutable version, checks preview hashes, activates it,
-and verifies the origin and (after routing) production hostname. A failed
-post-activation check restores the preceding version. Repeated content is not
-uploaded again. An unexpectedly changed active version stops publication instead
-of overwriting someone else's deployment.
+Publication uploads an immutable version, checks its preview hashes, activates
+it, and verifies the live site: the production hostname once routed, otherwise the
+`workers.dev` origin. A failed live check reactivates the preceding version and
+fails that run; the next scheduled run tries again. Unchanged content is not
+uploaded, but the active version is checked before taking that shortcut. A new Worker is deployed directly, since it
+has no live version to protect. An active version that differs from the recorded
+publication, or changes during preview checks, stops publication for inspection.
 
-Before activation, a private transition journal records the intended version and
-the preceding receipt. A process interruption therefore leaves enough evidence
-for `./deploy.sh reconcile` to verify and finalize the known target, or restore
-the preceding receipt when that version is active. Unknown external versions
-are never overwritten. Failed verification restores the preceding version and
-fails that run; the next scheduled run tries again. Failures inside a run are
-recorded in `state/run.log` and `state/last-run.json`; errors raised before the run
-starts, such as an invalid configuration or credential file, go to the console or,
-for scheduled runs, the system log. Archived receipts are written before the
-current-publication pointer.
+Permanent-storage deployments use the same linear flow. Small per-version
+receipts preserve the immutable archive root and verification hashes for rollback
+and private history retention; there is no transition journal or `reconcile`
+command. An interrupted attempt clears the content shortcut. If activation did
+not occur, the next run uploads and verifies again. If the live version changed
+without a completed receipt, publication stops for operator inspection rather
+than guessing whether that change belongs to this process. An external version
+change during verification is left intact rather than rolled back.
+
+Failures inside a run are recorded in `state/run.log` and `state/last-run.json`;
+errors raised before the run starts, such as an invalid configuration or credential
+file, go to the console or, for scheduled runs, the system log.
 
 The public package is an exact allowlist of generated pages, feeds and three
-assets. SQLite, source evidence, credentials, logs and release receipts stay
+assets. SQLite, source evidence, credentials, logs and publication records stay
 outside it. Source timestamps and original first-publication times are preserved.
 
 ## DigitalOcean Spaces
@@ -158,17 +163,17 @@ database until recovery is verified. Credentials are never included in backups.
 ```sh
 ./deploy.sh publish    # Publish already generated output; no LLM call
 ./deploy.sh hold       # Pause publication while collection can continue
-./deploy.sh rollback   # Restore and verify the preceding published version; hold
-./deploy.sh reconcile  # Recover a journaled interrupted version transition
+./deploy.sh rollback   # Reactivate the preceding version and hold publication
 ./deploy.sh resume     # Explicitly release a publication hold
 ./deploy.sh status
 tail -n 40 state/run.log
 ```
 
-Rollback requires a verified earlier publication; it does not roll the first
-publication back to the temporary bootstrap placeholder. The durable hold ensures
-the next scheduled run cannot undo a rollback. Correct the content/code before
-resuming. `state/receipts/` records version identities and exact file hashes.
+Rollback reactivates the version recorded as the previous publication and holds
+publication, so the next scheduled run cannot undo it. Correct the content or code
+before resuming; the first publication after resuming uploads again.
+`state/publication.json` records the live version, its predecessor and the exact
+file hashes.
 
 The installer and scheduled job share a lock. A concurrent scheduled run exits
 without overlapping work. A busy administrative command exits **75** with a clear
@@ -183,11 +188,11 @@ hold publication, update the two checkouts to reviewed commits, run `install.sh`
 again, verify with `check`, and explicitly resume. Keep previous Git SHAs for code
 rollback. Production installations should use reviewed tags or commit SHAs.
 
-All network limits are documented in `deployment.example.toml` and the application
-configuration. Reads retry transient failures with exponential backoff, jitter and
-bounded `Retry-After`; permanent authorization errors fail promptly. Wrangler's
-transient network failures are retried with the same bounded policy. LLM and source
-fallbacks are configured in the application, not hardcoded in deployment scripts.
+Network limits are in `deployment.example.toml` and the application configuration.
+Publication checks retry transient failures and not-yet-propagated files with
+exponential backoff; other client errors fail promptly. Wrangler retries its own API
+calls. LLM and source fallbacks are configured in the application, not hardcoded in
+deployment scripts.
 
 ## Tests
 
@@ -197,10 +202,10 @@ node --test tests/test_worker.mjs
 ```
 
 The deployment tests exercise publication boundaries, credential handling,
-backoff, partial route failure, deployment drift, interrupted transitions,
+verification retries, rollback after a failed check, partial route failure,
 administrative lock contention, holds, backup privacy cleanup and retention.
 The application repository has separate transport, collection, analysis, database
-and renderer tests. Test fixtures are never production news.
+and renderer tests.
 
 ## License
 

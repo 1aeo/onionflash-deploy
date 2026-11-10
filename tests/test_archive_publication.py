@@ -1,24 +1,22 @@
 """Cross-layer checks for permanent storage and guarded Worker activation."""
 import copy
+from contextlib import nullcontext
 import io
 import json
 import os
 from pathlib import Path
-import socket
 import shutil
 import tarfile
 import tempfile
 import unittest
-from unittest.mock import patch
-
-import httpx
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import publish
 from archive_store import ArchiveStore, HOT_FILES
 from onionflash.cli import build
 from onionflash.config import DEFAULTS
 from onionflash.store import Store
-from onionflash.transport import HttpClient
 from test_archive_store import FakeS3
 from test_recovery import FakeSpaces, OLD, NEW
 
@@ -116,31 +114,34 @@ class PermanentPublicationTests(unittest.TestCase):
         self.assertIn(self.p.archive.cfg["public_prefix"] + "objects/" + old_sha, self.s3.objects)
 
     def test_prepared_archive_is_bound_to_the_publication_receipt(self):
+        publish.atomic_json(self.p.state / "publication.json", {"version_id": OLD, "manifest": {}})
         commands = []
         def command(arguments, metadata=None):
             commands.append(arguments)
             if metadata:
                 metadata.write_text(json.dumps({"type": "version-upload", "version_id": NEW,
                                                "preview_url": "https://candidate.example.workers.dev"}) + "\n")
-        with patch.object(self.p, "current_version", return_value=OLD), patch.object(self.p, "command", side_effect=command), patch.object(self.p, "api", return_value={"subdomain": "example"}), patch.object(self.p, "verify") as verify, patch.object(self.p, "app_version", return_value="test"), patch.object(self.p, "transition", side_effect=lambda target, *args: target):
+        with patch.object(self.p, "current_version", return_value=OLD), patch.object(self.p, "command", side_effect=command), patch.object(self.p, "api", return_value={"subdomain": "example"}), patch.object(self.p, "verify") as verify, patch.object(self.p, "app_version", return_value="test"), patch.object(self.p, "activate") as activate:
             result = self.p.publish()
         self.assertEqual(result["version_id"], NEW)
         self.assertIn("archive", result)
         self.assertEqual(set(result["manifest"]), HOT_FILES | {"feed.xml", "feed.json"})
         self.assertEqual(verify.call_args.kwargs["archive"], result["archive"])
         self.assertEqual(len(commands), 1)
+        activate.assert_called_once()
+        self.assertEqual(publish.read_json(self.p.state / "receipts" / (NEW + ".json"))["archive"], result["archive"])
 
     def test_large_feeds_are_verified_with_head_not_buffered(self):
         self.p.cf["verify_paths"] = ["feed.xml"]
-        calls = []
         sha = "f" * 64
-        def handle(request):
-            calls.append(request.method)
-            return httpx.Response(200, headers={"etag": '"' + sha + '"', "content-length": "100000000"})
-        resolver = lambda host, port, *args: [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("8.8.8.8", port))]
-        self.p._http_client = HttpClient(self.p.http_settings(), transport=httpx.MockTransport(handle), resolver=resolver)
-        self.p.verify(self.p.base_url, {"feed.xml": sha}, archive={"manifest_sha256": "a" * 64})
-        self.assertEqual(calls, ["HEAD"])
+        body_read = Mock(side_effect=AssertionError("HEAD must not read the feed body"))
+        response = SimpleNamespace(status=200, headers={"ETag": '"' + sha + '"', "Content-Length": "100000000"},
+                                   geturl=lambda: self.p.base_url + "feed.xml", read=body_read)
+        self.p.net["max_response_bytes"] = 1
+        with patch("publish.urlopen", return_value=nullcontext(response)) as request:
+            self.p.verify(self.p.base_url, {"feed.xml": sha}, archive={"manifest_sha256": "a" * 64})
+        self.assertEqual(request.call_args.args[0].get_method(), "HEAD")
+        body_read.assert_not_called()
 
     def test_worker_and_binding_changes_invalidate_unchanged_asset_identity(self):
         fake_root = self.root / "code"

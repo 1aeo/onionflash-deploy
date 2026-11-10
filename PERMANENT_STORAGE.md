@@ -16,7 +16,9 @@ receives Spaces credentials or exposes the private prefix. Browser URLs such as
 
 ## Set up a bucket
 
-1. Create a **Standard Storage** bucket, for example `onionflash-data` in NYC3.
+1. Create a **Standard Storage** bucket, for example `onionflash-data` in NYC3
+   if that globally unique name is available. Otherwise choose an available name
+   you own and update both `archive.bucket` and `archive.public_origin` below.
    Keep bucket listing restricted/private. Cloudflare provides the public edge;
    enabling the Spaces CDN is unnecessary.
 2. Grant a Spaces access key **Read/Write/Delete** for this bucket. A limited key
@@ -63,6 +65,10 @@ to 250 and controls work per build, not retention.
 ./deploy.sh status
 ```
 
+`check` validates application settings, the installed toolchain, and enabled
+archive settings/credential presence. It does not create a bucket or prove that
+the credential has access to remote storage; the publication checks do that.
+
 For a large initial migration, repeat runs while `articles_pending` or archive
 pending counts remain. Existing article routes are not switched until previously
 published pages have verified permanent copies. A partial build, generation
@@ -73,8 +79,13 @@ Unchanged articles are reused. Feeds are streamed with bounded memory. A hot-onl
 front-page change reuses the permanent manifest. Asset, Worker-code and runtime
 binding changes all participate in deployment identity.
 
-The normal version journal, preview checks, activation checks and rollback remain
-in force. Feed routing is verified by its immutable hash/ETag without buffering
+The publisher uses one linear upload, preview-check, activation and live-check
+flow. Small per-version receipts retain the immutable root for rollback; there
+is no transition journal or `reconcile` command. An interrupted attempt clears
+the unchanged-content shortcut. Pre-activation failures retry normally; an
+unrecorded live-version change stops for operator inspection so an external
+deployment cannot be overwritten by an automatic retry.
+Feed routing is verified by its immutable hash/ETag without buffering
 an entire growing feed again. The upload itself is read back and hash-checked.
 
 ## Private evidence and receipt retention
@@ -94,8 +105,9 @@ endpoint, region, object key and hash so archived material remains findable
 after storage settings change. Future analysis rows preserve the collected source snapshot;
 legacy rows are archived as they exist, without fabricating missing inputs.
 
-Current/previous publication receipts and receipts referenced by transitions,
-holds or rollback state are pinned. Remote private evidence, immutable public
+Current/previous publication receipts and receipts referenced by holds or
+rollback state are pinned. Legacy transition records from older installations
+are also honored when deciding what to retain. Remote private evidence, immutable public
 objects and article history have no automatic expiry.
 
 ```sh
