@@ -158,6 +158,30 @@ in backups.
 
 ## Operations
 
+Use `./deploy.sh app` for offline application operations. It loads the protected
+dotenv files and the application config named in `deployment.toml`, so environment
+references such as `${ONIONFLASH_LLM_BASE_URL}` work without sourcing a shell file.
+Only `story`, `rejected`, `build`, and `status` are available; do not supply an
+application `--config`. Cloudflare, Spaces, and LLM keys are removed from the
+application environment after configuration is resolved. Inspection remains
+available during scheduled work; mutations take the deployment lock and the
+application's database lock, returning **75** if either is busy.
+
+```sh
+./deploy.sh app status
+./deploy.sh app rejected list --limit 20
+./deploy.sh app story show --story STORY_ID
+./deploy.sh app build      # Render saved stories after an editorial change
+./deploy.sh publish        # Publish the resulting files, or let the next cron run do it
+```
+
+The `story` and `rejected` action flags match the application's
+[editorial](https://github.com/1aeo/onionflash/blob/main/docs/EDITORIAL.md) and
+[rejected-analysis](https://github.com/1aeo/onionflash/blob/main/docs/REJECTED_ANALYSES.md)
+guides. These application commands make no source, model, or publication requests.
+Corrections and retractions require a subsequent build and publication to appear
+on the website; retrying a rejection only queues it for a later scheduled analysis.
+
 ```sh
 ./deploy.sh publish    # Publish already generated output; no LLM call
 ./deploy.sh hold       # Pause publication while collection can continue

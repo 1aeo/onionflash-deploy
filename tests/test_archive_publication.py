@@ -1,6 +1,6 @@
 """Cross-layer checks for permanent storage and guarded Worker activation."""
 import copy
-from contextlib import nullcontext
+from contextlib import closing, nullcontext
 import gzip
 import json
 import os
@@ -15,6 +15,7 @@ from urllib.error import HTTPError
 
 import publish
 from archive_store import ArchiveStore, HOT_FILES
+from onionflash import editorial
 from onionflash.cli import build
 from onionflash.config import DEFAULTS
 from onionflash.store import Store
@@ -158,6 +159,19 @@ class PermanentPublicationTests(unittest.TestCase):
         self.assertEqual(len({first, second, third}), 3)
 
     def test_sqlite_only_backups_preserve_the_permanent_manifest_catalog(self):
+        story_id = "operator-corrected-story"
+        stamp = "2026-11-01T00:00:00Z"
+        story = {"id": story_id, "title": "Reported authority incident", "summary": "An operator reported an incident.",
+                 "why_it_matters": "Original wording", "sources": [{"url": "https://example.org/report", "title": "Report"}],
+                 "published_at": stamp, "updated_at": stamp}
+        with Store(self.p.database) as store:
+            with store.db:
+                store.db.execute("INSERT INTO stories VALUES(?,?,?,?,?)", (story_id, "operator-correction", json.dumps(story), stamp, stamp))
+            build(self.app_config, store)
+            original = editorial.show(store.db, story_id)
+            editorial.correct(store.db, story_id, {"why_it_matters": "Corrected, source-supported wording."},
+                              reason="Removed unsupported advice", expect_hash=original["hash"])
+            build(self.app_config, store)
         sync = self.p.archive.sync()
         snapshot = self.root / "initial-snapshot"
         hot = self.p.archive.snapshot_hot(snapshot, sync["generation"])
@@ -170,9 +184,16 @@ class PermanentPublicationTests(unittest.TestCase):
             self.p.backup(force=True)
         restored = self.root / "restored.sqlite3"
         restored.write_bytes(gzip.decompress(backups.uploads[0][2]))
-        with sqlite3.connect(restored) as database:
+        with closing(sqlite3.connect(restored)) as database:
             self.assertEqual(database.execute("PRAGMA quick_check").fetchone()[0], "ok")
             self.assertEqual(database.execute("SELECT value FROM metadata WHERE key='archive_manifest_sha256'").fetchone()[0], sync["manifest_sha256"])
             self.assertGreater(database.execute("SELECT COUNT(*) FROM public_artifacts").fetchone()[0], 0)
+            self.assertEqual(database.execute("SELECT locked FROM editorial_controls WHERE story_id=?", (story_id,)).fetchone()[0], 1)
+            self.assertEqual(database.execute("SELECT COUNT(*) FROM editorial_revisions WHERE story_id=?", (story_id,)).fetchone()[0], 1)
+        with Store(restored) as store:
+            before = editorial.show(store.db, story_id)
+            with store.db:
+                store.db.execute("UPDATE stories SET payload='{}' WHERE id=?", (story_id,))
+            self.assertEqual(editorial.show(store.db, story_id)["hash"], before["hash"])
         self.assertEqual(privacy_check.call_args.args[1], "HEAD")
         self.assertNotIn("token", privacy_check.call_args.kwargs)
