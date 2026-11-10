@@ -213,6 +213,18 @@ url = "https://example.org/feed.xml"
         self.assertEqual(app["ONIONFLASH_LLM_API_KEY"], "llm-key-value")
         self.assertFalse({"CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ZONE_TOKEN", "DO_SPACES_KEY", "DO_SPACES_SECRET"} & set(app))
 
+    def test_default_zone_token_stays_out_of_child_processes(self):
+        import subprocess
+        del self.publisher.cf["zone_token_env"]  # api() then falls back to CLOUDFLARE_ZONE_TOKEN
+        captured = []
+        def fake(arguments, **kwargs):
+            captured.append(kwargs["env"])
+            return subprocess.CompletedProcess(arguments, 0, stdout="{}", stderr="")
+        with patch("publish.subprocess.run", side_effect=fake):
+            self.publisher.command(["whoami"])
+            self.publisher.application("check")
+        self.assertTrue(all("CLOUDFLARE_ZONE_TOKEN" not in env for env in captured))
+
     def test_route_conflicts_are_detected_before_any_mutation(self):
         p = self.publisher
         publish.atomic_json(p.state / "publication.json", {"origin_url": "https://test.workers.dev/onionflash", "manifest": {}})

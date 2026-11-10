@@ -97,7 +97,7 @@ def load_env(path):
             raise ValueError("Invalid credential-file assignment")
         tokens = shlex.split(raw)
         if len(tokens) > 1:
-            raise ValueError("Quote values containing spaces")
+            raise ValueError("Quote values containing spaces; put comments on their own line")
         os.environ.setdefault(key, tokens[0] if tokens else "")
 
 
@@ -202,14 +202,13 @@ class Publisher:
     def private_names(self):
         """Environment variables holding credentials for Cloudflare, Spaces or the LLM."""
         spaces = self.cfg.get("spaces", {})
-        names = {self.cf.get(k, "") for k in ("api_token_env", "zone_token_env")}
-        names |= {spaces.get(k, "") for k in ("access_key_env", "secret_key_env")}
-        return (names | {self.app["llm"]["api_key_env"]}) - {""}
+        names = {self.cf["api_token_env"], self.cf.get("zone_token_env", "CLOUDFLARE_ZONE_TOKEN"),
+                 spaces.get("access_key_env", ""), spaces.get("secret_key_env", ""), self.app["llm"]["api_key_env"]}
+        return names - {""}
 
     def secret_values(self):
         names = {k for k in os.environ if any(x in k.upper() for x in ("TOKEN", "SECRET", "API_KEY", "SPACES_KEY"))}
-        for section in [self.cf, self.cfg.get("spaces", {}), self.app["llm"]]:
-            names.update(v for k, v in section.items() if k in {"api_token_env", "zone_token_env", "access_key_env", "secret_key_env", "api_key_env"})
+        names |= self.private_names()
         return [os.environ[name] for name in names if len(os.environ.get(name, "")) >= 8]
 
     def http_settings(self):
@@ -273,7 +272,8 @@ class Publisher:
 
     def command(self, arguments, metadata=None):
         # Wrangler only needs its own credentials, not the LLM or Spaces keys.
-        env = {k: v for k, v in os.environ.items() if k not in self.private_names()}
+        private = self.private_names()
+        env = {k: v for k, v in os.environ.items() if k not in private}
         env.update(CLOUDFLARE_ACCOUNT_ID=self.account, CLOUDFLARE_API_TOKEN=self.token,
                    WRANGLER_SEND_METRICS="false", WRANGLER_LOG_SANITIZE="true",
                    WRANGLER_LOG_PATH=str(self.state / "wrangler-logs"), CI="true")
@@ -694,7 +694,8 @@ class Publisher:
         """Run one app command and return its output; failures carry the app's error."""
         budget = self.app["collection"]["run_budget_seconds"]
         # The application never needs the Cloudflare or Spaces credentials.
-        env = {k: v for k, v in os.environ.items() if k not in self.private_names() - {self.app["llm"]["api_key_env"]}}
+        private = self.private_names() - {self.app["llm"]["api_key_env"]}
+        env = {k: v for k, v in os.environ.items() if k not in private}
         result = subprocess.run([str(self.path(self.cfg["app_python"])), "-m", "onionflash", command,
                                  "--config", str(self.app_config)], capture_output=True, text=True,
                                 timeout=budget + 300, env=env)
