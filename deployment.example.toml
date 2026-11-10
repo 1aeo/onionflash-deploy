@@ -72,6 +72,7 @@ worker_backoff_cap_ms = 1000
 # Published articles, their catalog and remote evidence are never expired.
 [retention]
 enabled = false
+interval_seconds = 86400
 hot_days = 90
 receipt_hot_days = 30
 batch_size = 100

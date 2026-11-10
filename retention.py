@@ -21,7 +21,8 @@ import uuid
 
 
 DEFAULTS = {"enabled": False, "hot_days": 90, "receipt_hot_days": 30,
-            "batch_size": 100, "max_bundle_bytes": 16777216, "run_budget_seconds": 60}
+            "batch_size": 100, "max_bundle_bytes": 16777216, "run_budget_seconds": 60,
+            "interval_seconds": 86400}
 
 
 def _json(value) -> bytes:
@@ -79,11 +80,12 @@ class RetentionStore:
             raise ValueError("Invalid retention configuration")
         for key, low, high in (("hot_days", 1, 36500), ("receipt_hot_days", 1, 36500),
                                ("batch_size", 1, 1000), ("max_bundle_bytes", 1024, 67108864),
-                               ("run_budget_seconds", 1, 3600)):
+                               ("run_budget_seconds", 1, 3600), ("interval_seconds", 60, 31536000)):
             if type(self.cfg[key]) is not int or not low <= self.cfg[key] <= high:
                 raise ValueError("Invalid retention " + key)
         self.client = s3_client
         self._archive = None
+        self._destination = None
         self.state = Path(publisher.state)
         self.database = Path(publisher.database)
 
@@ -92,6 +94,8 @@ class RetentionStore:
         if self._archive is None:
             from archive_store import ArchiveStore
             self._archive = ArchiveStore(self.publisher, client=self.client)
+            self._destination = {key: self._archive.cfg[key] for key in ("endpoint_url", "region")}
+            self._destination["bucket"] = self._archive.bucket
         return self._archive
 
     def _db(self):
@@ -109,12 +113,32 @@ class RetentionStore:
             CREATE TABLE IF NOT EXISTS private_archive_refs (
                 kind TEXT NOT NULL, record_id TEXT NOT NULL, record_hash TEXT NOT NULL,
                 object_key TEXT NOT NULL, object_sha256 TEXT NOT NULL,
-                archived_at TEXT NOT NULL,
+                archived_at TEXT NOT NULL, destination_json TEXT,
                 PRIMARY KEY(kind, record_id, record_hash)
             );
             CREATE INDEX IF NOT EXISTS retention_items_age ON items(last_seen,id);
             CREATE INDEX IF NOT EXISTS retention_analyses_age ON analyses(created_at,cache_key);
         """)
+        if "destination_json" not in {row[1] for row in db.execute("PRAGMA table_info(private_archive_refs)")}:
+            # Earlier references did not record their destination. Keep it
+            # unknown; the current bucket is not evidence of their old location.
+            db.execute("ALTER TABLE private_archive_refs ADD COLUMN destination_json TEXT")
+            db.commit()
+
+    @staticmethod
+    def _record_reference(db, kind, identity, record_hash, uploaded, observed) -> bool:
+        existing = db.execute("SELECT destination_json FROM private_archive_refs WHERE kind=? AND record_id=? AND record_hash=?",
+                              (kind, identity, record_hash)).fetchone()
+        if existing is not None:
+            # Never replace a historical locator with today's destination. If
+            # it predates location tracking, preserve the remaining hot copy.
+            return existing[0] is not None
+        db.execute("""INSERT INTO private_archive_refs
+            (kind,record_id,record_hash,object_key,object_sha256,archived_at,destination_json)
+            VALUES(?,?,?,?,?,?,?)""",
+                   (kind, identity, record_hash, uploaded["key"], uploaded["sha256"],
+                    observed, _json(uploaded["destination"]).decode("utf-8")))
+        return True
 
     def _put_bundle(self, family: str, value: dict) -> dict:
         raw = _json(value)
@@ -136,7 +160,7 @@ class RetentionStore:
         expected = {"key": key, "sha256": checksum, "size": len(body)}
         if not isinstance(result, dict) or any(result.get(key) != value for key, value in expected.items()):
             raise ValueError("Private retention verification receipt does not match")
-        return result
+        return {**result, "destination": dict(self._destination)}
 
     def archive_evidence(self, now: datetime | None = None) -> dict:
         if not self.cfg["enabled"]:
@@ -189,8 +213,9 @@ class RetentionStore:
                 # Keep compact controls and deduplication state. Only the large
                 # source body moves out of a completed item's hot payload.
                 record_hash = row["content_hash"] if kind == "item" else _sha(_json(row))
-                db.execute("INSERT OR IGNORE INTO private_archive_refs VALUES(?,?,?,?,?,?)",
-                           (kind, row[key], record_hash, uploaded["key"], uploaded["sha256"], _iso(now)))
+                if not self._record_reference(db, kind, row[key], record_hash, uploaded, _iso(now)):
+                    result["changed_records_preserved"] += 1
+                    continue
                 if kind == "item":
                     try:
                         payload = json.loads(row["payload"])
@@ -200,13 +225,22 @@ class RetentionStore:
                         payload = None
                     if isinstance(payload, dict) and "content" in payload:
                         payload.pop("content")
-                        db.execute("UPDATE items SET payload=? WHERE id=?", (_json(payload).decode(), row["id"]))
-                        result["items_compacted"] += 1
+                        try:
+                            compacted = _json(payload).decode("utf-8")
+                        except (ValueError, TypeError, UnicodeError, RecursionError):
+                            # A valid archive of the raw JSON string does not
+                            # guarantee decoded metadata is valid UTF-8 JSON.
+                            # Keep that hot payload verbatim and process others.
+                            compacted = None
+                        if compacted is not None:
+                            db.execute("UPDATE items SET payload=? WHERE id=?", (compacted, row["id"]))
+                            result["items_compacted"] += 1
                 else:
                     db.execute("DELETE FROM analyses WHERE cache_key=?", (row["cache_key"],))
                     result["analyses_evicted"] += 1
                 result["records_archived"] += 1
         result["object_key"] = uploaded["key"]
+        result["destination"] = uploaded["destination"]
         return result
 
     def _pinned_receipts(self) -> set[str]:
@@ -308,13 +342,15 @@ class RetentionStore:
                 if _sha(_read_file(path, self.cfg["max_bundle_bytes"])) != record["sha256"]:
                     result["changed_receipts_preserved"] += 1
                     continue
-                db.execute("INSERT OR IGNORE INTO private_archive_refs VALUES(?,?,?,?,?,?)",
-                           ("receipt", version, record["sha256"], uploaded["key"], uploaded["sha256"], _iso(now)))
+                if not self._record_reference(db, "receipt", version, record["sha256"], uploaded, _iso(now)):
+                    result["changed_receipts_preserved"] += 1
+                    continue
                 # Commit the durable locator before removing a hot receipt.
                 db.commit()
                 path.unlink()
                 result["receipts_archived"] += 1
         result["object_key"] = uploaded["key"]
+        result["destination"] = uploaded["destination"]
         return result
 
     def run(self, now: datetime | None = None) -> dict:

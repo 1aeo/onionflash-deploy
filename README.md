@@ -5,6 +5,11 @@ news aggregator. A scheduled Python job collects sources and calls your LLM;
 Cloudflare Workers Static Assets serves the generated website and RSS. Private
 DigitalOcean Spaces backups are optional. Visitors never call the LLM.
 
+With `[archive].enabled = true`, Spaces durably stores article pages, public JSON,
+numbered history pages and full-history feeds. Cloudflare serves them under the
+same URLs and retains only the front page and small shared assets in its
+deployment bundle. See [permanent storage setup](PERMANENT_STORAGE.md).
+
 Production: **https://1aeo.com/onionflash/** · [RSS](https://1aeo.com/onionflash/feed.xml)
 
 Alias: **https://onionflash.1aeo.com/** redirects to the canonical site above.

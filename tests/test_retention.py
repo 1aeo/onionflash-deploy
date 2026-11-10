@@ -1,6 +1,7 @@
 """Cold evidence stays recoverable before any hot data is compacted."""
 
 from datetime import datetime, timezone
+from contextlib import closing, contextmanager
 import gzip
 import hashlib
 import io
@@ -97,8 +98,10 @@ class RetentionTests(unittest.TestCase):
                 INSERT INTO monitoring_groups VALUES('incident','do not replay');
             """)
 
+    @contextmanager
     def db(self):
-        return sqlite3.connect(self.publisher.database)
+        with closing(sqlite3.connect(self.publisher.database)) as db, db:
+            yield db
 
     def item(self, identity="item", *, status="published", date=OLD, content="private body", **fields):
         payload = {"title": "Source title", "content": content, "kind": "metrics_timeline",
@@ -129,6 +132,7 @@ class RetentionTests(unittest.TestCase):
         example = tomllib.loads((Path(__file__).parents[1] / "deployment.example.toml").read_text())
         self.publisher.cfg["retention"] = example["retention"]
         self.assertEqual(self.engine().cfg["run_budget_seconds"], 60)
+        self.assertEqual(self.engine().cfg["interval_seconds"], 86400)
 
     def receipt(self, version, previous=None, date=OLD):
         value = {"version_id": version, "previous_version_id": previous, "published_at": date,
@@ -233,6 +237,103 @@ class RetentionTests(unittest.TestCase):
         rows = {row["id"]: row for row in self.rows("items")}
         self.assertEqual(rows["bad"]["payload"], "malformed source snapshot")
         self.assertNotIn("content", json.loads(rows["good"]["payload"]))
+
+    def test_invalid_unicode_metadata_stays_hot_without_blocking_other_records(self):
+        self.item("bad")
+        self.item("good")
+        self.analysis()
+        raw = json.dumps({"title": "invalid \ud800 metadata", "content": "private original body",
+                          "updated_at": OLD})
+        with self.db() as db:
+            db.execute("UPDATE items SET payload=? WHERE id='bad'", (raw,))
+        client = FakeSpaces()
+        result = self.engine(client).archive_evidence(NOW)
+        self.assertEqual(result["records_archived"], 3)
+        self.assertEqual(result["items_compacted"], 1)
+        self.assertEqual(result["analyses_evicted"], 1)
+        rows = {row["id"]: row for row in self.rows("items")}
+        self.assertEqual(rows["bad"]["payload"], raw)
+        self.assertNotIn("content", json.loads(rows["good"]["payload"]))
+        bundle = json.loads(gzip.decompress(next(iter(client.objects.values()))[0]))
+        archived = next(record["row"] for record in bundle["records"] if record["kind"] == "item" and record["row"]["id"] == "bad")
+        self.assertEqual(archived["payload"], raw)
+        self.assertEqual(self.engine(client).archive_evidence(NOW)["records_archived"], 0)
+
+    def test_nonfinite_decoded_metadata_is_not_written_back(self):
+        self.item("bad-number")
+        self.item("good")
+        raw = '{"title":"source","score":NaN,"content":"private body"}'
+        with self.db() as db:
+            db.execute("UPDATE items SET payload=? WHERE id='bad-number'", (raw,))
+        result = self.engine().archive_evidence(NOW)
+        self.assertEqual(result["records_archived"], 2)
+        self.assertEqual(result["items_compacted"], 1)
+        rows = {row["id"]: row for row in self.rows("items")}
+        self.assertEqual(rows["bad-number"]["payload"], raw)
+        self.assertNotIn("content", json.loads(rows["good"]["payload"]))
+
+    def test_archive_references_retain_original_destinations_after_bucket_change(self):
+        self.item("old-item")
+        self.analysis("old-analysis")
+        self.current()
+        self.receipt(VERSIONS[1])
+        client = FakeSpaces()
+        first = self.engine(client).run(NOW)
+        first_refs = self.rows("private_archive_refs")
+        location_a = {"endpoint_url": "https://s3.example.org", "region": "nyc3", "bucket": "onionflash-data"}
+        self.assertEqual(len(first_refs), 3)
+        self.assertTrue(all(json.loads(row["destination_json"]) == location_a for row in first_refs))
+        self.assertEqual(first["evidence"]["destination"], location_a)
+        self.assertEqual(first["receipts"]["destination"], location_a)
+        self.publisher.cfg["archive"].update(endpoint_url="https://second.example.org", region="ams3", bucket="second-onionflash",
+                                             access_key_env="NEVER_ARCHIVE_KEY_NAME", secret_key_env="NEVER_ARCHIVE_SECRET_NAME")
+        self.item("new-item")
+        self.analysis("new-analysis")
+        self.receipt(VERSIONS[2])
+        second = self.engine(client).run(NOW)
+        refs = self.rows("private_archive_refs")
+        for old in first_refs:
+            self.assertIn(old, refs)
+            self.assertIn((location_a["bucket"], old["object_key"]), client.objects)
+        location_b = {"endpoint_url": "https://second.example.org", "region": "ams3", "bucket": "second-onionflash"}
+        new_refs = [row for row in refs if row not in first_refs]
+        self.assertEqual(len(new_refs), 3)
+        self.assertTrue(all(json.loads(row["destination_json"]) == location_b for row in new_refs))
+        self.assertEqual(second["evidence"]["destination"], location_b)
+        recorded = json.dumps({"refs": refs, "first": first, "second": second})
+        self.assertNotIn("access_key", recorded)
+        self.assertNotIn("secret_key", recorded)
+        self.assertNotIn("NEVER_ARCHIVE", recorded)
+
+    def test_legacy_reference_migration_does_not_invent_a_destination(self):
+        with self.db() as db:
+            db.execute("""CREATE TABLE private_archive_refs (
+                kind TEXT, record_id TEXT, record_hash TEXT, object_key TEXT,
+                object_sha256 TEXT, archived_at TEXT, PRIMARY KEY(kind,record_id,record_hash))""")
+            db.execute("INSERT INTO private_archive_refs VALUES(?,?,?,?,?,?)",
+                       ("item", "legacy", "old-hash", "onionflash/private/old.json.gz", "a" * 64, OLD))
+        self.item("new")
+        self.engine().archive_evidence(NOW)
+        refs = {row["record_id"]: row for row in self.rows("private_archive_refs")}
+        self.assertIsNone(refs["legacy"]["destination_json"])
+        self.assertEqual(refs["legacy"]["object_key"], "onionflash/private/old.json.gz")
+        self.assertEqual(json.loads(refs["new"]["destination_json"])["bucket"], "onionflash-data")
+
+    def test_unknown_legacy_locator_preserves_a_remaining_hot_cache_copy(self):
+        self.analysis()
+        original = self.rows("analyses")[0]
+        client = FakeSpaces()
+        self.engine(client).archive_evidence(NOW)
+        with self.db() as db:
+            db.execute("UPDATE private_archive_refs SET destination_json=NULL")
+            db.execute("INSERT INTO analyses(cache_key,result,created_at,source_payload,source_item_id) VALUES(?,?,?,?,?)",
+                       tuple(original[key] for key in ("cache_key", "result", "created_at", "source_payload", "source_item_id")))
+        self.publisher.cfg["archive"]["bucket"] = "another-onionflash"
+        result = self.engine(client).archive_evidence(NOW)
+        self.assertEqual(result["analyses_evicted"], 0)
+        self.assertEqual(result["changed_records_preserved"], 1)
+        self.assertEqual(self.rows("analyses"), [original])
+        self.assertIsNone(self.rows("private_archive_refs")[0]["destination_json"])
 
     def test_batch_and_byte_limits_keep_excess_hot(self):
         self.item("a")
@@ -342,7 +443,8 @@ class RetentionTests(unittest.TestCase):
             self.engine().archive_evidence(NOW)
 
     def test_invalid_retention_limits_are_rejected(self):
-        for settings in [{"batch_size": 0}, {"hot_days": 0}, {"max_bundle_bytes": 128}, {"enabled": 1}, {"unknown": True}]:
+        for settings in [{"batch_size": 0}, {"hot_days": 0}, {"max_bundle_bytes": 128}, {"enabled": 1},
+                         {"interval_seconds": 0}, {"interval_seconds": True}, {"run_budget_seconds": 0}, {"unknown": True}]:
             with self.subTest(settings=settings):
                 original = self.publisher.cfg["retention"].copy()
                 try:

@@ -810,12 +810,22 @@ class Publisher:
         if not self.cfg.get("retention", {}).get("enabled"):
             return
         from retention import RetentionStore
-        from onionflash.cli import time_budget
         seconds = self.cfg["retention"].get("run_budget_seconds", 60)
         if type(seconds) is not int or not 1 <= seconds <= 3600:
             raise ValueError("Invalid retention run budget")
-        with time_budget(seconds):
-            result = RetentionStore(self, s3_client=self.archive.client).run()
+        engine = RetentionStore(self, s3_client=self.archive.client)
+        destination = {key: self.archive.cfg[key] for key in ("endpoint_url", "region", "bucket", "private_prefix")}
+        policy = hashlib.sha256(json.dumps(engine.cfg, sort_keys=True).encode()).hexdigest()
+        previous = read_json(self.state / "retention.json", {})
+        age = time.time() - previous.get("timestamp", 0)
+        if (previous.get("batch_complete") and previous.get("destination") == destination
+                and previous.get("policy_hash") == policy and 0 <= age < engine.cfg["interval_seconds"]):
+            return
+        with engine.archive.budget(seconds):
+            result = engine.run()
+        result.update(timestamp=time.time(), destination=destination, policy_hash=policy,
+                      batch_complete=(result["evidence"]["records_archived"] < engine.cfg["batch_size"]
+                                      and result["receipts"]["receipts_archived"] < engine.cfg["batch_size"]))
         atomic_json(self.state / "retention.json", result)
 
     def run_cycle(self):

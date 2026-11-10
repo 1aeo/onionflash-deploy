@@ -140,6 +140,17 @@ class ArchiveStore:
             raise ArchiveBudgetReached("Archive synchronization budget reached")
 
     @contextmanager
+    def budget(self, seconds):
+        """Share a cooperative deadline without depending on the app CLI."""
+        previous = self._deadline
+        deadline = time.monotonic() + seconds
+        self._deadline = min(previous, deadline) if previous is not None else deadline
+        try:
+            yield
+        finally:
+            self._deadline = previous
+
+    @contextmanager
     def _database(self, shared=False):
         uri = self.database.resolve(strict=True).as_uri() + ("?mode=ro" if shared else "?mode=rw")
         with self.lock(str(self.database) + ".lock", shared=shared), closing(sqlite3.connect(uri, uri=True)) as db:
@@ -505,16 +516,14 @@ class ArchiveStore:
         return {"generation": generation, "uploaded": uploaded, "pending": pending, "ready": ready, "manifest_sha256": manifest_sha}
 
     def sync(self):
-        self._deadline = time.monotonic() + self.cfg["sync_budget_seconds"]
         try:
-            return self._sync()
+            with self.budget(self.cfg["sync_budget_seconds"]):
+                return self._sync()
         except ArchiveBudgetReached:
             with self._database(shared=True) as db:
                 return {"generation": self._generation(db), "pending": self._pending(db),
                         "uploaded": getattr(self, "_uploaded", 0), "ready": False,
                         "manifest_sha256": None, "budget_reached": True}
-        finally:
-            self._deadline = None
 
     def manifest(self, paths, generation=None):
         result = {}
