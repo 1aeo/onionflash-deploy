@@ -11,7 +11,7 @@ import unittest
 from contextlib import closing, redirect_stdout
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 
 import publish
 
@@ -34,6 +34,7 @@ class FakeSpaces:
         self.objects, self.uploads, self.deleted, self.listed = {}, [], [], list(listed)
 
     def put_object(self, *, Bucket, Key, Body, ACL, ContentType):
+        Body = Body.read()
         self.objects[Bucket, Key] = Body
         self.uploads.append((Bucket, Key, Body, ACL))
 
@@ -356,9 +357,12 @@ url = "https://example.org/feed.xml"
                     publish.Publisher(path)
 
     def anonymous(self, code):
-        """Patch the publisher's unsigned request; code None means it succeeded."""
+        """Patch the publisher's unsigned request: None means it succeeded, an
+        exception is raised as is, and a number is an HTTP status."""
         def request(url, method="GET", data=None, token=None):
             self.assertEqual((method, token), ("HEAD", None))
+            if isinstance(code, Exception):
+                raise code
             if code is not None:
                 raise HTTPError(url, code, "anonymous", {}, None)
             return b""
@@ -389,17 +393,17 @@ url = "https://example.org/feed.xml"
             self.assertEqual(database.execute("PRAGMA quick_check").fetchone()[0], "ok")
             self.assertEqual(database.execute("SELECT value FROM evidence").fetchone()[0], "private source evidence")
 
-    def test_a_publicly_readable_backup_is_deleted_and_fails(self):
+    def test_a_backup_not_proven_private_is_deleted_and_fails(self):
         self.seed_backup()
-        for code, message in [(None, "publicly readable"), (404, "Unexpected anonymous response 404")]:
+        for code, message in [(None, "publicly readable"), (404, "Unexpected anonymous response 404"),
+                              (URLError("reset"), "could not be checked")]:
             with self.subTest(code=code):
                 client = FakeSpaces()
                 with patch("boto3.client", return_value=client), self.anonymous(code):
                     with self.assertRaisesRegex(ValueError, message):
                         self.p.backup(force=True)
                 self.assertFalse((self.p.state / "backup.json").exists())
-                if code is None:
-                    self.assertEqual(client.deleted, [client.uploads[0][:2]])
+                self.assertEqual(client.deleted, [client.uploads[0][:2]])
 
     def test_retention_deletes_only_old_backups_and_its_failure_is_retried(self):
         self.seed_backup()

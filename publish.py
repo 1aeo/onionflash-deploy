@@ -503,23 +503,27 @@ class Publisher:
                               config=Config(connect_timeout=self.net["timeout_seconds"], read_timeout=self.net["timeout_seconds"],
                                             retries={"mode": "standard", "max_attempts": int(self.net["attempts"])}))
         # Only SQLite: the public site is rebuilt from it with `onionflash build`.
+        key = prefix + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + ".sqlite3.gz"
         with tempfile.TemporaryDirectory(prefix="backup-", dir=self.state) as temporary:
-            snapshot = Path(temporary) / "onionflash.sqlite3"
+            snapshot, compressed = Path(temporary) / "onionflash.sqlite3", Path(temporary) / "onionflash.sqlite3.gz"
             with lock(str(self.database) + ".lock", shared=True):
                 backup_database(self.database, snapshot)
-            body = gzip.compress(snapshot.read_bytes())
-        key = prefix + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + ".sqlite3.gz"
-        client.put_object(Bucket=cfg["bucket"], Key=key, Body=body, ACL="private", ContentType="application/gzip")
+            with snapshot.open("rb") as source, gzip.open(compressed, "wb") as target:
+                shutil.copyfileobj(source, target)
+            with compressed.open("rb") as body:
+                client.put_object(Bucket=cfg["bucket"], Key=key, Body=body, ACL="private", ContentType="application/gzip")
         # An anonymous request is the real exposure path; it must be refused,
-        # whatever ACLs or bucket policies say.
+        # whatever ACLs or bucket policies say. Anything but a 403 removes the object.
         try:
             self.request(cfg["endpoint_url"].rstrip("/") + "/" + cfg["bucket"] + "/" + quote(key), "HEAD")
+            problem = "The new backup was publicly readable"
         except HTTPError as exc:
-            if exc.code != 403:
-                raise ValueError(f"Unexpected anonymous response {exc.code} for the new backup") from None
-        else:
+            problem = None if exc.code == 403 else f"Unexpected anonymous response {exc.code} for the new backup"
+        except OSError as exc:  # URLError, timeouts
+            problem = f"The new backup's privacy could not be checked ({type(exc).__name__})"
+        if problem:
             client.delete_object(Bucket=cfg["bucket"], Key=key)
-            raise ValueError("The new backup was publicly readable and has been deleted")
+            raise ValueError(problem + "; it has been deleted")
         cutoff = datetime.now(timezone.utc) - timedelta(days=cfg["retention_days"])
         pattern = re.escape(prefix) + r"\d{8}T\d{6}Z(?:\.sqlite3\.gz|-[0-9a-f]{12}(?:-[0-9a-f]{32})?\.tar\.gz)"
         for page in client.get_paginator("list_objects_v2").paginate(Bucket=cfg["bucket"], Prefix=prefix):
