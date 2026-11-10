@@ -39,4 +39,3 @@ access_key_env = "DO_SPACES_KEY"
 secret_key_env = "DO_SPACES_SECRET"
 backup_interval_seconds = 86400
 retention_days = 30
-create_bucket = false
