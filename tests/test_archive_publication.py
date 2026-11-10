@@ -133,13 +133,13 @@ class PermanentPublicationTests(unittest.TestCase):
         self.assertEqual(publish.read_json(self.p.state / "receipts" / (NEW + ".json"))["archive"], result["archive"])
 
     def test_large_feeds_are_verified_with_head_not_buffered(self):
-        self.p.cf["verify_paths"] = ["feed.xml"]
         sha = "f" * 64
         body_read = Mock(side_effect=AssertionError("HEAD must not read the feed body"))
         response = SimpleNamespace(status=200, headers={"ETag": '"' + sha + '"', "Content-Length": "100000000"},
                                    geturl=lambda: self.p.base_url + "feed.xml", read=body_read)
         self.p.net["max_response_bytes"] = 1
-        with patch("publish.urlopen", return_value=nullcontext(response)) as request:
+        with patch("publish.VERIFY_PATHS", ("feed.xml",)), \
+                patch("publish.urlopen", return_value=nullcontext(response)) as request:
             self.p.verify(self.p.base_url, {"feed.xml": sha}, archive={"manifest_sha256": "a" * 64})
         self.assertEqual(request.call_args.args[0].get_method(), "HEAD")
         body_read.assert_not_called()

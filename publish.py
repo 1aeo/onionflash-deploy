@@ -12,7 +12,6 @@ import hashlib
 import json
 import logging
 from logging.handlers import RotatingFileHandler
-import math
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -33,6 +32,17 @@ from urllib.request import Request, urlopen
 ROOT = Path(__file__).resolve().parent
 LOG = logging.getLogger("onionflash.deploy")
 SAFE_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,62}\Z")
+API_BASE = "https://api.cloudflare.com/client/v4"
+MAX_FILES, MAX_FILE_BYTES, MAX_TOTAL_BYTES = 10000, 10 * 1024 * 1024, 100 * 1024 * 1024
+COMMAND_TIMEOUT_SECONDS = 240
+VERIFY_PATHS = ("index.html", "feed.xml", "feed.json")
+# The publisher's own requests and storage clients. Responses may be as large as
+# any validated file, so verification can always read a file back.
+NETWORK = {"timeout_seconds": 30, "attempts": 4, "backoff_seconds": 2, "backoff_cap_seconds": 30,
+           "jitter_seconds": 1, "max_response_bytes": MAX_FILE_BYTES}
+ACCOUNT_ID, API_TOKEN, ZONE_TOKEN, ZONE_ID = ("CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_API_TOKEN",
+                                              "CLOUDFLARE_ZONE_TOKEN", "CLOUDFLARE_ZONE_ID")
+SPACES_KEY, SPACES_SECRET = "DO_SPACES_KEY", "DO_SPACES_SECRET"
 def public_files():
     """Fixed files the application renders (story pages and topic feeds vary)."""
     from onionflash.render import ASSET_FILES
@@ -173,22 +183,12 @@ class Publisher:
         self.cf = self.cfg["cloudflare"]
         if not SAFE_ID.fullmatch(self.cf["worker_name"]):
             raise ValueError("Invalid Worker name")
-        self.net = self.cfg["network"]
-        for key in ["attempts", "timeout_seconds", "backoff_seconds", "backoff_cap_seconds", "jitter_seconds", "max_response_bytes"]:
-            if (isinstance(self.net[key], bool) or not isinstance(self.net[key], (int, float)) or
-                    not math.isfinite(self.net[key]) or self.net[key] < 0):
-                raise ValueError("Invalid network parameter: " + key)
-        if (type(self.net["attempts"]) is not int or not 1 <= self.net["attempts"] <= 10 or
-                self.net["timeout_seconds"] <= 0 or type(self.net["max_response_bytes"]) is not int or
-                self.net["max_response_bytes"] < 1):
-            raise ValueError("Invalid attempt/timeout limits")
-        self.account = self.secret(self.cf["account_id_env"])
+        self.net = dict(NETWORK)
+        self.account = self.secret(ACCOUNT_ID)
         if not re.fullmatch(r"[0-9a-f]{32}", self.account):
             raise ValueError("Invalid Cloudflare account ID")
-        self.token = self.secret(self.cf["api_token_env"])
-        self.api_base = self.cf["api_base_url"].rstrip("/")
-        if urlsplit(self.api_base).scheme != "https":
-            raise ValueError("Cloudflare API endpoint must use HTTPS")
+        self.token = self.secret(API_TOKEN)
+        self.api_base = API_BASE
         self._archive = None
         self.node = ROOT / "node_modules/node/bin/node"
         self.wrangler = ROOT / "node_modules/wrangler/bin/wrangler.js"
@@ -213,11 +213,10 @@ class Publisher:
 
     def private_names(self):
         """Environment variables holding credentials for Cloudflare, Spaces or the LLM."""
-        spaces = self.cfg.get("spaces", {})
+        # Permanent storage may use its own dedicated key pair, so its names stay configurable.
         archive = self.cfg.get("archive", {})
-        names = {self.cf["api_token_env"], self.cf.get("zone_token_env", "CLOUDFLARE_ZONE_TOKEN"),
-                 spaces.get("access_key_env", ""), spaces.get("secret_key_env", ""),
-                 archive.get("access_key_env", ""), archive.get("secret_key_env", ""), self.app["llm"]["api_key_env"]}
+        names = {API_TOKEN, ZONE_TOKEN, SPACES_KEY, SPACES_SECRET, self.app["llm"]["api_key_env"],
+                 archive.get("access_key_env", ""), archive.get("secret_key_env", "")}
         return names - {""}
 
     def secret_values(self):
@@ -267,7 +266,7 @@ class Publisher:
                 close()
 
     def api(self, suffix, method="GET", data=None, zone=False):
-        token = self.secret(self.cf.get("zone_token_env", "CLOUDFLARE_ZONE_TOKEN")) if zone else self.token
+        token = self.secret(ZONE_TOKEN) if zone else self.token
         response = json.loads(self.request(self.api_base + suffix, method, data, token))
         if not response.get("success"):
             raise RuntimeError("Cloudflare API rejected request: " + self.clean_error(response.get("errors")))
@@ -301,7 +300,7 @@ class Publisher:
         if metadata:
             env["WRANGLER_OUTPUT_FILE_PATH"] = str(metadata)
         result = subprocess.run([str(self.node), str(self.wrangler), *arguments], cwd=ROOT, env=env,
-                                capture_output=True, text=True, timeout=self.cf["command_timeout_seconds"])
+                                capture_output=True, text=True, timeout=COMMAND_TIMEOUT_SECONDS)
         if result.returncode:
             raise RuntimeError(self.clean_error(result.stdout + result.stderr))
         return result.stdout
@@ -359,15 +358,15 @@ class Publisher:
                 raise ValueError("Unexpected public file: " + relative)
             size = path.stat().st_size
             total += size
-            if size > self.cf["max_file_bytes"] or total > self.cf["max_total_bytes"]:
+            if size > MAX_FILE_BYTES or total > MAX_TOTAL_BYTES:
                 raise ValueError("Public output exceeds size budget")
             body = path.read_bytes()
             if any(secret in body for secret in secrets):
                 raise ValueError("Credential detected in public output")
             files[relative] = hashlib.sha256(body).hexdigest()
-        if len(files) > self.cf["max_files"]:
+        if len(files) > MAX_FILES:
             raise ValueError("Public output exceeds file count budget")
-        for relative in (HOT_FILES if hot_only else {*public_files(), *self.cf["verify_paths"]}):
+        for relative in (HOT_FILES if hot_only else {*public_files(), *VERIFY_PATHS}):
             if relative not in files:
                 raise ValueError("Missing required public file: " + relative)
         if not hot_only:
@@ -380,7 +379,7 @@ class Publisher:
 
     def verify(self, base_url, manifest, *, archive=None):
         from archive_store import HOT_FILES
-        for relative in self.cf["verify_paths"]:
+        for relative in VERIFY_PATHS:
             # Newly activated assets may take a short time to reach the edge.
             for attempt in range(self.net["attempts"]):
                 try:
@@ -500,7 +499,7 @@ class Publisher:
                 hot_manifest = self.archive.snapshot_hot(stage, generation)
                 if self.validate(stage, hot_only=True) != hot_manifest:
                     raise ValueError("Hot asset snapshot changed")
-                manifest = {**hot_manifest, **self.archive.manifest(self.cf["verify_paths"], generation)}
+                manifest = {**hot_manifest, **self.archive.manifest(VERIFY_PATHS, generation)}
                 archive_info = {"manifest_sha256": synchronized["manifest_sha256"],
                                 "generation": generation, "origin": self.archive.cfg["public_origin"]}
             else:
@@ -593,7 +592,7 @@ class Publisher:
         receipt = json.loads((self.state / "publication.json").read_text())
         options = {"archive": receipt["archive"]} if receipt.get("archive") else {}
         self.verify(self.origin_url(), receipt["manifest"], **options)
-        zone = self.secret(self.cf["zone_id_env"])
+        zone = self.secret(ZONE_ID)
         if not re.fullmatch(r"[0-9a-f]{32}", zone):
             raise ValueError("Invalid zone ID")
         existing = self.api(f"/zones/{zone}/workers/routes", zone=True)
@@ -649,8 +648,8 @@ class Publisher:
         from botocore.config import Config
         from onionflash.store import backup_database
         client = boto3.client("s3", endpoint_url=cfg["endpoint_url"], region_name=cfg["region"],
-                              aws_access_key_id=self.secret(cfg["access_key_env"]),
-                              aws_secret_access_key=self.secret(cfg["secret_key_env"]),
+                              aws_access_key_id=self.secret(SPACES_KEY),
+                              aws_secret_access_key=self.secret(SPACES_SECRET),
                               config=Config(connect_timeout=self.net["timeout_seconds"], read_timeout=self.net["timeout_seconds"],
                                             retries={"mode": "standard", "max_attempts": int(self.net["attempts"])}))
         # Only SQLite: the public site is rebuilt from it with `onionflash build`.
