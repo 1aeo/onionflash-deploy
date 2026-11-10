@@ -5,6 +5,11 @@ news aggregator. A scheduled Python job collects sources and calls your LLM;
 Cloudflare Workers Static Assets serves the generated website and RSS. Private
 DigitalOcean Spaces backups are optional. Visitors never call the LLM.
 
+With `[archive].enabled = true`, Spaces durably stores article pages, public JSON,
+numbered history pages and full-history feeds. Cloudflare serves them under the
+same URLs and retains only the front page and small shared assets in its
+deployment bundle. See [permanent storage setup](PERMANENT_STORAGE.md).
+
 Production: **https://1aeo.com/onionflash/** · [RSS](https://1aeo.com/onionflash/feed.xml)
 
 Alias: **https://onionflash.1aeo.com/** redirects to the canonical site above.
@@ -92,9 +97,20 @@ Publication uploads an immutable version, checks its preview hashes, activates
 it, and verifies the live site: the production hostname once routed, otherwise the
 `workers.dev` origin. A failed live check reactivates the preceding version and
 fails that run; the next scheduled run tries again. Unchanged content is not
-uploaded and makes no Cloudflare calls. A new Worker is deployed directly, since it
-has no live version to protect. A version deployed outside this publisher is
-replaced at the next content change.
+uploaded, but the active version is checked before taking that shortcut. A new Worker is deployed directly, since it
+has no live version to protect. An active version that differs from the recorded
+publication, or changes during preview checks, stops publication for inspection.
+
+Permanent-storage deployments use the same linear flow. Small per-version
+receipts preserve the immutable archive root and verification hashes for rollback
+and private history retention; there is no transition journal or `reconcile`
+command. An interrupted attempt clears the content shortcut. If activation did
+not occur, the next run uploads and verifies again. If the live version changed
+without a completed receipt, publication stops for operator inspection rather
+than guessing whether that change belongs to this process. An external version
+change during verification is left intact rather than rolled back.
+Manual rollback also checks the recorded active version before preparation and
+again before activation, so it will not replace a concurrent external deployment.
 
 Failures inside a run are recorded in `state/run.log` and `state/last-run.json`;
 errors raised before the run starts, such as an invalid configuration or credential

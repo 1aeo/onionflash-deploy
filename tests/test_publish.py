@@ -269,24 +269,43 @@ url = "https://example.org/feed.xml"
                 self.publisher.publish()
         api.assert_not_called()
 
-    def test_unchanged_content_makes_no_cloudflare_calls(self):
+    def test_unchanged_content_checks_active_version_without_uploading(self):
         p = self.publisher
         p.public.mkdir(parents=True)
         (p.public / "index.html").write_text("safe")
         manifest = {"index.html": "dummy"}
-        identity = publish.hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
+        identity = p.publication_identity(manifest)
         publish.atomic_json(p.state / "publication.json", {"content_hash": identity, "version_id": "expected"})
-        with patch.object(p, "validate", return_value=manifest), patch.object(p, "current_version") as version, \
+        with patch.object(p, "validate", return_value=manifest), patch.object(p, "current_version", return_value="expected") as version, \
                 patch.object(p, "command") as command, patch.object(p, "api") as api:
             self.assertEqual(p.publish()["version_id"], "expected")
-        version.assert_not_called()
+        version.assert_called_once()
         command.assert_not_called()
         api.assert_not_called()
+
+        with patch.object(p, "validate", return_value=manifest), patch.object(p, "current_version", return_value="external"), patch.object(p, "command") as command:
+            with self.assertRaisesRegex(ValueError, "differs"):
+                p.publish()
+        command.assert_not_called()
 
     def test_backup_invalid_retention_rejected_before_storage_access(self):
         self.publisher.cfg["spaces"].update(enabled=True, retention_days=0)
         with self.assertRaisesRegex(ValueError, "positive integer"):
             self.publisher.backup()
+
+    def test_invalid_remote_version_cannot_be_used_as_a_receipt_path(self):
+        response = {"deployments": [{"versions": [{"version_id": "../outside", "percentage": 100}]}]}
+        with patch.object(self.publisher, "api", return_value=response):
+            with self.assertRaisesRegex(ValueError, "invalid version"):
+                self.publisher.current_version()
+
+    def test_invalid_rollback_version_is_rejected_before_mutation(self):
+        publish.atomic_json(self.publisher.state / "publication.json", {"version_id": "v", "previous_version_id": "../outside"})
+        with patch.object(self.publisher, "activate") as activate:
+            with self.assertRaisesRegex(ValueError, "Invalid previous version"):
+                self.publisher.rollback()
+        activate.assert_not_called()
+        self.assertFalse((self.publisher.state / "publication-hold.json").exists())
 
     def test_secret_redaction(self):
         self.assertNotIn(os.environ["CLOUDFLARE_API_TOKEN"], self.publisher.clean_error("failed " + os.environ["CLOUDFLARE_API_TOKEN"]))
