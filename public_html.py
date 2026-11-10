@@ -3,6 +3,9 @@
 from html.parser import HTMLParser
 
 
+URL_ATTRIBUTES = frozenset({"href", "src", "xlink:href", "action", "formaction", "data", "poster", "background", "cite"})
+
+
 class _StaticHTML(HTMLParser):
     def handle_starttag(self, tag, attributes):
         if tag == "script":
@@ -10,7 +13,7 @@ class _StaticHTML(HTMLParser):
         for name, value in attributes:
             if name.startswith("on"):
                 raise ValueError("Public HTML contains a browser event handler")
-            if value is not None and "".join(value.split()).lower().startswith("javascript:"):
+            if name in URL_ATTRIBUTES and value is not None and "".join(value.split()).lower().startswith("javascript:"):
                 raise ValueError("Public HTML contains a JavaScript URL")
 
 

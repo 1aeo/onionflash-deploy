@@ -114,6 +114,11 @@ url = "https://example.org/feed.xml"
         (public / "index.html").write_text('<details><summary>Menu</summary><a href="topics/security/">Security</a></details>')
         self.assertIn("index.html", self.publisher.validate(public))
 
+    def test_literal_script_scheme_in_news_metadata_is_not_an_executable_url(self):
+        public = self.public_tree()
+        (public / "index.html").write_text('<meta name="description" content="javascript: URLs are the subject of this security report"><p title="JavaScript: disabled">News</p>')
+        self.assertIn("index.html", self.publisher.validate(public))
+
     def test_subdirectory_assets_use_plain_paths_and_root_headers(self):
         public = self.public_tree()
         assets = self.publisher.prepare_assets(public)
