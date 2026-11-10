@@ -24,8 +24,9 @@ import tempfile
 import time
 import tomllib
 import uuid
-from urllib.error import HTTPError, URLError
+from urllib.error import HTTPError
 from urllib.parse import urlsplit
+from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parent
 LOG = logging.getLogger("onionflash.deploy")
@@ -177,7 +178,6 @@ class Publisher:
         self.api_base = self.cf["api_base_url"].rstrip("/")
         if urlsplit(self.api_base).scheme != "https":
             raise ValueError("Cloudflare API endpoint must use HTTPS")
-        self._http_client = None
         self.node = ROOT / "node_modules/node/bin/node"
         self.wrangler = ROOT / "node_modules/wrangler/bin/wrangler.js"
 
@@ -211,42 +211,19 @@ class Publisher:
         names |= self.private_names()
         return [os.environ[name] for name in names if len(os.environ.get(name, "")) >= 8]
 
-    def http_settings(self):
-        return {"timeout_seconds": self.net["timeout_seconds"],
-                "connect_timeout_seconds": self.net["timeout_seconds"],
-                "total_timeout_seconds": self.net["timeout_seconds"],
-                "retry_attempts": self.net["attempts"], "requests_per_minute": 0,
-                "backoff_base_seconds": self.net["backoff_seconds"],
-                "backoff_cap_seconds": self.net["backoff_cap_seconds"],
-                "backoff_jitter_seconds": self.net["jitter_seconds"],
-                "max_retry_after_seconds": self.net["backoff_cap_seconds"],
-                "max_response_bytes": self.net["max_response_bytes"], "max_redirects": 10,
-                "user_agent": "OnionFlashPublisher/0.1"}
-
-    def delay(self, attempt, retry_after=""):
-        from onionflash.transport import retry_delay
-        time.sleep(retry_delay(attempt, self.http_settings(), retry_after))
-
     def request(self, url, method="GET", data=None, token=None):
-        # Lazy import keeps install.py usable before the app is installed.
-        from onionflash.transport import FetchError, HttpClient
-        if self._http_client is None:
-            self._http_client = HttpClient(self.http_settings(), same_origin_redirects=True)
-        headers = {"Accept-Encoding": "identity"}
+        """One bounded request. The token is never forwarded to a redirect target."""
+        headers = {"User-Agent": "OnionFlashPublisher", "Accept-Encoding": "identity"}
+        if data is not None:
+            headers["Content-Type"] = "application/json"
+        request = Request(url, None if data is None else json.dumps(data).encode(), headers, method=method)
         if token:
-            headers["Authorization"] = "Bearer " + token
-        try:
-            return self._http_client.request(method, url, headers=headers, json_body=data).body
-        except FetchError as exc:
-            if exc.status:
-                raise HTTPError(url, exc.status, str(exc), {}, None) from None
-            if exc.retryable:
-                raise URLError(str(exc)) from None
-            raise ValueError(str(exc)) from None
-
-    def close(self):
-        if self._http_client is not None:
-            self._http_client.close()
+            request.add_unredirected_header("Authorization", "Bearer " + token)
+        with urlopen(request, timeout=self.net["timeout_seconds"]) as response:
+            body = response.read(self.net["max_response_bytes"] + 1)
+        if len(body) > self.net["max_response_bytes"]:
+            raise ValueError("Response exceeds the size limit: " + url)
+        return body
 
     def api(self, suffix, method="GET", data=None, zone=False):
         token = self.secret(self.cf.get("zone_token_env", "CLOUDFLARE_ZONE_TOKEN")) if zone else self.token
@@ -279,32 +256,20 @@ class Publisher:
                    WRANGLER_LOG_PATH=str(self.state / "wrangler-logs"), CI="true")
         if metadata:
             env["WRANGLER_OUTPUT_FILE_PATH"] = str(metadata)
-        for attempt in range(self.net["attempts"]):
-            try:
-                result = subprocess.run([str(self.node), str(self.wrangler), *arguments], cwd=ROOT, env=env,
-                                        capture_output=True, text=True, timeout=self.cf["command_timeout_seconds"])
-            except subprocess.TimeoutExpired:
-                if attempt + 1 == self.net["attempts"]:
-                    raise
-                self.delay(attempt)
-                continue
-            if result.returncode == 0:
-                return result.stdout
-            message = self.clean_error(result.stdout + result.stderr)
-            if attempt + 1 == self.net["attempts"] or not re.search(r"ECONNRESET|ETIMEDOUT|EAI_AGAIN|fetch failed|network error|\b(?:429|500|502|503|504)\b", message, re.I):
-                raise RuntimeError(message)
-            self.delay(attempt)
-        raise RuntimeError("Wrangler exhausted its bounded retry budget")
+        result = subprocess.run([str(self.node), str(self.wrangler), *arguments], cwd=ROOT, env=env,
+                                capture_output=True, text=True, timeout=self.cf["command_timeout_seconds"])
+        if result.returncode:
+            raise RuntimeError(self.clean_error(result.stdout + result.stderr))
+        return result.stdout
 
-    def make_config(self, directory, bootstrap=False):
+    def make_config(self, directory):
         config = {"name": self.cf["worker_name"], "account_id": self.account,
                   "compatibility_date": self.cf["compatibility_date"], "workers_dev": True,
-                  "preview_urls": True, "main": str(ROOT / ("bootstrap.mjs" if bootstrap else "worker.mjs"))}
-        if not bootstrap:
-            config["assets"] = {"directory": str(directory), "binding": "ASSETS",
-                                "html_handling": "auto-trailing-slash", "not_found_handling": "none"}
-            config["vars"] = {"BASE_PATH": self.base_path}
-        target = self.state / ("wrangler-bootstrap.json" if bootstrap else "wrangler.json")
+                  "preview_urls": True, "main": str(ROOT / "worker.mjs"),
+                  "assets": {"directory": str(directory), "binding": "ASSETS",
+                             "html_handling": "auto-trailing-slash", "not_found_handling": "none"},
+                  "vars": {"BASE_PATH": self.base_path}}
+        target = self.state / "wrangler.json"
         atomic_json(target, config)
         return target
 
@@ -363,12 +328,12 @@ class Publisher:
                     if hashlib.sha256(body).hexdigest() != manifest[relative]:
                         raise ValueError("Published hash mismatch: " + relative)
                     break
-                except (ValueError, HTTPError) as exc:
-                    if isinstance(exc, HTTPError) and exc.code != 404:
+                except (ValueError, OSError) as exc:  # URLError and HTTPError are OSErrors
+                    if isinstance(exc, HTTPError) and exc.code != 404 and exc.code < 500:
                         raise
                     if attempt + 1 == self.net["attempts"]:
                         raise
-                    self.delay(attempt)
+                    time.sleep(min(self.net["backoff_cap_seconds"], self.net["backoff_seconds"] * 2 ** attempt))
 
     def activate(self, version, config):
         if not re.fullmatch(r"[0-9a-f-]{36}", version):
@@ -385,108 +350,32 @@ class Publisher:
                              "compatibility_date": self.cf["compatibility_date"]})
         return target
 
-    def verify_receipt(self, receipt):
-        self.verify(receipt["origin_url"], receipt["manifest"])
-        if (self.state / "routes.json").exists():
-            self.verify(self.base_url, receipt["manifest"])
+    def origin_url(self):
+        subdomain = self.api(f"/accounts/{self.account}/workers/subdomain")["subdomain"]
+        return f"https://{self.cf['worker_name']}.{subdomain}.workers.dev" + self.base_path
 
-    def commit_receipt(self, receipt):
-        version = receipt["version_id"]
-        if not re.fullmatch(r"[0-9a-f-]{36}", version):
-            raise ValueError("Invalid receipt version identity")
-        # A current pointer must never reference an unarchived publication.
-        atomic_json(self.state / "receipts" / (version + ".json"), receipt)
+    def forget_content(self, receipt):
+        """Before changing the live version: until a check confirms the result, the
+        recorded content no longer describes the live site, so an interrupted run
+        can never take the unchanged-content shortcut."""
+        receipt.pop("content_hash", None)
         atomic_json(self.state / "publication.json", receipt)
 
-    def finish_transition(self, journal, outcome):
-        journal = {**journal, "outcome": outcome, "finished_at": datetime.now(timezone.utc).isoformat()}
-        atomic_json(self.state / "last-transition.json", journal)
-        (self.state / "transition.json").unlink(missing_ok=True)
-        sync_directory(self.state)
-
-    def complete_transition(self, journal):
-        receipt = dict(journal["target"])
-        if journal["kind"] == "publish":
-            archived = read_json(self.state / "receipts" / (receipt["version_id"] + ".json"), {})
-            receipt["published_at"] = archived.get("published_at", datetime.now(timezone.utc).isoformat())
-        self.commit_receipt(receipt)
-        if journal["kind"] == "rollback":
-            atomic_json(self.state / "rollback.json", {"version_id": receipt["version_id"], "timestamp": time.time()})
-            atomic_json(self.state / "publication-hold.json", {"reason": "rollback completed", "to": receipt["version_id"], "timestamp": time.time()})
-        self.finish_transition({**journal, "target": receipt}, "committed")
-        return receipt
-
-    def restore_transition(self, journal):
-        actual = self.current_version()
-        before = journal["before_version"]
-        if actual not in {before, journal["target"]["version_id"]}:
-            raise ValueError("Unknown external version; transition retained for investigation")
-        if actual != before:
-            self.activate(before, self.control_config())
-        receipt = journal.get("before_receipt")
-        if receipt:
-            self.verify_receipt(receipt)
-            self.commit_receipt(receipt)
-        else:
-            (self.state / "publication.json").unlink(missing_ok=True)
-        self.finish_transition(journal, "restored-before")
-        return receipt
-
-    def transition(self, target, before_version, before_receipt, kind="publish"):
-        if read_json(self.state / "transition.json"):
-            raise ValueError("An unfinished transition exists; run reconcile first")
-        if self.current_version() != before_version:
-            raise ValueError("Active Worker version changed before activation")
-        journal = {"kind": kind, "before_version": before_version,
-                   "before_receipt": before_receipt, "target": target,
-                   "started_at": datetime.now(timezone.utc).isoformat()}
-        atomic_json(self.state / "transition.json", journal)
-        # Interruptions, including process termination, leave this journal for
-        # reconciliation. All metadata is gathered before the external mutation.
-        try:
-            self.activate(target["version_id"], self.control_config())
-            self.verify_receipt(target)
-            return self.complete_transition(journal)
-        except Exception:
-            # Restore and fail this run; the next run retries. An automatic hold
-            # would freeze publication while every later run reported success.
-            try:
-                self.restore_transition(journal)
-            except Exception as recovery_error:
-                raise RuntimeError("Transition uncertain; run reconcile: " + self.clean_error(recovery_error)) from recovery_error
-            raise
-
-    def reconcile(self):
-        journal = read_json(self.state / "transition.json")
-        if not journal:
-            return None
-        actual = self.current_version()
-        if actual == journal["target"]["version_id"]:
-            try:
-                self.verify_receipt(journal["target"])
-            except Exception:
-                # Restore the previous version, then report the failed check.
-                self.restore_transition(journal)
-                raise
-            return self.complete_transition(journal)
-        if actual == journal["before_version"]:
-            return self.restore_transition(journal)
-        raise ValueError("Unknown external version; transition retained for investigation")
-
     def rollback(self):
-        if read_json(self.state / "transition.json"):
-            raise ValueError("Run reconcile before requesting another rollback")
+        """Hold publication and reactivate the previous version."""
         receipt = read_json(self.state / "publication.json", {})
         previous = receipt.get("previous_version_id")
-        restored = read_json(self.state / "receipts" / (str(previous) + ".json"))
-        if not previous or not restored:
-            raise ValueError("No verified previous publication exists; use hold to pause publication")
+        if not previous:
+            raise ValueError("No previous publication is recorded; use hold to pause publication")
         atomic_json(self.state / "publication-hold.json", {"reason": "rollback requested", "from": receipt["version_id"], "to": previous, "timestamp": time.time()})
-        return self.transition(restored, receipt["version_id"], receipt, "rollback")
+        self.forget_content(receipt)
+        self.activate(previous, self.control_config())
+        # Without a content hash the next publication after resume uploads again.
+        atomic_json(self.state / "publication.json", {"version_id": previous, "rolled_back_from": receipt["version_id"],
+                                                      "rolled_back_at": datetime.now(timezone.utc).isoformat()})
 
     def publish(self):
-        if not (self.state / "publication-hold.json").exists():
-            self.reconcile()
+        """Upload, check the preview, activate, verify; roll back and fail on a bad check."""
         if (self.state / "publication-hold.json").exists():
             raise ValueError("Publication is on hold; inspect status and use the explicit resume command")
         if not self.public.is_dir():
@@ -498,41 +387,49 @@ class Publisher:
                 shutil.copytree(self.public, stage, symlinks=True)
             manifest = self.validate(stage)
             identity = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
-            previous_path = self.state / "publication.json"
-            previous = read_json(previous_path, {})
+            previous = read_json(self.state / "publication.json", {})
             if previous.get("content_hash") == identity:
-                if self.current_version() != previous.get("version_id"):
-                    raise ValueError("Active Worker version differs from the publication receipt; reconcile before publishing")
                 LOG.info("Public output unchanged; skipping Cloudflare upload")
                 return previous
-            old_version = self.current_version()
-            if previous and old_version != previous.get("version_id"):
-                raise ValueError("Active Worker version changed outside this publisher; reconcile before uploading")
-            if old_version is None:
-                # Initialize only this new Worker, with a 503 placeholder and no routes.
-                bootstrap = self.make_config(stage, bootstrap=True)
-                self.command(["deploy", "--config", str(bootstrap)])
-                old_version = self.current_version()
             config = self.make_config(self.prepare_assets(stage))
-            metadata = Path(temporary) / "upload.ndjson"
-            self.command(["versions", "upload", "--config", str(config), "--preview-alias", "candidate"], metadata)
-            records = [json.loads(line) for line in metadata.read_text().splitlines() if line.strip()]
-            uploaded = next(x for x in records if x.get("type") == "version-upload")
-            version, preview = uploaded["version_id"], uploaded["preview_url"]
-            parsed = urlsplit(preview)
-            if parsed.scheme != "https" or not parsed.hostname or not parsed.hostname.endswith(".workers.dev") or parsed.username:
-                raise ValueError("Invalid Cloudflare preview URL")
-            self.verify(preview.rstrip("/") + self.base_path, manifest)
             # Fetch fallible metadata before activation, never after changing production.
-            account_subdomain = self.api(f"/accounts/{self.account}/workers/subdomain")["subdomain"]
-            origin = f"https://{self.cf['worker_name']}.{account_subdomain}.workers.dev" + self.base_path
-            receipt = {"version_id": version, "previous_version_id": old_version,
+            live = self.base_url if (self.state / "routes.json").exists() else self.origin_url()
+            before = self.current_version()
+            self.forget_content(previous)
+            if before is None:
+                # A new Worker has no live version to protect: deploy it directly.
+                self.command(["deploy", "--config", str(config)])
+                version = self.current_version()
+            else:
+                metadata = Path(temporary) / "upload.ndjson"
+                self.command(["versions", "upload", "--config", str(config), "--preview-alias", "candidate"], metadata)
+                lines = metadata.read_text().splitlines() if metadata.exists() else []
+                records = [json.loads(line) for line in lines if line.strip()]
+                uploaded = next((x for x in records if x.get("type") == "version-upload"), {})
+                version, preview = uploaded.get("version_id"), uploaded.get("preview_url")
+                if not version or not preview:
+                    raise RuntimeError("Wrangler did not report the uploaded version and its preview URL")
+                parsed = urlsplit(preview)
+                if parsed.scheme != "https" or not parsed.hostname or not parsed.hostname.endswith(".workers.dev") or parsed.username:
+                    raise ValueError("Invalid Cloudflare preview URL")
+                self.verify(preview.rstrip("/") + self.base_path, manifest)
+                self.activate(version, self.control_config())
+            try:
+                self.verify(live, manifest)
+            except Exception as failure:
+                if before is not None:
+                    try:
+                        self.activate(before, self.control_config())
+                    except Exception as restore:
+                        raise RuntimeError(f"Live check failed ({failure}) and restoring {before} failed: {restore}") from failure
+                raise
+            receipt = {"version_id": version, "previous_version_id": before,
                        "content_hash": identity, "manifest": manifest,
-                       "preview_url": preview, "origin_url": origin,
+                       "published_at": datetime.now(timezone.utc).isoformat(),
                        "app_version": self.app_version(),
                        "app_commit": self.git_commit(self.path(self.cfg.get("app_source", "../onionflash"))),
                        "deployment_commit": self.git_commit(ROOT)}
-            receipt = self.transition(receipt, old_version, previous or None)
+            atomic_json(self.state / "publication.json", receipt)
             LOG.info("Published version %s (%s files)", version, len(manifest))
             return receipt
 
@@ -548,7 +445,7 @@ class Publisher:
 
     def routes(self):
         receipt = json.loads((self.state / "publication.json").read_text())
-        self.verify(receipt["origin_url"], receipt["manifest"])
+        self.verify(self.origin_url(), receipt["manifest"])
         zone = self.secret(self.cf["zone_id_env"])
         if not re.fullmatch(r"[0-9a-f]{32}", zone):
             raise ValueError("Invalid zone ID")
@@ -727,13 +624,7 @@ class Publisher:
                 return False
         if attempt("collection", lambda: self.collect(result)):
             if (self.state / "publication-hold.json").exists():
-                if read_json(self.state / "transition.json"):
-                    message = "publication: unfinished transition; run reconcile before resuming"
-                    result["phases"]["publication"] = "unreconciled"
-                    result["errors"].append(message)
-                    LOG.error("%s", message)
-                else:
-                    result["phases"]["publication"] = "held"
+                result["phases"]["publication"] = "held"
             else:
                 attempt("publication", self.publish)
         else:
@@ -750,12 +641,10 @@ class Publisher:
         except BusyLock:
             running = True
         report = {"running": running}
-        for name in ["publication.json", "publication-hold.json", "transition.json", "last-transition.json", "backup.json", "last-run.json"]:
+        for name in ["publication.json", "publication-hold.json", "backup.json", "last-run.json"]:
             data = read_json(self.state / name)
             if data is not None:
                 data.pop("manifest", None)
-                if name in {"transition.json", "last-transition.json"}:
-                    data = {key: data.get(key) for key in ("kind", "outcome", "before_version", "started_at", "finished_at")} | {"target_version": data.get("target", {}).get("version_id")}
                 report[name] = data
         print(json.dumps(report, indent=2))
 
@@ -772,13 +661,11 @@ class Publisher:
         elif command == "hold":
             atomic_json(self.state / "publication-hold.json", {"reason": "manual hold", "timestamp": time.time()})
         elif command == "resume":
-            if read_json(self.state / "transition.json"):
-                raise ValueError("Run reconcile before releasing a publication hold")
             (self.state / "publication-hold.json").unlink(missing_ok=True)
             sync_directory(self.state)
         else:
             {"publish": self.publish, "routes": self.routes, "schedule": self.schedule,
-             "rollback": self.rollback, "reconcile": self.reconcile}[command]()
+             "rollback": self.rollback}[command]()
         return {"ok": True}
 
 
@@ -786,7 +673,7 @@ def main():
     os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default=str(ROOT / "deployment.toml"))
-    parser.add_argument("command", choices=["check", "run", "publish", "backup", "routes", "schedule", "status", "rollback", "hold", "resume", "reconcile"])
+    parser.add_argument("command", choices=["check", "run", "publish", "backup", "routes", "schedule", "status", "rollback", "hold", "resume"])
     parser.add_argument("--force", action="store_true", help="Create a backup even when its interval has not elapsed")
     args = parser.parse_args()
     if args.force and args.command != "backup":
@@ -820,8 +707,6 @@ def main():
         LOG.error("%s", publisher.clean_error(exc) if publisher else type(exc).__name__ + ": " + str(exc))
         return 1
     finally:
-        if publisher is not None:
-            publisher.close()
         LOG.removeHandler(console)
         console.close()
 

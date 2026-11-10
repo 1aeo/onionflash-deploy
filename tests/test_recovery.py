@@ -90,23 +90,7 @@ url = "https://example.org/feed.xml"
 ''')
         self.p = publish.Publisher(self.directory / "deployment.toml")
 
-    def seed_receipts(self):
-        old, new = receipt(OLD), receipt(NEW, OLD)
-        publish.atomic_json(self.p.state / "publication.json", old)
-        publish.atomic_json(self.p.state / "receipts" / (OLD + ".json"), old)
-        return old, new
-
-    def seed_transition(self, old, new):
-        publish.atomic_json(self.p.state / "transition.json", {
-            "kind": "publish", "before_version": OLD, "before_receipt": old,
-            "target": new, "started_at": "2026-11-09T11:00:00Z"})
-
-    def seed_backup(self):
-        self.p.cfg["spaces"].update(enabled=True, create_bucket=False)
-        with closing(sqlite3.connect(self.p.database)) as db:
-            db.execute("CREATE TABLE evidence (value TEXT)")
-            db.execute("INSERT INTO evidence VALUES ('private source evidence')")
-            db.commit()
+    def seed_public(self):
         self.p.public.mkdir(parents=True)
         for name in publish.public_files():
             body = b"generated public content"
@@ -115,144 +99,134 @@ url = "https://example.org/feed.xml"
             elif name == "feed.json":
                 body = b'{"items":[]}'
             (self.p.public / name).write_bytes(body)
+
+    def fake_cloudflare(self, live, *, failing_check=None):
+        """Patch wrangler, the API and checks; record calls in self.calls."""
+        self.calls, self.live = [], [live]
+        preview = "https://candidate-news.example.workers.dev"
+        def command(arguments, metadata=None):
+            self.calls.append(" ".join(arguments[:2]))
+            if arguments[:2] == ["versions", "upload"]:
+                Path(metadata).write_text(json.dumps({"type": "version-upload", "version_id": NEW, "preview_url": preview}) + "\n")
+            elif arguments[0] == "deploy":
+                self.live[0] = NEW
+            return ""
+        def activate(version, config):
+            self.calls.append("activate " + version)
+            self.live[0] = version
+        def verify(url, manifest):
+            self.calls.append("verify " + ("preview" if url.startswith(preview) else "live"))
+            if failing_check and self.calls[-1] == "verify " + failing_check:
+                raise ValueError("check failed")
+        for name, value in [("command", command), ("activate", activate), ("verify", verify),
+                            ("current_version", lambda: self.live[0])]:
+            patcher = patch.object(self.p, name, side_effect=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        for name, value in [("origin_url", "https://news.example.workers.dev/onionflash"), ("app_version", "test")]:
+            patcher = patch.object(self.p, name, return_value=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_publish_checks_the_preview_before_activating_and_records_the_receipt(self):
+        self.seed_public()
+        self.fake_cloudflare(OLD)
+        receipt = self.p.publish()
+        self.assertEqual(self.calls, ["versions upload", "verify preview", "activate " + NEW, "verify live"])
+        self.assertEqual((receipt["version_id"], receipt["previous_version_id"]), (NEW, OLD))
+        self.assertEqual(publish.read_json(self.p.state / "publication.json")["version_id"], NEW)
+
+    def test_failed_live_check_rolls_back_and_fails_without_holding(self):
+        self.seed_public()
+        publish.atomic_json(self.p.state / "publication.json", receipt(OLD))
+        self.fake_cloudflare(OLD, failing_check="live")
+        with self.assertRaisesRegex(ValueError, "check failed"):
+            self.p.publish()
+        self.assertEqual(self.calls[-2:], ["verify live", "activate " + OLD])
+        self.assertEqual(self.live[0], OLD)
+        self.assertEqual(publish.read_json(self.p.state / "publication.json")["version_id"], OLD)
+        self.assertFalse((self.p.state / "publication-hold.json").exists())
+
+    def test_a_failed_restore_reports_both_failures_and_forces_the_next_upload(self):
+        self.seed_public()
+        publish.atomic_json(self.p.state / "publication.json", receipt(OLD))
+        self.fake_cloudflare(OLD, failing_check="live")
+        def activate(version, config):
+            if version == OLD:
+                raise RuntimeError("restore unavailable")
+        with patch.object(self.p, "activate", side_effect=activate):
+            with self.assertRaisesRegex(RuntimeError, "check failed.*restore unavailable"):
+                self.p.publish()
+        current = publish.read_json(self.p.state / "publication.json")
+        self.assertEqual(current["version_id"], OLD)
+        self.assertNotIn("content_hash", current)
+
+    def test_an_upload_without_a_reported_version_fails_clearly(self):
+        self.seed_public()
+        self.fake_cloudflare(OLD)
+        with patch.object(self.p, "command", return_value=""):
+            with self.assertRaisesRegex(RuntimeError, "did not report the uploaded version"):
+                self.p.publish()
+
+    def test_an_interrupted_publication_or_rollback_cannot_skip_the_next_upload(self):
+        self.seed_public()
+        publish.atomic_json(self.p.state / "publication.json", receipt(OLD))
+        self.fake_cloudflare(OLD)
+        with patch.object(self.p, "activate", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.p.publish()
+        self.assertNotIn("content_hash", publish.read_json(self.p.state / "publication.json"))
+        publish.atomic_json(self.p.state / "publication.json", receipt(NEW, OLD))
+        with patch.object(self.p, "activate", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.p.rollback()
+        self.assertNotIn("content_hash", publish.read_json(self.p.state / "publication.json"))
+        self.assertTrue((self.p.state / "publication-hold.json").is_file())
+
+    def test_failed_preview_check_never_activates(self):
+        self.seed_public()
+        self.fake_cloudflare(OLD, failing_check="preview")
+        with self.assertRaisesRegex(ValueError, "check failed"):
+            self.p.publish()
+        self.assertFalse(any(call.startswith("activate") for call in self.calls))
+
+    def test_a_new_worker_is_deployed_directly(self):
+        self.seed_public()
+        self.fake_cloudflare(None)
+        receipt = self.p.publish()
+        self.assertEqual(self.calls, ["deploy --config", "verify live"])
+        self.assertEqual((receipt["version_id"], receipt["previous_version_id"]), (NEW, None))
+
+    def test_rollback_holds_before_activation_and_forces_the_next_upload(self):
+        publish.atomic_json(self.p.state / "publication.json", receipt(NEW, OLD))
+        def activate(version, config):
+            self.assertTrue((self.p.state / "publication-hold.json").is_file())
+        with patch.object(self.p, "activate", side_effect=activate) as activation:
+            self.p.rollback()
+        activation.assert_called_once()
+        self.assertEqual(activation.call_args[0][0], OLD)
+        current = publish.read_json(self.p.state / "publication.json")
+        self.assertEqual(current["version_id"], OLD)
+        self.assertNotIn("content_hash", current)
+
+    def test_failed_rollback_keeps_the_hold_and_the_receipt(self):
+        publish.atomic_json(self.p.state / "publication.json", receipt(NEW, OLD))
+        with patch.object(self.p, "activate", side_effect=RuntimeError("API unavailable")):
+            with self.assertRaises(RuntimeError):
+                self.p.rollback()
+        self.assertEqual(publish.read_json(self.p.state / "publication-hold.json")["reason"], "rollback requested")
+        self.assertEqual(publish.read_json(self.p.state / "publication.json")["version_id"], NEW)
+
+    def seed_backup(self):
+        self.p.cfg["spaces"].update(enabled=True, create_bucket=False)
+        with closing(sqlite3.connect(self.p.database)) as db:
+            db.execute("CREATE TABLE evidence (value TEXT)")
+            db.execute("INSERT INTO evidence VALUES ('private source evidence')")
+            db.commit()
+        self.seed_public()
         # Deliberately unlike the current build: an offline build can be newer
         # than the last successful publication receipt.
         publish.atomic_json(self.p.state / "publication.json", receipt(OLD))
-
-    def test_interrupted_activation_reconciles_owned_target(self):
-        old, new = self.seed_receipts()
-        actual = [OLD]
-        def interrupt(version, config):
-            self.assertTrue((self.p.state / "transition.json").is_file())
-            actual[0] = version
-            raise KeyboardInterrupt()
-        with patch.object(self.p, "activate", side_effect=interrupt), \
-                patch.object(self.p, "current_version", side_effect=lambda: actual[0]), \
-                patch.object(self.p, "verify_receipt"):
-            with self.assertRaises(KeyboardInterrupt):
-                self.p.transition(new, OLD, old)
-            self.assertTrue((self.p.state / "transition.json").is_file())
-            self.p.reconcile()
-        current = json.loads((self.p.state / "publication.json").read_text())
-        self.assertEqual(current["version_id"], NEW)
-        self.assertTrue((self.p.state / "receipts" / (NEW + ".json")).is_file())
-        self.assertFalse((self.p.state / "transition.json").exists())
-
-    def test_failed_verification_restores_previous_version_without_holding(self):
-        old, new = self.seed_receipts()
-        actual = [OLD]
-        def activate(version, config):
-            actual[0] = version
-        def verify(value):
-            if value["version_id"] == NEW:
-                raise ValueError("new version failed verification")
-        with patch.object(self.p, "activate", side_effect=activate), \
-                patch.object(self.p, "current_version", side_effect=lambda: actual[0]), \
-                patch.object(self.p, "verify_receipt", side_effect=verify):
-            with self.assertRaises(Exception):
-                self.p.transition(new, OLD, old)
-        self.assertEqual(actual[0], OLD)
-        self.assertEqual(json.loads((self.p.state / "publication.json").read_text())["version_id"], OLD)
-        self.assertFalse((self.p.state / "publication-hold.json").is_file())
-
-    def test_recovery_never_overwrites_an_external_version_change(self):
-        old, new = self.seed_receipts()
-        actual, activations = [OLD], []
-        def activate(version, config):
-            activations.append(version)
-            actual[0] = version
-        def verify(value):
-            actual[0] = OTHER
-            raise ValueError("verification interrupted by external deployment")
-        with patch.object(self.p, "activate", side_effect=activate), \
-                patch.object(self.p, "current_version", side_effect=lambda: actual[0]), \
-                patch.object(self.p, "verify_receipt", side_effect=verify):
-            with self.assertRaises(Exception):
-                self.p.transition(new, OLD, old)
-        self.assertEqual(activations, [NEW])
-        self.assertEqual(actual[0], OTHER)
-        self.assertTrue((self.p.state / "transition.json").is_file())
-        self.assertFalse((self.p.state / "publication-hold.json").is_file())
-
-    def test_manual_rollback_holds_before_activation_and_preserves_receipt_time(self):
-        old, new = self.seed_receipts()
-        publish.atomic_json(self.p.state / "publication.json", new)
-        actual = [NEW]
-        def activate(version, config):
-            self.assertTrue((self.p.state / "publication-hold.json").is_file())
-            self.assertEqual(publish.read_json(self.p.state / "transition.json")["kind"], "rollback")
-            actual[0] = version
-        with patch.object(self.p, "activate", side_effect=activate), \
-                patch.object(self.p, "current_version", side_effect=lambda: actual[0]), \
-                patch.object(self.p, "verify_receipt"):
-            self.p.rollback()
-        restored = publish.read_json(self.p.state / "publication.json")
-        self.assertEqual(actual[0], OLD)
-        self.assertEqual(restored["published_at"], old["published_at"])
-        self.assertTrue((self.p.state / "publication-hold.json").is_file())
-        self.assertFalse((self.p.state / "transition.json").exists())
-
-    def test_reconcile_refuses_unknown_external_version(self):
-        old, new = self.seed_receipts()
-        self.seed_transition(old, new)
-        with patch.object(self.p, "current_version", return_value=OTHER), \
-                patch.object(self.p, "activate") as activate, \
-                patch.object(self.p, "verify_receipt") as verify:
-            with self.assertRaises(Exception):
-                self.p.reconcile()
-        activate.assert_not_called()
-        verify.assert_not_called()
-        self.assertEqual(json.loads((self.p.state / "publication.json").read_text())["version_id"], OLD)
-        self.assertTrue((self.p.state / "transition.json").exists())
-
-    def test_reconcile_restores_before_pointer_when_remote_already_reverted(self):
-        old, new = self.seed_receipts()
-        self.seed_transition(old, new)
-        publish.atomic_json(self.p.state / "publication.json", new)
-        with patch.object(self.p, "current_version", return_value=OLD), \
-                patch.object(self.p, "activate") as activate, \
-                patch.object(self.p, "verify_receipt"):
-            self.p.reconcile()
-        activate.assert_not_called()
-        self.assertEqual(json.loads((self.p.state / "publication.json").read_text())["version_id"], OLD)
-        self.assertFalse((self.p.state / "transition.json").exists())
-
-    def test_reconcile_can_restore_known_good_before_if_target_is_bad(self):
-        old, new = self.seed_receipts()
-        self.seed_transition(old, new)
-        actual = [NEW]
-        def activate(version, config):
-            actual[0] = version
-        def verify(value):
-            if value["version_id"] == NEW:
-                raise ValueError("target assets fail verification")
-        with patch.object(self.p, "current_version", side_effect=lambda: actual[0]), \
-                patch.object(self.p, "activate", side_effect=activate), \
-                patch.object(self.p, "verify_receipt", side_effect=verify):
-            with self.assertRaisesRegex(ValueError, "target assets fail verification"):
-                self.p.reconcile()
-        self.assertEqual(actual[0], OLD)
-        self.assertEqual(json.loads((self.p.state / "publication.json").read_text())["version_id"], OLD)
-        self.assertFalse((self.p.state / "transition.json").exists())
-        self.assertFalse((self.p.state / "publication-hold.json").is_file())
-
-    def test_version_archive_precedes_current_pointer_write(self):
-        old, new = self.seed_receipts()
-        original = publish.atomic_json
-        writes = []
-        def record(path, value):
-            if value.get("version_id") == NEW:
-                writes.append(Path(path))
-                if Path(path) == self.p.state / "publication.json":
-                    self.assertTrue((self.p.state / "receipts" / (NEW + ".json")).is_file())
-            original(path, value)
-        with patch("publish.atomic_json", side_effect=record), \
-                patch.object(self.p, "activate"), \
-                patch.object(self.p, "current_version", return_value=OLD), \
-                patch.object(self.p, "verify_receipt"):
-            self.p.transition(new, OLD, old)
-        archive = self.p.state / "receipts" / (NEW + ".json")
-        self.assertLess(writes.index(archive), writes.index(self.p.state / "publication.json"))
 
     def test_publication_failure_does_not_prevent_due_backup(self):
         with patch.object(self.p, "application", return_value='{"sources_ok": 1}'), \
@@ -285,29 +259,6 @@ url = "https://example.org/feed.xml"
         backup.assert_called_once()
         self.assertTrue(result["ok"])
         self.assertEqual(result["phases"]["publication"], "held")
-
-    def test_unresolved_held_transition_is_not_reported_healthy(self):
-        old, new = self.seed_receipts()
-        self.seed_transition(old, new)
-        publish.atomic_json(self.p.state / "publication-hold.json", {"reason": "transition failed"})
-        with patch.object(self.p, "application", return_value='{"sources_ok": 1}'), patch.object(self.p, "publish") as publication, \
-                patch.object(self.p, "reconcile") as reconciliation, patch.object(self.p, "backup") as backup:
-            result = self.p.run_cycle()
-        self.assertFalse(result["ok"])
-        self.assertEqual(result["phases"]["publication"], "unreconciled")
-        publication.assert_not_called()
-        reconciliation.assert_not_called()  # An operator hold remains authoritative.
-        backup.assert_called_once()
-
-    def test_failed_rollback_precondition_keeps_an_explicit_intent_hold(self):
-        old, new = self.seed_receipts()
-        publish.atomic_json(self.p.state / "publication.json", new)
-        with patch.object(self.p, "current_version", side_effect=ValueError("API unavailable")):
-            with self.assertRaises(ValueError):
-                self.p.rollback()
-        self.assertEqual(publish.read_json(self.p.state / "publication-hold.json")["reason"], "rollback requested")
-        self.assertFalse((self.p.state / "rollback.json").exists())
-        self.assertEqual(publish.read_json(self.p.state / "publication.json")["version_id"], NEW)
 
     def test_optional_backup_error_is_visible_as_degraded_status(self):
         with patch.object(self.p, "application", return_value='{"sources_ok": 1}'), patch.object(self.p, "publish"), \
