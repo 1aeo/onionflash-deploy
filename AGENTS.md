@@ -30,12 +30,20 @@ listed in the README.
 ## The application boundary
 
 This repository uses the application only through its public interfaces:
-`onionflash.config.load_config`, its commands and their JSON output, the rendered
-output, and the publication tables and metadata it documents for publishers. Do
-not read other application tables or parse its private JSON; ask the application
-to expose what is needed instead. The one current exception is retention's
-protection of unfinished review evidence, which is to move behind an application
-interface.
+
+- `onionflash.config.load_config`, `onionflash.cli.main` and the commands' JSON
+  output;
+- `onionflash.store.backup_database`, and the layout constants
+  `onionflash.render.ASSET_FILES` and `onionflash.schema.CATEGORIES`;
+- the rendered output, and the publication tables and metadata documented for
+  publishers: `public_artifacts`, `public_render_queue` and the `publication_*`
+  metadata keys.
+
+Do not read other application tables or parse its private JSON; ask the
+application to expose what is needed instead. The current exceptions are in
+`retention.py`, which compacts old `items` and `analyses` rows and protects
+unfinished review evidence by reading `review_jobs`. Both are to move behind an
+application interface.
 
 ## Code
 
