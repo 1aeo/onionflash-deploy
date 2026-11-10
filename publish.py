@@ -30,14 +30,17 @@ from urllib.parse import urlsplit
 ROOT = Path(__file__).resolve().parent
 LOG = logging.getLogger("onionflash.deploy")
 SAFE_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,62}\Z")
-PUBLIC_FILES = {"index.html", "feed.xml", "feed.json", "style.css", "app.js", "mark.svg", "_headers"}
-TOPICS = {"security", "release", "dos", "directory-authority", "relay", "protocol", "feature", "network"}
+def public_files():
+    """Fixed files the application renders (story pages and topic feeds vary)."""
+    from onionflash.render import ASSET_FILES
+    return {"index.html", "feed.xml", "feed.json", "_headers", *ASSET_FILES}
 
 
 def public_path_allowed(relative):
-    return (relative in PUBLIC_FILES or
+    from onionflash.schema import CATEGORIES
+    return (relative in public_files() or
             bool(re.fullmatch(r"news/[A-Za-z0-9_-]{1,64}/index\.html", relative)) or
-            relative in {f"tags/{topic}.xml" for topic in TOPICS})
+            relative in {f"tags/{topic}.xml" for topic in CATEGORIES})
 
 
 def atomic_json(path, value):
@@ -77,7 +80,7 @@ def read_json(path, default=None):
 
 
 def load_env(path):
-    """Literal dotenv syntax, with existing process environment taking priority."""
+    """KEY=value lines with shell-style quoting and no expansion; the existing environment wins."""
     path = Path(path)
     if not path.exists():
         return
@@ -92,7 +95,7 @@ def load_env(path):
         key, separator, raw = line.partition("=")
         if not separator or not re.fullmatch(r"[A-Z_][A-Z0-9_]*", key):
             raise ValueError("Invalid credential-file assignment")
-        tokens = shlex.split(raw, comments=True)
+        tokens = shlex.split(raw)
         if len(tokens) > 1:
             raise ValueError("Quote values containing spaces")
         os.environ.setdefault(key, tokens[0] if tokens else "")
@@ -143,10 +146,11 @@ class Publisher:
         self.state.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.state, 0o700)
         self.app_config = self.path(self.cfg["app_config"])
-        self.app = tomllib.loads(self.app_config.read_text())
-        self.public = (self.app_config.parent / self.app["storage"]["output_dir"]).resolve()
-        self.database = (self.app_config.parent / self.app["storage"]["database"]).resolve()
-        self.base_url = self.app["site"]["base_url"].rstrip("/") + "/"
+        from onionflash.config import load_config
+        self.app = load_config(self.app_config)
+        self.public = Path(self.app["storage"]["output_dir"])
+        self.database = Path(self.app["storage"]["database"])
+        self.base_url = self.app["site"]["base_url"]
         parsed = urlsplit(self.base_url)
         if parsed.scheme != "https" or parsed.username or parsed.password or parsed.query or parsed.fragment:
             raise ValueError("Public base_url must be an HTTPS URL without credentials, query, or fragment")
@@ -195,9 +199,16 @@ class Publisher:
             result = result.replace(secret, "[redacted]")
         return result[-2500:]
 
+    def private_names(self):
+        """Environment variables holding credentials for Cloudflare, Spaces or the LLM."""
+        spaces = self.cfg.get("spaces", {})
+        names = {self.cf.get(k, "") for k in ("api_token_env", "zone_token_env")}
+        names |= {spaces.get(k, "") for k in ("access_key_env", "secret_key_env")}
+        return (names | {self.app["llm"]["api_key_env"]}) - {""}
+
     def secret_values(self):
         names = {k for k in os.environ if any(x in k.upper() for x in ("TOKEN", "SECRET", "API_KEY", "SPACES_KEY"))}
-        for section in [self.cf, self.cfg.get("spaces", {}), self.app.get("llm", {})]:
+        for section in [self.cf, self.cfg.get("spaces", {}), self.app["llm"]]:
             names.update(v for k, v in section.items() if k in {"api_token_env", "zone_token_env", "access_key_env", "secret_key_env", "api_key_env"})
         return [os.environ[name] for name in names if len(os.environ.get(name, "")) >= 8]
 
@@ -261,7 +272,8 @@ class Publisher:
         return versions[0]["version_id"]
 
     def command(self, arguments, metadata=None):
-        env = os.environ.copy()
+        # Wrangler only needs its own credentials, not the LLM or Spaces keys.
+        env = {k: v for k, v in os.environ.items() if k not in self.private_names()}
         env.update(CLOUDFLARE_ACCOUNT_ID=self.account, CLOUDFLARE_API_TOKEN=self.token,
                    WRANGLER_SEND_METRICS="false", WRANGLER_LOG_SANITIZE="true",
                    WRANGLER_LOG_PATH=str(self.state / "wrangler-logs"), CI="true")
@@ -332,7 +344,7 @@ class Publisher:
             files[relative] = hashlib.sha256(body).hexdigest()
         if len(files) > self.cf["max_files"]:
             raise ValueError("Public output exceeds file count budget")
-        for relative in {*PUBLIC_FILES, *self.cf["verify_paths"]}:
+        for relative in {*public_files(), *self.cf["verify_paths"]}:
             if relative not in files:
                 raise ValueError("Missing required public file: " + relative)
         import xml.etree.ElementTree as ET
@@ -680,10 +692,12 @@ class Publisher:
 
     def application(self, command):
         """Run one app command and return its output; failures carry the app's error."""
-        budget = self.app.get("collection", {}).get("run_budget_seconds", 240)
+        budget = self.app["collection"]["run_budget_seconds"]
+        # The application never needs the Cloudflare or Spaces credentials.
+        env = {k: v for k, v in os.environ.items() if k not in self.private_names() - {self.app["llm"]["api_key_env"]}}
         result = subprocess.run([str(self.path(self.cfg["app_python"])), "-m", "onionflash", command,
                                  "--config", str(self.app_config)], capture_output=True, text=True,
-                                timeout=budget + 300)
+                                timeout=budget + 300, env=env)
         if result.returncode:
             detail = result.stderr.strip() or f"exited with status {result.returncode}"
             raise RuntimeError(self.clean_error(detail[-1000:]))
@@ -734,14 +748,15 @@ class Publisher:
                 running = False
         except BusyLock:
             running = True
-        print(json.dumps({"running": running}))
+        report = {"running": running}
         for name in ["publication.json", "publication-hold.json", "transition.json", "last-transition.json", "backup.json", "last-run.json"]:
             data = read_json(self.state / name)
             if data is not None:
                 data.pop("manifest", None)
                 if name in {"transition.json", "last-transition.json"}:
                     data = {key: data.get(key) for key in ("kind", "outcome", "before_version", "started_at", "finished_at")} | {"target_version": data.get("target", {}).get("version_id")}
-                print(json.dumps({name: data}, indent=2))
+                report[name] = data
+        print(json.dumps(report, indent=2))
 
     def execute(self, command, force=False):
         if command == "run":

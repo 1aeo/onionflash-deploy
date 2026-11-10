@@ -32,6 +32,9 @@ base_url = "https://example.com/onionflash/"
 [storage]
 database = "state/news.sqlite3"
 output_dir = "build/public"
+[[sources]]
+id = "test"
+url = "https://example.org/feed.xml"
 ''')
         self.publisher = publish.Publisher(self.directory / "deployment.toml")
         self.addCleanup(self.publisher.close)
@@ -47,7 +50,7 @@ output_dir = "build/public"
     def public_tree(self):
         directory = self.directory / "public"
         directory.mkdir()
-        for name in publish.PUBLIC_FILES:
+        for name in publish.public_files():
             body = b"safe generated content"
             if name == "feed.xml":
                 body = b"<rss version='2.0'><channel><title>News</title></channel></rss>"
@@ -155,6 +158,60 @@ output_dir = "build/public"
         path.chmod(0o644)
         with self.assertRaisesRegex(ValueError, "mode 600"):
             publish.load_env(path)
+
+    def test_hash_inside_an_unquoted_value_is_kept(self):
+        path = self.directory / "hash.env"
+        path.write_text("ONIONFLASH_TEST_HASH=abc#def123\n")
+        path.chmod(0o600)
+        with patch.dict(os.environ, {}, clear=False):
+            publish.load_env(path)
+            self.assertEqual(os.environ["ONIONFLASH_TEST_HASH"], "abc#def123")
+
+    def test_application_paths_come_from_the_application_loader(self):
+        (self.directory / "onionflash.toml").write_text(
+            '[site]\nbase_url = "https://example.com/onionflash"\n'
+            '[storage]\ndatabase = "${OF_TEST_STATE}/news.sqlite3"\n'
+            '[[sources]]\nid = "test"\nurl = "https://example.org/feed.xml"\n')
+        with patch.dict(os.environ, {"OF_TEST_STATE": str(self.directory / "elsewhere")}):
+            p = publish.Publisher(self.directory / "deployment.toml")
+        self.addCleanup(p.close)
+        self.assertEqual(p.database, (self.directory / "elsewhere" / "news.sqlite3").resolve())
+        self.assertEqual(p.public, (self.directory / "build" / "public").resolve())  # application default
+        self.assertEqual(p.base_url, "https://example.com/onionflash/")
+
+    def test_public_layout_follows_the_application(self):
+        from onionflash.render import ASSET_FILES
+        from onionflash.schema import CATEGORIES
+        self.assertTrue(set(ASSET_FILES) <= publish.public_files())
+        self.assertTrue(all(publish.public_path_allowed(f"tags/{topic}.xml") for topic in CATEGORIES))
+        self.assertFalse(publish.public_path_allowed("tags/unknown.xml"))
+
+    def test_status_prints_one_json_document(self):
+        publish.atomic_json(self.publisher.state / "last-run.json", {"ok": True})
+        publish.atomic_json(self.publisher.state / "publication.json", {"version_id": "v", "manifest": {"a": "b"}})
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.publisher.status()
+        report = json.loads(output.getvalue())
+        self.assertEqual(report["last-run.json"], {"ok": True})
+        self.assertNotIn("manifest", report["publication.json"])
+
+    def test_child_processes_get_only_their_own_credentials(self):
+        import subprocess
+        captured = []
+        def fake(arguments, **kwargs):
+            captured.append(kwargs["env"])
+            return subprocess.CompletedProcess(arguments, 0, stdout="{}", stderr="")
+        extra = {"DO_SPACES_KEY": "spaces-key-value", "DO_SPACES_SECRET": "spaces-secret-value",
+                 "ONIONFLASH_LLM_API_KEY": "llm-key-value"}
+        with patch.dict(os.environ, extra), patch("publish.subprocess.run", side_effect=fake):
+            self.publisher.command(["whoami"])
+            self.publisher.application("check")
+        wrangler, app = captured
+        self.assertEqual(wrangler["CLOUDFLARE_API_TOKEN"], self.publisher.token)
+        self.assertFalse({"DO_SPACES_KEY", "DO_SPACES_SECRET", "ONIONFLASH_LLM_API_KEY"} & set(wrangler))
+        self.assertEqual(app["ONIONFLASH_LLM_API_KEY"], "llm-key-value")
+        self.assertFalse({"CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ZONE_TOKEN", "DO_SPACES_KEY", "DO_SPACES_SECRET"} & set(app))
 
     def test_route_conflicts_are_detected_before_any_mutation(self):
         p = self.publisher
