@@ -1,15 +1,14 @@
 import io
 from contextlib import redirect_stdout
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
-import socket
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 from urllib.error import HTTPError, URLError
-import httpx
-from onionflash.transport import HttpClient
 
 import publish
 
@@ -37,15 +36,32 @@ id = "test"
 url = "https://example.org/feed.xml"
 ''')
         self.publisher = publish.Publisher(self.directory / "deployment.toml")
-        self.addCleanup(self.publisher.close)
 
-    def use_http(self, handler):
-        waits = []
-        resolver = lambda host, port, *args: [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("8.8.8.8", port))]
-        self.publisher._http_client = HttpClient(self.publisher.http_settings(),
-            transport=httpx.MockTransport(handler), resolver=resolver, sleep=waits.append,
-            same_origin_redirects=True)
-        return waits
+    def serve(self, handle):
+        """A local HTTP server whose every request is passed to handle(handler)."""
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                handle(self)
+            do_POST = do_DELETE = do_GET
+            def log_message(self, *args):
+                pass
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        environment = patch.dict(os.environ, {"no_proxy": "127.0.0.1", "NO_PROXY": "127.0.0.1"})
+        environment.start()
+        self.addCleanup(environment.stop)
+        return f"http://127.0.0.1:{server.server_port}"
+
+    @staticmethod
+    def reply(handler, body, status=200, headers=()):
+        handler.send_response(status)
+        for name, value in headers:
+            handler.send_header(name, value)
+        handler.send_header("Content-Length", str(len(body)))
+        handler.end_headers()
+        handler.wfile.write(body)
 
     def public_tree(self):
         directory = self.directory / "public"
@@ -104,49 +120,43 @@ url = "https://example.org/feed.xml"
         binary.symlink_to("/usr/bin/python3")
         self.assertEqual(self.publisher.path(".venv/bin/python"), binary.parent.resolve() / "python")
 
-    def test_retry_is_exponential_and_bounded(self):
-        self.publisher.net.update(attempts=3, backoff_seconds=2, backoff_cap_seconds=3, jitter_seconds=0)
-        attempts = []
-        def fail(request):
-            attempts.append(1)
-            raise httpx.ConnectError("connection unavailable", request=request)
-        waits = self.use_http(fail)
-        with self.assertRaises(URLError):
-            self.publisher.request("https://example.com")
-        self.assertEqual(len(attempts), 3)
-        self.assertEqual(waits, [2, 3])
+    def test_api_token_is_never_sent_to_a_redirect_target(self):
+        seen = []
+        def target(handler):
+            seen.append(handler.headers.get("Authorization"))
+            self.reply(handler, b"ok")
+        target_url = self.serve(target)
+        def origin(handler):
+            seen.append(handler.headers.get("Authorization"))
+            self.reply(handler, b"", 302, [("Location", target_url + "/")])
+        self.assertEqual(self.publisher.request(self.serve(origin) + "/", token="test-credential"), b"ok")
+        self.assertEqual(seen, ["Bearer test-credential", None])
 
-    def test_permanent_errors_are_not_retried(self):
-        waits = self.use_http(lambda request: httpx.Response(401))
-        with self.assertRaises(HTTPError):
-            self.publisher.request("https://example.com")
-        self.assertEqual(waits, [])
-
-    def test_retry_after_is_capped(self):
-        self.publisher.net.update(attempts=2, backoff_cap_seconds=3, jitter_seconds=0)
-        waits = self.use_http(lambda request: httpx.Response(429, headers={"Retry-After": "999999"}))
-        with self.assertRaises(HTTPError):
-            self.publisher.request("https://example.com")
-        self.assertEqual(waits, [3])
-
-    def test_shared_transport_keeps_api_auth_on_same_origin_only(self):
-        calls = []
+    def test_api_sends_method_and_token_and_bounds_responses(self):
+        seen = []
         def handler(request):
-            calls.append(request)
-            return httpx.Response(302, headers={"Location": "https://other.example/"})
-        self.use_http(handler)
-        with self.assertRaisesRegex(ValueError, "cross-origin"):
-            self.publisher.request("https://example.com/", token="test-credential")
-        self.assertEqual(len(calls), 1)
+            seen.append((request.command, request.headers.get("Authorization")))
+            self.reply(request, b'{"success": true, "result": null}')
+        self.publisher.api_base = self.serve(handler)
+        self.assertIsNone(self.publisher.api("/routes/1", method="DELETE"))
+        self.assertEqual(seen, [("DELETE", "Bearer unit-test-not-a-real-secret")])
+        self.publisher.net["max_response_bytes"] = 10
+        with self.assertRaisesRegex(ValueError, "size limit"):
+            self.publisher.api("/routes/1")
 
-    def test_shared_transport_supports_route_cleanup_delete(self):
-        calls = []
-        def handler(request):
-            calls.append(request)
-            return httpx.Response(200, json={"success": True, "result": None})
-        self.use_http(handler)
-        self.assertIsNone(self.publisher.api("/test-route", method="DELETE"))
-        self.assertEqual(calls[0].method, "DELETE")
+    def test_verification_retries_transient_failures_but_not_client_errors(self):
+        p = self.publisher
+        body = b"live content"
+        manifest = {name: publish.hashlib.sha256(body).hexdigest() for name in p.cf["verify_paths"]}
+        transient = [HTTPError("u", 503, "busy", {}, None), URLError("reset"), HTTPError("u", 404, "not yet", {}, None)]
+        with patch.object(p, "request", side_effect=transient + [body] * 3), patch("publish.time.sleep") as sleep:
+            p.verify("https://example.com/onionflash", manifest)
+        self.assertEqual(sleep.call_count, 3)
+        with patch.object(p, "request", side_effect=HTTPError("u", 403, "forbidden", {}, None)), \
+                patch("publish.time.sleep") as sleep:
+            with self.assertRaises(HTTPError):
+                p.verify("https://example.com/onionflash", manifest)
+        sleep.assert_not_called()
 
     def test_credentials_file_is_literal_and_private(self):
         path = self.directory / "literal.env"
@@ -174,7 +184,6 @@ url = "https://example.org/feed.xml"
             '[[sources]]\nid = "test"\nurl = "https://example.org/feed.xml"\n')
         with patch.dict(os.environ, {"OF_TEST_STATE": str(self.directory / "elsewhere")}):
             p = publish.Publisher(self.directory / "deployment.toml")
-        self.addCleanup(p.close)
         self.assertEqual(p.database, (self.directory / "elsewhere" / "news.sqlite3").resolve())
         self.assertEqual(p.public, (self.directory / "build" / "public").resolve())  # application default
         self.assertEqual(p.base_url, "https://example.com/onionflash/")
@@ -227,16 +236,17 @@ url = "https://example.org/feed.xml"
 
     def test_route_conflicts_are_detected_before_any_mutation(self):
         p = self.publisher
-        publish.atomic_json(p.state / "publication.json", {"origin_url": "https://test.workers.dev/onionflash", "manifest": {}})
+        publish.atomic_json(p.state / "publication.json", {"manifest": {}})
         routes = [{"id": "existing", "pattern": "example.com/onionflash*", "script": "another-project"}]
-        with patch.object(p, "api", return_value=routes) as api, patch.object(p, "verify"):
+        with patch.object(p, "api", return_value=routes) as api, patch.object(p, "verify"), \
+                patch.object(p, "origin_url", return_value="https://test.workers.dev/onionflash"):
             with self.assertRaisesRegex(ValueError, "another Worker"):
                 p.routes()
         self.assertEqual(len(api.call_args_list), 1)
 
     def test_route_verify_failure_removes_only_routes_just_created(self):
         p = self.publisher
-        publish.atomic_json(p.state / "publication.json", {"origin_url": "https://test.workers.dev/onionflash", "manifest": {}})
+        publish.atomic_json(p.state / "publication.json", {"manifest": {}})
         calls = []
         def api(path, method="GET", data=None, zone=False):
             calls.append((path, method))
@@ -245,7 +255,8 @@ url = "https://example.org/feed.xml"
             if method == "POST":
                 return {"id": "new-route"}
             return None
-        with patch.object(p, "api", side_effect=api), patch.object(p, "verify", side_effect=[None, ValueError("bad live output")]):
+        with patch.object(p, "api", side_effect=api), patch.object(p, "verify", side_effect=[None, ValueError("bad live output")]), \
+                patch.object(p, "origin_url", return_value="https://test.workers.dev/onionflash"):
             with self.assertRaisesRegex(ValueError, "bad live"):
                 p.routes()
         deleted = [path for path, method in calls if method == "DELETE"]
@@ -258,17 +269,19 @@ url = "https://example.org/feed.xml"
                 self.publisher.publish()
         api.assert_not_called()
 
-    def test_unchanged_content_reconciles_remote_version(self):
+    def test_unchanged_content_makes_no_cloudflare_calls(self):
         p = self.publisher
         p.public.mkdir(parents=True)
         (p.public / "index.html").write_text("safe")
         manifest = {"index.html": "dummy"}
         identity = publish.hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
         publish.atomic_json(p.state / "publication.json", {"content_hash": identity, "version_id": "expected"})
-        with patch.object(p, "validate", return_value=manifest), patch.object(p, "current_version", return_value="unexpected"), patch.object(p, "command") as command:
-            with self.assertRaisesRegex(ValueError, "differs"):
-                p.publish()
+        with patch.object(p, "validate", return_value=manifest), patch.object(p, "current_version") as version, \
+                patch.object(p, "command") as command, patch.object(p, "api") as api:
+            self.assertEqual(p.publish()["version_id"], "expected")
+        version.assert_not_called()
         command.assert_not_called()
+        api.assert_not_called()
 
     def test_backup_invalid_retention_rejected_before_storage_access(self):
         self.publisher.cfg["spaces"].update(enabled=True, retention_days=0)
