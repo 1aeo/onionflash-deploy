@@ -91,7 +91,7 @@ test("archive requests do not forward credentials or arbitrary request headers",
     assert.equal((await worker.fetch(request, state.env)).status, 200);
     for (const call of state.calls) {
       assert.deepEqual(call.options.headers, { "Accept-Encoding": "identity" });
-      assert.equal(call.options.redirect, "error");
+      assert.equal(call.options.redirect, "manual");
       assert.equal(call.options.cf.cacheEverything, true);
     }
   });
@@ -238,35 +238,57 @@ test("POST cannot fetch an archive object or consume its body", async () => {
   });
 });
 
-test("missing manifest entries are plain 404s without arbitrary object requests", async () => {
+test("missing manifest shards and entries are plain 404s without object requests", async () => {
   const state = fixture();
+  // news/removed/index.html shares news/a/index.html's shard but has no entry of its own.
+  assert.equal(hash("news/removed/index.html").slice(0, 2), hash("news/a/index.html").slice(0, 2));
   await withOrigin(state, async () => {
-    const response = await worker.fetch(new Request("https://example.com/onionflash/news/missing/"), state.env);
-    assert.equal(response.status, 404);
-    assert.equal(await response.text(), "Not found");
+    for (const path of ["news/missing/", "news/removed/"]) {
+      const response = await worker.fetch(new Request("https://example.com/onionflash/" + path), state.env);
+      assert.equal(response.status, 404);
+      assert.equal(await response.text(), "Not found");
+    }
     assert.ok(state.calls.every(call => call.url.includes("/manifests/")));
   });
 });
 
-test("untrusted redirects, wrong hashes and oversized manifests fail closed", async () => {
-  for (const kind of ["redirect", "hash", "oversized"]) {
-    const state = fixture({ ARCHIVE_MAX_MANIFEST_BYTES: "1024" });
+test("wrong manifest bytes and oversized manifests fail closed without a retry", async () => {
+  for (const kind of ["hash", "oversized"]) {
+    const state = fixture({ ARCHIVE_RETRY_ATTEMPTS: "2" });
+    const root = `${origin}manifests/${state.rootHash}.json`;
+    const text = new TextDecoder().decode(state.objects.get(root).body);
+    // Only the guard under test refuses each: the pinned root plus a space, or a pinned root past the limit.
+    if (kind === "hash") state.objects.set(root, { body: new TextEncoder().encode(text + " ") });
+    else {
+      state.env.ARCHIVE_MAX_MANIFEST_BYTES = "1024";
+      const padded = new TextEncoder().encode(text.padEnd(2048));
+      state.env.ARCHIVE_MANIFEST_SHA = hash(padded);
+      state.objects.set(`${origin}manifests/${hash(padded)}.json`, { body: padded });
+    }
     await withOrigin(state, async () => {
       const response = await worker.fetch(new Request("https://example.com/onionflash/feed.xml"), state.env);
       assert.equal(response.status, 503);
       assert.equal(await response.text(), "Temporarily unavailable");
-    }, async () => kind === "redirect" ? new Response(null, { status: 302, headers: { Location: "https://evil.example/private" } })
-      : kind === "oversized" ? new Response("x", { headers: { "content-length": "100000" } }) : new Response('{"wrong":"data"}'));
+      assert.equal(state.calls.length, 1);
+    });
   }
 });
 
-test("origin failure retries only within the configured limit", async () => {
-  const state = fixture({ ARCHIVE_RETRY_ATTEMPTS: "2" });
-  let attempts = 0;
-  await withOrigin(state, async () => {
-    assert.equal((await worker.fetch(new Request("https://example.com/onionflash/feed.xml"), state.env)).status, 503);
-    assert.equal(attempts, 2);
-  }, async () => { attempts++; return new Response("temporary", { status: 503 }); });
+test("only transient origin failures are retried, within the configured limit", async () => {
+  for (const [target, respond, attempts] of [
+    ["/manifests/", () => new Response("temporary", { status: 503 }), 2],
+    ["/manifests/", () => new Response(new ReadableStream({ pull(controller) { controller.error(new Error("connection reset")); } })), 2],
+    ["/manifests/", () => new Response("storage access denied", { status: 403 }), 1],
+    ["/manifests/", () => new Response(null, { status: 302, headers: { Location: "https://evil.example/private" } }), 1],
+    ["/objects/", () => new Response("wrong object"), 1],
+  ]) {
+    const state = fixture({ ARCHIVE_RETRY_ATTEMPTS: "2" });
+    let calls = 0;
+    await withOrigin(state, async () => {
+      assert.equal((await worker.fetch(new Request("https://example.com/onionflash/feed.xml"), state.env)).status, 503);
+      assert.equal(calls, attempts);
+    }, async (input, options) => String(input).includes(target) ? (calls++, respond()) : state.respond(input, options));
+  }
 });
 
 test("object body streams and an upstream error body is never exposed", async () => {
