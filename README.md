@@ -7,6 +7,8 @@ DigitalOcean Spaces backups are optional. Visitors never call the LLM.
 
 Production: **https://1aeo.com/onionflash/** · [RSS](https://1aeo.com/onionflash/feed.xml)
 
+Alias: **https://onionflash.1aeo.com/** redirects to the canonical site above.
+
 ## Quick start
 
 Requirements: Linux or macOS, Python **3.11+** with `venv`/pip, Git, and npm.
@@ -64,6 +66,25 @@ matching includes query strings. The tiny Worker redirects `/onionflash` to
 and **passes sibling paths such as `/onionflash-other` to their original origin**.
 Its code and tests explicitly enforce that boundary. For a whole-host deployment,
 use a root `site.base_url`, such as `https://news.example.com/`.
+
+### Optional hostname alias
+
+`redirect-worker.mjs` is a separate, small Worker that sends HTTP 308 redirects.
+Production uses `onionflash-redirect` on `onionflash.1aeo.com/*`, with a proxied
+CNAME from `onionflash.1aeo.com` to `1aeo.com`. Its `CANONICAL_URL` variable is
+`https://1aeo.com/onionflash/`. Article/feed paths and query strings are preserved;
+an already-present `/onionflash` prefix is not duplicated.
+
+To configure another installation, copy `redirect.example.toml` to
+`redirect.toml`, edit the Worker name and canonical URL, and deploy that file
+with Wrangler using the existing account credential. Create the alias's proxied
+DNS record and attach only `<alias-hostname>/*` to the redirect Worker. The
+regular `deploy.sh routes` command manages the canonical site's route; it does
+not replace this separate alias route. Keep DNS/routing receipts privately.
+
+The separate Worker guarantees hostname redirects even when an incoming path
+matches a static asset. The canonical site keeps its existing asset delivery,
+and the redirect itself requires no browser JavaScript.
 
 Publication uploads an immutable version, checks preview hashes, activates it,
 and verifies the origin and (after routing) production hostname. A failed

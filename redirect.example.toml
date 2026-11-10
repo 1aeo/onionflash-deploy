@@ -1,0 +1,9 @@
+# Optional redirect-only Worker; separate from the static website Worker.
+name = "onionflash-redirect"
+main = "redirect-worker.mjs"
+compatibility_date = "2026-11-08"
+workers_dev = true
+preview_urls = true
+
+[vars]
+CANONICAL_URL = "https://1aeo.com/onionflash/"

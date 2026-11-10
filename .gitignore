@@ -4,6 +4,7 @@ state/
 build/
 config/
 deployment.toml
+redirect.toml
 onionflash.toml
 secrets.env
 *.log
