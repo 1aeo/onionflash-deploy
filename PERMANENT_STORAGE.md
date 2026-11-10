@@ -5,14 +5,19 @@ Published articles have no age or count expiry. The homepage is paginated, and
 feeds. A separate cold-news archive is unnecessary.
 
 Cloudflare keeps `index.html` and the application's shared assets. Article
-HTML/public JSON, numbered pages and feeds are uploaded to immutable objects in
+HTML/public JSON, numbered history pages, static topic pages and feeds are uploaded to immutable objects in
 Spaces. A small sharded manifest maps their ordinary paths to content hashes.
 The Worker version binds one immutable root manifest, so rollback selects the
 same historical objects rather than reading files overwritten by a later run.
 
-The Worker routes only known public article, pagination and feed paths. It never
+The Worker routes only known public article, pagination, topic and feed paths. It never
 receives Spaces credentials or exposes the private prefix. Browser URLs such as
 `https://example.com/onionflash/news/<id>/` do not change.
+Topic HTML is available at `/topics/<schema-topic>/` and its numbered `/page/N/`
+routes, while `/tags/<schema-topic>.xml` retains the topic RSS feed. Only configured
+schema topics are routed to permanent storage; other paths cannot select objects
+or private evidence. Canonical redirects preserve query strings, and GET/HEAD
+retain the existing immutable-cache behavior.
 
 ## Set up a bucket
 
@@ -73,6 +78,19 @@ For a large initial migration, repeat runs while `articles_pending` or archive
 pending counts remain. Existing article routes are not switched until previously
 published pages have verified permanent copies. A partial build, generation
 change, failed upload or exhausted work budget retains the existing publication.
+For the upgrade that removes browser JavaScript, both the publisher and archive
+sync require `publication_no_browser_js_ready=1` in the core's publication ledger.
+The upgraded core sets it only after all accepted article pages have the new
+static template. Later ordinary rebuild queues do not reset that completed
+migration. Missing or incomplete migration state stops before uploads or
+activation and requests another upgraded core build.
+
+New root manifests and Cloudflare hot snapshots omit the retired `app.js` mapping.
+Old content-addressed objects, manifests and per-version receipts are preserved,
+so rolling back an existing Worker version still selects its original contents.
+Obsolete history/topic pagination can leave a new manifest; article permalinks
+are retained. HTML uses `script-src 'none'` and `connect-src 'none'`; RSS keeps
+its existing inline-style allowance for feed rendering.
 
 On ordinary runs, only changed objects and affected manifest shards upload.
 Unchanged articles are reused. Feeds are streamed with bounded memory. A hot-only

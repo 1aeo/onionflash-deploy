@@ -4,9 +4,11 @@ Install and publish [Onion Flash](https://github.com/1aeo/onionflash), a small T
 news aggregator. A scheduled Python job collects sources and calls your LLM;
 Cloudflare Workers Static Assets serves the generated website and RSS. Private
 DigitalOcean Spaces backups are optional. Visitors never call the LLM.
+The website uses ordinary links, static topic pages and a native menu disclosure;
+it ships no browser JavaScript. Cloudflare's routing Worker runs only on the server.
 
 With `[archive].enabled = true`, Spaces durably stores article pages, public JSON,
-numbered history pages and full-history feeds. Cloudflare serves them under the
+numbered history/topic pages and full-history feeds. Cloudflare serves them under the
 same URLs and retains only the front page and small shared assets in its
 deployment bundle. See [permanent storage setup](PERMANENT_STORAGE.md).
 
@@ -119,9 +121,23 @@ Failures inside a run are recorded in `state/run.log` and `state/last-run.json`;
 errors raised before the run starts, such as an invalid configuration or credential
 file, go to the console or, for scheduled runs, the system log.
 
-The public package is an exact allowlist of generated pages, feeds and three
-assets. SQLite, source evidence, credentials, logs and publication records stay
+The public package is an exact allowlist of generated pages, feeds and two
+assets (`style.css` and `mark.svg`). SQLite, source evidence, credentials, logs and publication records stay
 outside it. Source timestamps and original first-publication times are preserved.
+
+Topic pages use `/topics/<topic>/` and `/topics/<topic>/page/<number>/`; the
+existing `/tags/<topic>.xml` subscriptions remain available. HTML responses
+disable browser scripts and connections with `script-src 'none'` and
+`connect-src 'none'`. Publication also rejects script elements, event handlers
+and JavaScript URLs in generated HTML.
+
+When upgrading an existing database, run the upgraded core build until it reports
+`no_browser_js_ready: true`. This is a one-time bounded rebuild of accepted
+article pages: the deployer will not upload or activate a partially migrated
+site, or publish a database whose migration marker is missing. Every existing
+article permalink remains in the publication catalog. The old `app.js` is retired
+from new packages after that check; historical Worker versions and immutable
+storage objects are retained for rollback.
 
 ## DigitalOcean Spaces
 

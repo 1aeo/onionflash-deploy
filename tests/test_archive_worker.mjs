@@ -12,6 +12,10 @@ const types = {
   "feed.xml": "application/rss+xml; charset=utf-8",
   "tags/security.xml": "application/rss+xml; charset=utf-8",
   "tags/bridges.xml": "application/rss+xml; charset=utf-8",
+  "topics/security/index.html": "text/html; charset=utf-8",
+  "topics/security/page/2/index.html": "text/html; charset=utf-8",
+  "topics/bridges/index.html": "text/html; charset=utf-8",
+  "topics/bridges/page/2/index.html": "text/html; charset=utf-8",
   "feed.json": "application/feed+json; charset=utf-8",
 };
 
@@ -117,11 +121,61 @@ test("HTML, XML and JSON get distinct safe response policies", async () => {
     const html = await worker.fetch(new Request("https://example.com/onionflash/news/a/"), state.env);
     const xml = await worker.fetch(new Request("https://example.com/onionflash/feed.xml"), state.env);
     const json = await worker.fetch(new Request("https://example.com/onionflash/feed.json"), state.env);
-    assert.match(html.headers.get("content-security-policy"), /script-src 'self'/);
+    assert.match(html.headers.get("content-security-policy"), /script-src 'none'/);
+    assert.match(html.headers.get("content-security-policy"), /connect-src 'none'/);
+    assert.match(html.headers.get("content-security-policy"), /style-src 'self'/);
     assert.match(xml.headers.get("content-security-policy"), /script-src 'none'/);
     assert.match(xml.headers.get("content-security-policy"), /style-src 'unsafe-inline'/);
     assert.match(json.headers.get("content-security-policy"), /script-src 'none'/);
     assert.doesNotMatch(json.headers.get("content-security-policy"), /unsafe-inline/);
+  });
+});
+
+test("static topic pages resolve exact immutable entries with query-independent GET and HEAD", async () => {
+  const state = fixture();
+  await withOrigin(state, async () => {
+    for (const key of ["topics/security/index.html", "topics/security/page/2/index.html"]) {
+      const url = "https://example.com/onionflash/" + key.replace("index.html", "") + "?same=1&same=2";
+      const get = await worker.fetch(new Request(url), state.env);
+      assert.equal(get.status, 200);
+      assert.equal(await get.text(), `public content for ${key}`);
+      assert.equal(get.headers.get("content-type"), types[key]);
+      assert.match(get.headers.get("content-security-policy"), /script-src 'none'/);
+      assert.match(get.headers.get("content-security-policy"), /connect-src 'none'/);
+      const head = await worker.fetch(new Request(url, { method: "HEAD" }), state.env);
+      assert.equal(head.status, 200);
+      assert.equal(await head.text(), "");
+      assert.equal(head.headers.get("content-length"), String(state.entries[key].size));
+      assert.equal(head.headers.get("etag"), get.headers.get("etag"));
+      assert.equal(state.calls.at(-1).options.method, "HEAD");
+      const cached = await worker.fetch(new Request(url, { headers: { "If-None-Match": head.headers.get("etag") } }), state.env);
+      assert.equal(cached.status, 304);
+      assert.equal(await cached.text(), "");
+    }
+    assert.equal(state.assetCalls.length, 0);
+    assert.ok(state.calls.every(call => call.url.startsWith(origin) && !call.url.includes("?")));
+  });
+});
+
+test("topic canonical redirects preserve query and page one collapses to the topic root", async () => {
+  const state = fixture();
+  await withOrigin(state, async () => {
+    for (const method of ["GET", "HEAD"]) {
+      for (const [path, destination] of [
+        ["topics/security", "topics/security/"], ["topics/security/index.html", "topics/security/"],
+        ["topics/security/page/1", "topics/security/"], ["topics/security/page/1/", "topics/security/"],
+        ["topics/security/page/1/index.html", "topics/security/"],
+        ["topics/security/page/2", "topics/security/page/2/"],
+        ["topics/security/page/2/index.html", "topics/security/page/2/"],
+      ]) {
+        const response = await worker.fetch(new Request("https://example.com/onionflash/" + path + "?q=a%2Fb&same=1&same=2", { method }), state.env);
+        assert.equal(response.status, 308);
+        assert.equal(response.headers.get("location"), "https://example.com/onionflash/" + destination + "?q=a%2Fb&same=1&same=2");
+        assert.equal(await response.text(), "");
+      }
+    }
+    assert.equal(state.calls.length, 0);
+    assert.equal(state.assetCalls.length, 0);
   });
 });
 
@@ -140,7 +194,8 @@ test("article and pagination redirects preserve query and canonical locations", 
 test("private paths, encoded escapes, arbitrary topics and unbounded page numbers are never fetched", async () => {
   const state = fixture();
   await withOrigin(state, async () => {
-    for (const path of ["private/evidence.json.gz", "news/a/%2e%2e/%2e%2e/private/key", "news/%2Fprivate/", "news/a/anything", "tags/private.xml", "page/0002/", "page/1000000000/", "objects/" + "a".repeat(64)]) {
+    for (const path of ["private/evidence.json.gz", "news/a/%2e%2e/%2e%2e/private/key", "news/%2Fprivate/", "news/a/anything", "tags/private.xml", "page/0002/", "page/1000000000/", "objects/" + "a".repeat(64),
+      "topics/private/", "topics/bridges/", "topics/bridges/page/2/", "topics/Security/", "topics/security-extra/", "topics/security/story.json", "topics/security/%2e%2e/%2e%2e/private/key", "topics/%2Fprivate/", "topics/security/page/0/", "topics/security/page/0002/", "topics/security/page/1000000000/", "topics/security/page/-1/", "topics/security/page/2/extra"]) {
       const response = await worker.fetch(new Request("https://example.com/onionflash/" + path), state.env);
       assert.equal(response.status, 404);
     }
@@ -154,10 +209,17 @@ test("configured topic names use exact safe membership without regular-expressio
     const response = await worker.fetch(new Request("https://example.com/onionflash/tags/bridges.xml"), state.env);
     assert.equal(response.status, 200);
     assert.equal(await response.text(), "public content for tags/bridges.xml");
+    for (const path of ["topics/bridges/", "topics/bridges/page/2/"]) {
+      const page = await worker.fetch(new Request("https://example.com/onionflash/" + path), state.env);
+      assert.equal(page.status, 200);
+      assert.equal(await page.text(), `public content for ${path}index.html`);
+    }
     state.calls.length = 0;
     for (const configured of ["security|private", "security,../private", "security,.*", "x".repeat(5000)]) {
-      const rejected = await worker.fetch(new Request("https://example.com/onionflash/tags/private.xml"), { ...state.env, ARCHIVE_TOPICS: configured });
-      assert.equal(rejected.status, 404);
+      for (const path of ["tags/private.xml", "topics/private/", "topics/security/", "topics/security/page/2/"]) {
+        const rejected = await worker.fetch(new Request("https://example.com/onionflash/" + path), { ...state.env, ARCHIVE_TOPICS: configured });
+        assert.equal(rejected.status, 404);
+      }
     }
     assert.equal(state.calls.length, 0);
   });
@@ -166,10 +228,12 @@ test("configured topic names use exact safe membership without regular-expressio
 test("POST cannot fetch an archive object or consume its body", async () => {
   const state = fixture();
   await withOrigin(state, async () => {
-    const request = new Request("https://example.com/onionflash/news/a/", { method: "POST", body: "keep private" });
-    const response = await worker.fetch(request, state.env);
-    assert.equal(response.status, 405);
-    assert.equal(request.bodyUsed, false);
+    for (const path of ["news/a/", "topics/security/", "topics/security/page/2", "topics/security/page/2/"]) {
+      const request = new Request("https://example.com/onionflash/" + path, { method: "POST", body: "keep private" });
+      const response = await worker.fetch(request, state.env);
+      assert.equal(response.status, 405);
+      assert.equal(request.bodyUsed, false);
+    }
     assert.equal(state.calls.length, 0);
   });
 });

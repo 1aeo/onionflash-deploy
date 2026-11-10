@@ -97,6 +97,27 @@ url = "https://example.org/feed.xml"
         self.assertFalse(publish.public_path_allowed("tags/private.xml"))
         self.assertTrue(publish.public_path_allowed("news/abc_123/index.html"))
         self.assertTrue(publish.public_path_allowed("tags/security.xml"))
+        self.assertTrue(publish.public_path_allowed("topics/security/index.html"))
+        self.assertTrue(publish.public_path_allowed("topics/security/page/2/index.html"))
+        for path in ["app.js", "topics/private/index.html", "topics/security/../secret/index.html",
+                     "topics/security/page/00/index.html", "topics/security/page/1000000000/index.html"]:
+            self.assertFalse(publish.public_path_allowed(path))
+
+    def test_public_html_cannot_reintroduce_browser_javascript(self):
+        public = self.public_tree()
+        for html in ['<script src="app.js"></script>', '<ScRiPt>alert(1)</ScRiPt>',
+                     '<p onClick="alert(1)">hello</p>', '<a href="java&#x73;cript:alert(1)">link</a>']:
+            with self.subTest(html=html):
+                (public / "index.html").write_text(html)
+                with self.assertRaisesRegex(ValueError, "browser|JavaScript"):
+                    self.publisher.validate(public)
+        (public / "index.html").write_text('<details><summary>Menu</summary><a href="topics/security/">Security</a></details>')
+        self.assertIn("index.html", self.publisher.validate(public))
+
+    def test_literal_script_scheme_in_news_metadata_is_not_an_executable_url(self):
+        public = self.public_tree()
+        (public / "index.html").write_text('<meta name="description" content="javascript: URLs are the subject of this security report"><p title="JavaScript: disabled">News</p>')
+        self.assertIn("index.html", self.publisher.validate(public))
 
     def test_subdirectory_assets_use_plain_paths_and_root_headers(self):
         public = self.public_tree()
