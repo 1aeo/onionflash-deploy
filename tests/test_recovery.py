@@ -430,6 +430,11 @@ url = "https://example.org/feed.xml"
                 self.p.backup(force=True)
         self.assertEqual(client.deleted, [client.uploads[0][:2]])
         self.assertFalse((self.p.state / "backup.json").exists())
+        client = LostResponse(cleanup_error=True)
+        with patch("boto3.client", return_value=client), self.anonymous(403):
+            with self.assertRaisesRegex(RuntimeError, "could not be removed") as caught:
+                self.p.backup(force=True)
+        self.assertIn(client.uploads[0][1], str(caught.exception))  # the error names the key
 
     def test_retention_deletes_only_old_backups_and_its_failure_is_retried(self):
         self.seed_backup()
