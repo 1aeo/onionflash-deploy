@@ -515,8 +515,17 @@ class Publisher:
                 backup_database(self.database, snapshot)
             with snapshot.open("rb") as source, gzip.open(compressed, "wb") as target:
                 shutil.copyfileobj(source, target)
-            with compressed.open("rb") as body:
-                client.put_object(Bucket=cfg["bucket"], Key=key, Body=body, ACL="private", ContentType="application/gzip")
+            try:
+                with compressed.open("rb") as body:
+                    client.put_object(Bucket=cfg["bucket"], Key=key, Body=body, ACL="private", ContentType="application/gzip")
+            except Exception as failure:
+                # The object may exist even when the response was lost; the key is unique to this attempt.
+                try:
+                    client.delete_object(Bucket=cfg["bucket"], Key=key)
+                except Exception as cleanup:
+                    raise RuntimeError(f"Backup upload failed and {key} could not be removed: "
+                                       f"{self.clean_error(failure)}; {self.clean_error(cleanup)}") from failure
+                raise
         # An anonymous request is the real exposure path; it must be refused,
         # whatever ACLs or bucket policies say. Anything but a 403 removes the object.
         try:

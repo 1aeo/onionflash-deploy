@@ -418,6 +418,19 @@ url = "https://example.org/feed.xml"
                 self.assertFalse((self.p.state / "backup.json").exists())
                 self.assertEqual(client.deleted, [client.uploads[0][:2]])
 
+    def test_an_ambiguous_upload_failure_removes_the_object(self):
+        self.seed_backup()
+        class LostResponse(FakeSpaces):
+            def put_object(self, **kwargs):
+                super().put_object(**kwargs)
+                raise ConnectionError("response lost")
+        client = LostResponse()
+        with patch("boto3.client", return_value=client), self.anonymous(403):
+            with self.assertRaises(ConnectionError):
+                self.p.backup(force=True)
+        self.assertEqual(client.deleted, [client.uploads[0][:2]])
+        self.assertFalse((self.p.state / "backup.json").exists())
+
     def test_retention_deletes_only_old_backups_and_its_failure_is_retried(self):
         self.seed_backup()
         old = datetime(2020, 1, 1, tzinfo=timezone.utc)
