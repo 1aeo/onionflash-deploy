@@ -394,9 +394,12 @@ class Publisher:
             else:
                 metadata = Path(temporary) / "upload.ndjson"
                 self.command(["versions", "upload", "--config", str(config), "--preview-alias", "candidate"], metadata)
-                records = [json.loads(line) for line in metadata.read_text().splitlines() if line.strip()]
-                uploaded = next(x for x in records if x.get("type") == "version-upload")
-                version, preview = uploaded["version_id"], uploaded["preview_url"]
+                lines = metadata.read_text().splitlines() if metadata.exists() else []
+                records = [json.loads(line) for line in lines if line.strip()]
+                uploaded = next((x for x in records if x.get("type") == "version-upload"), {})
+                version, preview = uploaded.get("version_id"), uploaded.get("preview_url")
+                if not version or not preview:
+                    raise RuntimeError("Wrangler did not report the uploaded version and its preview URL")
                 parsed = urlsplit(preview)
                 if parsed.scheme != "https" or not parsed.hostname or not parsed.hostname.endswith(".workers.dev") or parsed.username:
                     raise ValueError("Invalid Cloudflare preview URL")

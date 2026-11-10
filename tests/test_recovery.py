@@ -157,6 +157,13 @@ url = "https://example.org/feed.xml"
             with self.assertRaisesRegex(RuntimeError, "check failed.*restore unavailable"):
                 self.p.publish()
 
+    def test_an_upload_without_a_reported_version_fails_clearly(self):
+        self.seed_public()
+        self.fake_cloudflare(OLD)
+        with patch.object(self.p, "command", return_value=""):
+            with self.assertRaisesRegex(RuntimeError, "did not report the uploaded version"):
+                self.p.publish()
+
     def test_failed_preview_check_never_activates(self):
         self.seed_public()
         self.fake_cloudflare(OLD, failing_check="preview")

@@ -47,8 +47,9 @@ Edit the three generated files (all ignored by Git):
 
 The first run may publish only some stories while its durable analysis queue is
 processed. Each later run continues the queue. Processing limits and the run time
-budget are configurable. `run` does not attach hostname routes; the initial
-publication can be inspected at the origin URL printed by `status` first.
+budget are configurable. `run` does not attach hostname routes; inspect the initial
+publication first at the Worker's `workers.dev` origin (`https://<worker_name>.<account
+subdomain>.workers.dev` plus the site's base path).
 
 ## Cloudflare setup
 
