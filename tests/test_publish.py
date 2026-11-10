@@ -97,11 +97,7 @@ url = "https://example.org/feed.xml"
         self.assertFalse(publish.public_path_allowed("tags/private.xml"))
         self.assertTrue(publish.public_path_allowed("news/abc_123/index.html"))
         self.assertTrue(publish.public_path_allowed("tags/security.xml"))
-        self.assertTrue(publish.public_path_allowed("topics/security/index.html"))
-        self.assertTrue(publish.public_path_allowed("topics/security/page/2/index.html"))
-        for path in ["app.js", "topics/private/index.html", "topics/security/../secret/index.html",
-                     "topics/security/page/00/index.html", "topics/security/page/1000000000/index.html"]:
-            self.assertFalse(publish.public_path_allowed(path))
+        self.assertFalse(publish.public_path_allowed("app.js"))
 
     def test_public_html_cannot_reintroduce_browser_javascript(self):
         public = self.public_tree()

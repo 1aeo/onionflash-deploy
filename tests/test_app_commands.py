@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -78,7 +79,7 @@ url = "https://example.org/feed.xml"
         self.config.write_text(self.config.read_text().replace('secret_key_env = "DO_SPACES_SECRET"',
                                                               'secret_key_env = "CUSTOM_PRIVATE_VALUE"'))
         os.environ["CUSTOM_PRIVATE_VALUE"] = "custom-private-value"
-        private = {"CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ZONE_TOKEN", "DO_SPACES_KEY",
+        private = {"CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ZONE_TOKEN", "DO_SPACES_KEY", "DO_SPACES_SECRET",
                    "CUSTOM_PRIVATE_VALUE", "ONIONFLASH_LLM_API_KEY"}
 
         def inspect(arguments):
@@ -126,7 +127,8 @@ url = "https://example.org/feed.xml"
 
     def test_real_core_status_build_and_database_lock(self):
         from onionflash.cli import run_lock
-        with patch("publish.urlopen", side_effect=AssertionError("unexpected network")), \
+        # Every HTTP client ends in socket.connect. Errors may become exit codes, so the mock is checked too.
+        with patch.object(socket.socket, "connect", side_effect=AssertionError("unexpected network")) as connect, \
                 patch("subprocess.run", side_effect=AssertionError("unexpected subprocess")), redirect_stdout(io.StringIO()):
             self.assertEqual(self.run_app("status"), 0)
             self.assertEqual(self.run_app("rejected", "list", "--limit", "1"), 0)
@@ -136,6 +138,7 @@ url = "https://example.org/feed.xml"
                 self.assertTrue(acquired)
                 self.assertEqual(self.run_app("build"), 75)
                 self.assertEqual(self.run_app("status"), 0)
+        connect.assert_not_called()
 
     def test_shell_routes_app_and_preserves_publisher_backup_force_arguments(self):
         shutil.copyfile(publish.ROOT / "deploy.sh", self.directory / "deploy.sh")
