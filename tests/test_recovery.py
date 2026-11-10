@@ -226,7 +226,8 @@ output_dir = "build/public"
         with patch.object(self.p, "current_version", side_effect=lambda: actual[0]), \
                 patch.object(self.p, "activate", side_effect=activate), \
                 patch.object(self.p, "verify_receipt", side_effect=verify):
-            self.p.reconcile()
+            with self.assertRaisesRegex(ValueError, "target assets fail verification"):
+                self.p.reconcile()
         self.assertEqual(actual[0], OLD)
         self.assertEqual(json.loads((self.p.state / "publication.json").read_text())["version_id"], OLD)
         self.assertFalse((self.p.state / "transition.json").exists())

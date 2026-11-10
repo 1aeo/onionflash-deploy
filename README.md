@@ -97,8 +97,10 @@ the preceding receipt. A process interruption therefore leaves enough evidence
 for `./deploy.sh reconcile` to verify and finalize the known target, or restore
 the preceding receipt when that version is active. Unknown external versions
 are never overwritten. Failed verification restores the preceding version and
-fails that run; the next scheduled run tries again, and every failure is recorded
-in `state/run.log` and `state/last-run.json`. Archived receipts are written before the
+fails that run; the next scheduled run tries again. Failures inside a run are
+recorded in `state/run.log` and `state/last-run.json`; errors raised before the run
+starts, such as an invalid configuration or credential file, go to the console or,
+for scheduled runs, the system log. Archived receipts are written before the
 current-publication pointer.
 
 The public package is an exact allowlist of generated pages, feeds and three

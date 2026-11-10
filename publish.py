@@ -453,7 +453,9 @@ class Publisher:
             try:
                 self.verify_receipt(journal["target"])
             except Exception:
-                return self.restore_transition(journal)
+                # Restore the previous version, then report the failed check.
+                self.restore_transition(journal)
+                raise
             return self.complete_transition(journal)
         if actual == journal["before_version"]:
             return self.restore_transition(journal)
