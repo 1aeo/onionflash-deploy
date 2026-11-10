@@ -114,7 +114,13 @@ batches continue on subsequent scheduled runs until the backlog drains.
 Enable it only after `[archive]` is
 working. The job first writes a compressed private bundle and verifies its bytes
 and private ACL. It then conditionally compacts unchanged completed rows/files.
-Pending items and concurrent edits are preserved.
+Pending items and concurrent edits are preserved. Source items and historical
+analysis snapshots referenced by unfinished final-review jobs are pinned in hot
+storage, including jobs awaiting operator action. Pins are checked again under
+the compaction transaction after remote storage I/O, so a new review cannot lose
+its supporting evidence during upload. Completed review audits travel with their
+analysis rows into private evidence bundles. Full SQLite backups also preserve
+the unfinished jobs and exact approval cache.
 
 Item IDs, source URLs, content hashes, timestamps, story mappings, retry state,
 published stories, last-good public article JSON and incident deduplication state

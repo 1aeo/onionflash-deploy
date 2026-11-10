@@ -119,6 +119,12 @@ class RetentionTests(unittest.TestCase):
             db.execute("INSERT INTO analyses VALUES(?,?,?,?,?)", (key, '{"evidence":["private quote"]}', date,
                        '{"content":"collected source snapshot; not an exact model request"}', "item"))
 
+    def review_job(self, sources, identity="active-review"):
+        with self.db() as db:
+            db.execute("CREATE TABLE IF NOT EXISTS review_jobs(item_id TEXT PRIMARY KEY,stage TEXT,envelope_json TEXT)")
+            db.execute("INSERT OR REPLACE INTO review_jobs VALUES(?,?,?)",
+                       (identity, "verify", json.dumps({"binding": {"sources": sources}})))
+
     def rows(self, table):
         with self.db() as db:
             db.row_factory = sqlite3.Row
@@ -187,6 +193,63 @@ class RetentionTests(unittest.TestCase):
                 self.assertEqual(self.rows("items"), before_items)
                 self.assertEqual(self.rows("analyses"), before_analyses)
                 self.assertEqual(self.rows("private_archive_refs"), [])
+
+    def test_active_review_pins_items_and_historical_analyses_without_starving_other_records(self):
+        self.item()
+        self.analysis()
+        self.analysis("other-analysis")
+        self.review_job([{"table": "item_lookup", "by": "url", "key": "https://example.org/item"},
+                         {"table": "analyses", "key": "cache"}])
+        result = self.engine(batch_size=1).archive_evidence(NOW)
+        self.assertEqual(result["analyses_evicted"], 1)
+        self.assertEqual(result["items_compacted"], 0)
+        self.assertEqual([row["cache_key"] for row in self.rows("analyses")], ["cache"])
+        self.assertIn("content", json.loads(self.rows("items")[0]["payload"]))
+        self.assertEqual(self.rows("review_jobs")[0]["stage"], "verify")
+
+    def test_new_review_dependency_during_object_upload_is_rechecked_before_deletion(self):
+        self.item()
+        self.analysis()
+        before_items, before_analyses = self.rows("items"), self.rows("analyses")
+        client = FakeSpaces(callback=lambda: self.review_job([
+            {"table": "items", "key": "item"}, {"table": "analyses", "key": "cache"}]))
+        engine = self.engine(client)
+        pin_check = engine._review_pins
+        transactions = []
+        def observe_transaction(db):
+            transactions.append(db.in_transaction)
+            return pin_check(db)
+        engine._review_pins = observe_transaction
+        result = engine.archive_evidence(NOW)
+        self.assertEqual(result["changed_records_preserved"], 2)
+        self.assertEqual(result["items_compacted"], 0)
+        self.assertEqual(result["analyses_evicted"], 0)
+        self.assertEqual(self.rows("items"), before_items)
+        self.assertEqual(self.rows("analyses"), before_analyses)
+        self.assertEqual(transactions, [False, True])
+        self.assertEqual(len(client.puts), 1)
+
+    def test_analysis_review_audit_is_included_in_private_bundle(self):
+        self.analysis()
+        with self.db() as db:
+            db.execute("ALTER TABLE analyses ADD COLUMN review_record TEXT")
+            db.execute("UPDATE analyses SET review_record=?", (json.dumps({"stage": "approved", "source_packet": "private review evidence"}),))
+        client = FakeSpaces()
+        self.assertEqual(self.engine(client).archive_evidence(NOW)["analyses_evicted"], 1)
+        bundle = json.loads(gzip.decompress(next(iter(client.objects.values()))[0]))
+        audit = json.loads(bundle["records"][0]["row"]["review_record"])
+        self.assertEqual(audit["source_packet"], "private review evidence")
+
+    def test_malformed_review_dependency_fails_closed_without_upload(self):
+        self.analysis()
+        self.review_job([])
+        with self.db() as db:
+            db.execute("UPDATE review_jobs SET envelope_json='unreadable'")
+        client = FakeSpaces()
+        with self.assertRaisesRegex(ValueError, "unfinished review evidence"):
+            self.engine(client).archive_evidence(NOW)
+        self.assertEqual(client.puts, [])
+        self.assertEqual(len(self.rows("analyses")), 1)
 
     def test_changed_rows_during_upload_are_not_overwritten(self):
         self.item()
