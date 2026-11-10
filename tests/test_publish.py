@@ -263,7 +263,7 @@ url = "https://example.org/feed.xml"
         p.public.mkdir(parents=True)
         (p.public / "index.html").write_text("safe")
         manifest = {"index.html": "dummy"}
-        identity = publish.hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
+        identity = p.publication_identity(manifest)
         publish.atomic_json(p.state / "publication.json", {"content_hash": identity, "version_id": "expected"})
         with patch.object(p, "validate", return_value=manifest), patch.object(p, "current_version", return_value="unexpected"), patch.object(p, "command") as command:
             with self.assertRaisesRegex(ValueError, "differs"):

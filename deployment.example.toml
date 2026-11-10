@@ -40,3 +40,40 @@ secret_key_env = "DO_SPACES_SECRET"
 backup_interval_seconds = 86400
 retention_days = 30
 create_bucket = false
+
+# Durable public stories, pagination and full-history feeds. Bucket ACL remains
+# private; only verified public objects/manifests get a public-read object ACL.
+[archive]
+enabled = false
+# Optional additional protected dotenv file for dedicated storage credentials.
+# env_file = "archive-secrets.env"
+endpoint_url = "https://nyc3.digitaloceanspaces.com"
+region = "nyc3"
+bucket = "onionflash-data"
+public_prefix = "onionflash/public/"
+private_prefix = "onionflash/private/"
+public_origin = "https://onionflash-data.nyc3.digitaloceanspaces.com/onionflash/public/"
+access_key_env = "DO_SPACES_KEY"
+secret_key_env = "DO_SPACES_SECRET"
+max_uploads_per_run = 500
+max_upload_bytes_per_run = 536870912
+max_object_bytes = 268435456
+max_manifest_bytes = 8388608
+shard_prefix_chars = 2
+sync_budget_seconds = 180
+cache_ttl_seconds = 60
+immutable_cache_ttl_seconds = 31536000
+worker_timeout_ms = 5000
+worker_retry_attempts = 2
+worker_backoff_ms = 200
+worker_backoff_cap_ms = 1000
+
+# Only old private inputs/caches/receipts are compacted after verified archival.
+# Published articles, their catalog and remote evidence are never expired.
+[retention]
+enabled = false
+hot_days = 90
+receipt_hot_days = 30
+batch_size = 100
+max_bundle_bytes = 16777216
+run_budget_seconds = 60
