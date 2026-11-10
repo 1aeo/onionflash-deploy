@@ -377,8 +377,12 @@ url = "https://example.org/feed.xml"
                 with publish.lock(str(self.p.database) + ".lock", nonblocking=True):
                     pass
             return backup_database(source, destination)
+        class Frozen(datetime):  # both uploads happen in the same UTC second
+            @classmethod
+            def now(cls, tz=None):
+                return datetime(2026, 11, 10, 12, 0, 0, tzinfo=timezone.utc)
         with patch("boto3.client", return_value=client), self.anonymous(403), \
-                patch("onionflash.store.backup_database", side_effect=snapshot):
+                patch("onionflash.store.backup_database", side_effect=snapshot), patch("publish.datetime", Frozen):
             self.p.backup()
             self.p.backup()
             self.assertEqual(len(client.uploads), 1)
@@ -387,7 +391,8 @@ url = "https://example.org/feed.xml"
         bucket, key, body, acl = client.uploads[0]
         self.assertEqual(acl, "private")
         self.assertRegex(key, r"^onionflash/backups/\d{8}T\d{6}Z-[0-9a-f]{8}\.sqlite3\.gz$")
-        self.assertNotEqual(key, client.uploads[1][1])  # same-second backups get distinct keys
+        self.assertEqual(key[:36], client.uploads[1][1][:36])  # the same second...
+        self.assertNotEqual(key, client.uploads[1][1])  # ...but distinct keys
         restored = self.directory / "restored.sqlite3"
         restored.write_bytes(gzip.decompress(body))
         with closing(sqlite3.connect(restored)) as database:
