@@ -269,6 +269,12 @@ class Publisher:
             raise RuntimeError("Cloudflare API rejected request: " + self.clean_error(response.get("errors")))
         return response.get("result")
 
+    def record_first_version(self):
+        version = self.current_version()
+        if version:
+            atomic_json(self.state / "publication.json", {"version_id": version})
+        return version
+
     def current_version(self):
         try:
             result = self.api(f"/accounts/{self.account}/workers/scripts/{self.cf['worker_name']}/deployments")
@@ -445,8 +451,6 @@ class Publisher:
         config = self.control_config()
         atomic_json(self.state / "publication-hold.json", {"reason": "rollback requested", "from": expected, "to": previous, "timestamp": time.time()})
         self.forget_content(receipt)
-        if self.current_version() != expected:
-            raise ValueError("Active Worker version changed before rollback; external version retained")
         self.activate(previous, config)
         # Preserve archive roots and original publication dates when available,
         # but force a fresh upload after resume instead of taking a cached shortcut.
@@ -518,34 +522,41 @@ class Publisher:
                        for path in previous.get("manifest", {})):
                     raise ValueError("A previously published article is missing from the local snapshot")
             identity = self.publication_identity(manifest, archive_info)
+            before = self.current_version()
+            if before != previous.get("version_id"):
+                raise ValueError("Active Worker version differs from the publication receipt; inspect before "
+                                 f"publishing (live {before}, recorded {previous.get('version_id')})")
             if previous.get("content_hash") == identity:
-                if self.current_version() != previous.get("version_id"):
-                    raise ValueError("Active Worker version differs from the publication receipt")
                 LOG.info("Public output unchanged; skipping Cloudflare upload")
                 return previous
             config = self.make_config(self.prepare_assets(stage), archive=archive_info)
             options = {"archive": archive_info} if archive_info else {}
             # Resolve fallible metadata before any activation, including a first deploy.
-            origin = self.origin_url()
-            live = self.base_url if (self.state / "routes.json").exists() else origin
-            before = self.current_version()
-            if before != previous.get("version_id"):
-                raise ValueError("Active Worker version differs from the publication receipt; inspect before publishing")
+            live = self.base_url if (self.state / "routes.json").exists() else self.origin_url()
             provenance = {"app_version": self.app_version(),
                           "app_commit": self.git_commit(self.path(self.cfg.get("app_source", "../onionflash"))),
                           "deployment_commit": self.git_commit(ROOT)}
             # A small per-version receipt preserves the previous archive root for
-            # manual rollback and private retention, without a transition journal.
+            # manual rollback and private retention.
             if previous.get("version_id") == before and previous.get("manifest"):
                 prior_path = self.state / "receipts" / (before + ".json")
                 if not prior_path.exists():
                     atomic_json(prior_path, previous)
             self.forget_content(previous)
             if before is None:
-                if self.current_version() is not None:
-                    raise ValueError("Worker appeared outside this publication; existing version retained")
-                self.command(["deploy", "--config", str(config)])
-                version = self.current_version()
+                try:
+                    self.command(["deploy", "--config", str(config)])
+                except BaseException:
+                    # Record a Worker the failed deploy may still have created, so the
+                    # next run can replace it; the deploy error is the one reported.
+                    try:
+                        self.record_first_version()
+                    except Exception as lookup:
+                        LOG.error("Could not read the Worker version after a failed deploy: %s", self.clean_error(lookup))
+                    raise
+                # Recorded with no content hash, so a failed live check below leaves
+                # the next run to upload and check again.
+                version = self.record_first_version()
                 if not version:
                     raise RuntimeError("Cloudflare did not report the deployed version")
             else:
@@ -576,13 +587,13 @@ class Publisher:
                         raise RuntimeError(f"Live check failed ({failure}) and restoring {before} failed: {restore}") from failure
                 raise
             receipt = {"version_id": version, "previous_version_id": before,
-                       "content_hash": identity, "manifest": manifest, "origin_url": origin,
+                       "content_hash": identity, "manifest": manifest,
                        "published_at": datetime.now(timezone.utc).isoformat(), **provenance}
             if archive_info:
                 receipt["archive"] = archive_info
             atomic_json(self.state / "receipts" / (version + ".json"), receipt)
             atomic_json(self.state / "publication.json", receipt)
-            LOG.info("Published version %s (%s files)", version, len(manifest))
+            LOG.info("Published version %s (%s files) at %s", version, len(manifest), live)
             return receipt
 
     def app_version(self):

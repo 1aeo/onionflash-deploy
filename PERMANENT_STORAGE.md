@@ -97,14 +97,8 @@ Unchanged articles are reused. Feeds are streamed with bounded memory. A hot-onl
 front-page change reuses the permanent manifest. Asset, Worker-code and runtime
 binding changes all participate in deployment identity.
 
-The publisher uses one linear upload, preview-check, activation and live-check
-flow. Small per-version receipts retain the immutable root for rollback; there
-is no transition journal or `reconcile` command. An interrupted attempt clears
-the unchanged-content shortcut. Pre-activation failures retry normally; an
-unrecorded live-version change stops for operator inspection so an external
-deployment cannot be overwritten by an automatic retry.
-Feed routing is verified by its immutable hash/ETag without buffering
-an entire growing feed again. The upload itself is read back and hash-checked.
+Publication, rollback and recovery work as described in the
+[README](README.md#publication).
 
 ## Private evidence and receipt retention
 
