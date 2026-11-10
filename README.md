@@ -109,6 +109,8 @@ not occur, the next run uploads and verifies again. If the live version changed
 without a completed receipt, publication stops for operator inspection rather
 than guessing whether that change belongs to this process. An external version
 change during verification is left intact rather than rolled back.
+Manual rollback also checks the recorded active version before preparation and
+again before activation, so it will not replace a concurrent external deployment.
 
 Failures inside a run are recorded in `state/run.log` and `state/last-run.json`;
 errors raised before the run starts, such as an invalid configuration or credential
@@ -122,41 +124,34 @@ outside it. Source timestamps and original first-publication times are preserved
 
 Set `spaces.enabled = true`, an HTTPS endpoint, region, bucket and private prefix
 in `deployment.toml`. The corresponding environment variable names are configurable.
-Use a dedicated bucket or an isolated prefix such as `onionflash/backups/`.
-Set `create_bucket = true` only when the credential is authorized to create that
-bucket; otherwise create it privately first. Bucket creation is checked before use.
+Use a dedicated bucket or an isolated prefix such as `onionflash/backups/`, and
+create the bucket privately first.
 
 ```sh
 ./deploy.sh backup
-./deploy.sh backup --force   # Verify a fresh backup immediately
+./deploy.sh backup --force   # Make a fresh backup immediately
 ```
 
-Backups hold the application's database lock while creating a consistent SQLite
-copy and snapshotting the generated public files. The archive's
-`snapshot-manifest.json` records those files and whether they match the last
-publication receipt: a held or failed publication can leave a newer local build.
-If generated files fail validation, the archive records the error and omits those
-files while still preserving the validated SQLite backup.
-Every object is uploaded
-with a **private ACL**, checked for size/hash metadata, and checked for accidental
-public/group grants. A failed upload/verification attempts to remove only its new,
-uniquely named object; a cleanup failure is reported explicitly. Defaults are one
-backup per day and 30 days of retention. The interval marker includes the endpoint,
-bucket and prefix, so changing destinations forces a new verified backup.
-Retention only touches this application's strictly named objects under its backup
-prefix; the newest upload is always retained. The SDK uses bounded retries and
-timeouts. A backup outage is recorded and retried later without blocking news
-publication unless `spaces.required = true`; optional failures appear as degraded
-warnings in job status. Scheduled backups are attempted even when collection or
-publication fails, or publication is deliberately held. Retention failures do not
-advance the interval marker and are retried on a later run.
+A backup is a gzip-compressed SQLite snapshot taken under the application's
+database lock; the public site is rebuilt from it with `onionflash build`. Each
+object is uploaded with a **private ACL**, then an unsigned request for it must be
+refused with 403. That checks the actual exposure path, whatever ACLs or bucket
+policies say; a publicly readable object is deleted and the backup fails.
+Defaults are one backup per day and 30 days of retention; changing the endpoint,
+bucket or prefix triggers a backup on the next run. Retention only deletes
+this application's strictly named objects under its backup prefix and never the
+newest upload. A backup outage is recorded and retried later without blocking
+news publication unless `spaces.required = true`; optional failures appear as
+degraded warnings in job status. Scheduled backups are attempted even when
+collection or publication fails, or publication is held. A retention failure does
+not advance the interval marker and is retried on a later run.
 
-For recovery, hold publication, download a selected private archive using an S3
-client, compare its SHA-256 with object metadata, and extract it into a new private
-directory. Validate the recovered database using `PRAGMA quick_check`. Replace the
-database only with the scheduled job stopped and the application lock held, then
-run the application's offline `build` before resuming publication. Keep the old
-database until recovery is verified. Credentials are never included in backups.
+For recovery, hold publication, download a selected object with an S3 client,
+decompress it into a new private directory and check it with `PRAGMA quick_check`.
+Replace the database only with the scheduled job stopped and the application lock
+held, then run the application's offline `build` before resuming publication.
+Keep the old database until recovery is verified. Credentials are never included
+in backups.
 
 ## Operations
 

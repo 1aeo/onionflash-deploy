@@ -1,16 +1,17 @@
 """Cross-layer checks for permanent storage and guarded Worker activation."""
 import copy
 from contextlib import nullcontext
-import io
+import gzip
 import json
 import os
 from pathlib import Path
 import shutil
-import tarfile
+import sqlite3
 import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
+from urllib.error import HTTPError
 
 import publish
 from archive_store import ArchiveStore, HOT_FILES
@@ -156,7 +157,7 @@ class PermanentPublicationTests(unittest.TestCase):
             third = self.p.publication_identity({"index.html": "same"})
         self.assertEqual(len({first, second, third}), 3)
 
-    def test_archive_backups_keep_database_and_hot_assets_without_full_site(self):
+    def test_sqlite_only_backups_preserve_the_permanent_manifest_catalog(self):
         sync = self.p.archive.sync()
         snapshot = self.root / "initial-snapshot"
         hot = self.p.archive.snapshot_hot(snapshot, sync["generation"])
@@ -165,13 +166,13 @@ class PermanentPublicationTests(unittest.TestCase):
             "archive": {"generation": sync["generation"], "manifest_sha256": sync["manifest_sha256"]}})
         self.p.cfg["spaces"]["enabled"] = True
         backups = FakeSpaces()
-        with patch("boto3.client", return_value=backups):
+        with patch("boto3.client", return_value=backups), patch.object(self.p, "request", side_effect=HTTPError("unsigned", 403, "private", {}, None)) as privacy_check:
             self.p.backup(force=True)
-        with tarfile.open(fileobj=io.BytesIO(backups.uploads[0][2]), mode="r:gz") as tar:
-            names = tar.getnames()
-            self.assertIn("onionflash.sqlite3", names)
-            self.assertIn("public/index.html", names)
-            self.assertNotIn("public/feed.xml", names)
-            report = json.load(tar.extractfile("snapshot-manifest.json"))
-            self.assertTrue(report["matches_publication"])
-            self.assertEqual(report["archive"]["manifest_sha256"], sync["manifest_sha256"])
+        restored = self.root / "restored.sqlite3"
+        restored.write_bytes(gzip.decompress(backups.uploads[0][2]))
+        with sqlite3.connect(restored) as database:
+            self.assertEqual(database.execute("PRAGMA quick_check").fetchone()[0], "ok")
+            self.assertEqual(database.execute("SELECT value FROM metadata WHERE key='archive_manifest_sha256'").fetchone()[0], sync["manifest_sha256"])
+            self.assertGreater(database.execute("SELECT COUNT(*) FROM public_artifacts").fetchone()[0], 0)
+        self.assertEqual(privacy_check.call_args.args[1], "HEAD")
+        self.assertNotIn("token", privacy_check.call_args.kwargs)

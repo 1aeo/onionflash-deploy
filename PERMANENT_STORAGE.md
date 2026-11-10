@@ -114,8 +114,11 @@ objects and article history have no automatic expiry.
 ./deploy.sh retention   # Run one bounded private-retention batch explicitly.
 ```
 
-Routine private backups include SQLite, publication metadata and the small hot
-asset set. They do not repeatedly copy the entire public object archive. A
+Routine private backups contain only a gzip-compressed SQLite snapshot, including
+the permanent publication catalog and last-good public story JSON. An unsigned
+request must confirm the backup object is private. They do not repeatedly copy
+generated pages or the public object archive. Keep deployment configuration and
+publication receipts securely alongside the separately managed credentials. A
 database restore can rebuild article files from the last-good public snapshots
 with `onionflash build --config onionflash.toml --force`; repeat while the bounded
 rebuild reports `articles_pending`. No LLM calls are required for reconstruction.

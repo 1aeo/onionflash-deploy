@@ -1,16 +1,17 @@
 """Failure-path checks for owned deployment transitions and private backups."""
-import hashlib
+from datetime import datetime, timezone
+import gzip
 import io
 import json
 import os
 from pathlib import Path
 import sqlite3
-import tarfile
 import tempfile
 import unittest
 from contextlib import closing, redirect_stdout
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
+from urllib.error import HTTPError, URLError
 
 import publish
 
@@ -28,24 +29,14 @@ def receipt(version, previous=None):
 
 
 class FakeSpaces:
-    def __init__(self, *, public_acl=False, corrupt=False, cleanup_error=False,
-                 retention_error=False):
-        self.public_acl, self.corrupt = public_acl, corrupt
+    def __init__(self, *, cleanup_error=False, retention_error=False, listed=()):
         self.cleanup_error, self.retention_error = cleanup_error, retention_error
-        self.objects, self.uploads, self.deleted = {}, [], []
+        self.objects, self.uploads, self.deleted, self.listed = {}, [], [], list(listed)
 
-    def upload_file(self, filename, bucket, key, ExtraArgs):
-        body = Path(filename).read_bytes()
-        self.objects[bucket, key] = (body, ExtraArgs)
-        self.uploads.append((bucket, key, body, ExtraArgs))
-
-    def head_object(self, *, Bucket, Key):
-        body, options = self.objects[Bucket, Key]
-        return {"ContentLength": len(body), "Metadata": {
-            "sha256": "corrupt" if self.corrupt else options["Metadata"]["sha256"]}}
-
-    def get_object_acl(self, **kwargs):
-        return {"Grants": [{"Grantee": {"Type": "Group"}}] if self.public_acl else []}
+    def put_object(self, *, Bucket, Key, Body, ACL, ContentType):
+        Body = Body.read()
+        self.objects[Bucket, Key] = Body
+        self.uploads.append((Bucket, Key, Body, ACL))
 
     def delete_object(self, *, Bucket, Key):
         self.deleted.append((Bucket, Key))
@@ -59,7 +50,7 @@ class FakeSpaces:
     def paginate(self, **kwargs):
         if self.retention_error:
             raise RuntimeError("retention listing unavailable")
-        return [{"Contents": []}]
+        return [{"Contents": self.listed}]
 
 
 class RecoveryTests(unittest.TestCase):
@@ -180,6 +171,7 @@ url = "https://example.org/feed.xml"
                 self.p.publish()
         self.assertNotIn("content_hash", publish.read_json(self.p.state / "publication.json"))
         publish.atomic_json(self.p.state / "publication.json", receipt(NEW, OLD))
+        self.live[0] = NEW
         with patch.object(self.p, "activate", side_effect=KeyboardInterrupt):
             with self.assertRaises(KeyboardInterrupt):
                 self.p.rollback()
@@ -254,7 +246,7 @@ url = "https://example.org/feed.xml"
         old["archive"] = {"manifest_sha256": "a" * 64, "generation": "1", "origin": "https://example.org/public/"}
         publish.atomic_json(self.p.state / "receipts" / (OLD + ".json"), old)
         publish.atomic_json(self.p.state / "publication.json", receipt(NEW, OLD))
-        with patch.object(self.p, "activate"):
+        with patch.object(self.p, "activate"), patch.object(self.p, "current_version", return_value=NEW):
             self.p.rollback()
         current = publish.read_json(self.p.state / "publication.json")
         self.assertEqual(current["archive"], old["archive"])
@@ -265,7 +257,7 @@ url = "https://example.org/feed.xml"
         publish.atomic_json(self.p.state / "publication.json", receipt(NEW, OLD))
         def activate(version, config):
             self.assertTrue((self.p.state / "publication-hold.json").is_file())
-        with patch.object(self.p, "activate", side_effect=activate) as activation:
+        with patch.object(self.p, "activate", side_effect=activate) as activation, patch.object(self.p, "current_version", return_value=NEW):
             self.p.rollback()
         activation.assert_called_once()
         self.assertEqual(activation.call_args[0][0], OLD)
@@ -275,14 +267,33 @@ url = "https://example.org/feed.xml"
 
     def test_failed_rollback_keeps_the_hold_and_the_receipt(self):
         publish.atomic_json(self.p.state / "publication.json", receipt(NEW, OLD))
-        with patch.object(self.p, "activate", side_effect=RuntimeError("API unavailable")):
+        with patch.object(self.p, "activate", side_effect=RuntimeError("API unavailable")), patch.object(self.p, "current_version", return_value=NEW):
             with self.assertRaises(RuntimeError):
                 self.p.rollback()
         self.assertEqual(publish.read_json(self.p.state / "publication-hold.json")["reason"], "rollback requested")
         self.assertEqual(publish.read_json(self.p.state / "publication.json")["version_id"], NEW)
 
+    def test_manual_rollback_never_replaces_an_external_version(self):
+        original = receipt(NEW, OLD)
+        publish.atomic_json(self.p.state / "publication.json", original)
+        with patch.object(self.p, "current_version", return_value=OTHER), patch.object(self.p, "activate") as activate:
+            with self.assertRaisesRegex(ValueError, "rollback not performed"):
+                self.p.rollback()
+        activate.assert_not_called()
+        self.assertFalse((self.p.state / "publication-hold.json").exists())
+        self.assertEqual(publish.read_json(self.p.state / "publication.json"), original)
+
+    def test_manual_rollback_rechecks_the_version_after_local_preparation(self):
+        publish.atomic_json(self.p.state / "publication.json", receipt(NEW, OLD))
+        with patch.object(self.p, "current_version", side_effect=[NEW, OTHER]), patch.object(self.p, "activate") as activate:
+            with self.assertRaisesRegex(ValueError, "changed before rollback"):
+                self.p.rollback()
+        activate.assert_not_called()
+        self.assertTrue((self.p.state / "publication-hold.json").exists())
+        self.assertEqual(publish.read_json(self.p.state / "publication.json")["version_id"], NEW)
+
     def seed_backup(self):
-        self.p.cfg["spaces"].update(enabled=True, create_bucket=False)
+        self.p.cfg["spaces"].update(enabled=True)
         with closing(sqlite3.connect(self.p.database)) as db:
             db.execute("CREATE TABLE evidence (value TEXT)")
             db.execute("INSERT INTO evidence VALUES ('private source evidence')")
@@ -429,91 +440,100 @@ url = "https://example.org/feed.xml"
                 with self.assertRaises(ValueError):
                     publish.Publisher(path)
 
-    def test_backup_force_and_destination_change_bypass_interval(self):
-        self.seed_backup()
-        client = FakeSpaces()
-        with patch("boto3.client", return_value=client):
-            self.p.backup()
-            self.p.backup()
-            self.assertEqual(len(client.uploads), 1)
-            self.p.backup(force=True)
-            self.assertEqual(len(client.uploads), 2)
-            self.p.cfg["spaces"]["bucket"] = "different-news-bucket"
-            self.p.backup()
-        self.assertEqual(len(client.uploads), 3)
-        self.assertEqual(client.uploads[-1][0], "different-news-bucket")
+    def anonymous(self, code):
+        """Patch the publisher's unsigned request: None means it succeeded, an
+        exception is raised as is, and a number is an HTTP status."""
+        self.checked_urls = []
+        def request(url, method="GET", data=None, token=None):
+            self.assertEqual((method, token), ("HEAD", None))
+            self.checked_urls.append(url)
+            if isinstance(code, Exception):
+                raise code
+            if code is not None:
+                raise HTTPError(url, code, "anonymous", {}, None)
+            return b""
+        return patch.object(self.p, "request", side_effect=request)
 
-    def test_failed_backup_privacy_or_integrity_removes_only_new_object(self):
-        self.seed_backup()
-        for arguments in [{"public_acl": True}, {"corrupt": True}]:
-            with self.subTest(arguments=arguments):
-                client = FakeSpaces(**arguments)
-                client.objects["unrelated", "keep"] = (b"retained", {})
-                with patch("boto3.client", return_value=client):
-                    with self.assertRaises(ValueError):
-                        self.p.backup(force=True)
-                bucket, key, _, _ = client.uploads[0]
-                self.assertEqual(client.deleted, [(bucket, key)])
-                self.assertEqual(set(client.objects), {("unrelated", "keep")})
-                self.assertFalse((self.p.state / "backup.json").exists())
-
-    def test_failed_privacy_cleanup_remains_a_reported_error(self):
-        self.seed_backup()
-        client = FakeSpaces(public_acl=True, cleanup_error=True)
-        with patch("boto3.client", return_value=client):
-            with self.assertRaisesRegex(Exception, "cleanup"):
-                self.p.backup(force=True)
-        self.assertFalse((self.p.state / "backup.json").exists())
-
-    def test_retention_failure_does_not_mark_backup_cycle_complete(self):
-        self.seed_backup()
-        client = FakeSpaces(retention_error=True)
-        with patch("boto3.client", return_value=client):
-            with self.assertRaisesRegex(RuntimeError, "retention"):
-                self.p.backup()
-        self.assertFalse((self.p.state / "backup.json").exists())
-
-    def test_snapshot_helper_runs_under_lock_and_archive_has_its_own_manifest(self):
+    def test_backup_is_a_private_sqlite_snapshot_and_respects_the_interval(self):
         self.seed_backup()
         from onionflash.store import backup_database
         client = FakeSpaces()
         def snapshot(source, destination):
-            self.assertEqual(source, self.p.database)
-            with self.assertRaises(publish.BusyLock):
+            with self.assertRaises(publish.BusyLock):  # taken under the application lock
                 with publish.lock(str(self.p.database) + ".lock", nonblocking=True):
                     pass
             return backup_database(source, destination)
-        with patch("boto3.client", return_value=client), \
-                patch("onionflash.store.backup_database", side_effect=snapshot) as snapshot_call:
+        class Frozen(datetime):  # both uploads happen in the same UTC second
+            @classmethod
+            def now(cls, tz=None):
+                return datetime(2026, 11, 10, 12, 0, 0, tzinfo=timezone.utc)
+        with patch("boto3.client", return_value=client), self.anonymous(403), \
+                patch("onionflash.store.backup_database", side_effect=snapshot), patch("publish.datetime", Frozen):
             self.p.backup()
-        snapshot_call.assert_called_once()
-        archive = client.uploads[0][2]
-        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as tar:
-            snapshot = json.load(tar.extractfile("snapshot-manifest.json"))
-            manifest = snapshot["public_manifest"]
-            for name, digest in manifest.items():
-                self.assertEqual(hashlib.sha256(tar.extractfile("public/" + name).read()).hexdigest(), digest)
-            self.assertNotEqual(manifest, json.load(tar.extractfile("publication.json"))["manifest"])
-            self.assertFalse(snapshot["matches_publication"])
-            restored = self.directory / "restored.sqlite3"
-            restored.write_bytes(tar.extractfile("onionflash.sqlite3").read())
+            self.p.backup()
+            self.assertEqual(len(client.uploads), 1)
+            self.p.backup(force=True)
+            self.p.cfg["spaces"]["bucket"] = "another-private-bucket"
+            self.p.backup()  # a new destination does not wait for the interval
+        self.assertEqual(len(client.uploads), 3)
+        self.assertEqual(client.uploads[2][0], "another-private-bucket")
+        bucket, key, body, acl = client.uploads[0]
+        # The anonymous check asks for exactly the object that was uploaded.
+        self.assertEqual(self.checked_urls[0], self.p.cfg["spaces"]["endpoint_url"] + "/" + bucket + "/" + key)
+        self.assertEqual(acl, "private")
+        self.assertRegex(key, r"^onionflash/backups/\d{8}T\d{6}Z-[0-9a-f]{8}\.sqlite3\.gz$")
+        self.assertEqual(key[:36], client.uploads[1][1][:36])  # the same second...
+        self.assertNotEqual(key, client.uploads[1][1])  # ...but distinct keys
+        restored = self.directory / "restored.sqlite3"
+        restored.write_bytes(gzip.decompress(body))
         with closing(sqlite3.connect(restored)) as database:
             self.assertEqual(database.execute("PRAGMA quick_check").fetchone()[0], "ok")
             self.assertEqual(database.execute("SELECT value FROM evidence").fetchone()[0], "private source evidence")
 
-    def test_invalid_public_tree_does_not_prevent_private_database_backup(self):
+    def test_a_backup_not_proven_private_is_deleted_and_fails(self):
         self.seed_backup()
-        (self.p.public / "private-notes.txt").write_text("must not enter the archive")
-        client = FakeSpaces()
-        with patch("boto3.client", return_value=client):
-            self.p.backup(force=True)
-        with tarfile.open(fileobj=io.BytesIO(client.uploads[0][2]), mode="r:gz") as tar:
-            names = tar.getnames()
-            self.assertIn("onionflash.sqlite3", names)
-            self.assertFalse(any(name == "public" or name.startswith("public/") for name in names))
-            snapshot = json.load(tar.extractfile("snapshot-manifest.json"))
-            self.assertEqual(snapshot["public_manifest"], {})
-            self.assertIn("Unexpected public file", snapshot["public_error"])
+        for code, message in [(None, "publicly readable"), (404, "Unexpected anonymous response 404"),
+                              (URLError("reset"), "could not be checked")]:
+            with self.subTest(code=code):
+                client = FakeSpaces()
+                with patch("boto3.client", return_value=client), self.anonymous(code):
+                    with self.assertRaisesRegex(ValueError, message):
+                        self.p.backup(force=True)
+                self.assertFalse((self.p.state / "backup.json").exists())
+                self.assertEqual(client.deleted, [client.uploads[0][:2]])
+
+    def test_an_ambiguous_upload_failure_removes_the_object(self):
+        self.seed_backup()
+        class LostResponse(FakeSpaces):
+            def put_object(self, **kwargs):
+                super().put_object(**kwargs)
+                raise ConnectionError("response lost")
+        client = LostResponse()
+        with patch("boto3.client", return_value=client), self.anonymous(403):
+            with self.assertRaises(ConnectionError):
+                self.p.backup(force=True)
+        self.assertEqual(client.deleted, [client.uploads[0][:2]])
+        self.assertFalse((self.p.state / "backup.json").exists())
+        client = LostResponse(cleanup_error=True)
+        with patch("boto3.client", return_value=client), self.anonymous(403):
+            with self.assertRaisesRegex(RuntimeError, "could not be removed") as caught:
+                self.p.backup(force=True)
+        self.assertIn(client.uploads[0][1], str(caught.exception))  # the error names the key
+
+    def test_retention_deletes_only_old_backups_and_its_failure_is_retried(self):
+        self.seed_backup()
+        old = datetime(2020, 1, 1, tzinfo=timezone.utc)
+        listed = [{"Key": "onionflash/backups/20200101T000000Z-0123abcd.sqlite3.gz", "LastModified": old},
+                  {"Key": "onionflash/backups/20200101T000000Z-" + "a" * 12 + ".tar.gz", "LastModified": old},
+                  {"Key": "onionflash/backups/notes.txt", "LastModified": old}]
+        client = FakeSpaces(listed=listed)
+        with patch("boto3.client", return_value=client), self.anonymous(403):
+            self.p.backup()
+        self.assertEqual([key for _, key in client.deleted], [item["Key"] for item in listed[:2]])
+        client = FakeSpaces(retention_error=True)
+        with patch("boto3.client", return_value=client), self.anonymous(403):
+            with self.assertRaisesRegex(RuntimeError, "retention"):
+                self.p.backup(force=True)
 
 
 if __name__ == "__main__":
