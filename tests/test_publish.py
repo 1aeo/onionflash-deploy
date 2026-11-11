@@ -316,6 +316,11 @@ url = "https://example.org/feed.xml"
         activate.assert_not_called()
         self.assertFalse((self.publisher.state / "publication-hold.json").exists())
 
+    def test_routes_explain_a_receipt_without_files(self):
+        publish.atomic_json(self.publisher.state / "publication.json", {"version_id": "live-version"})
+        with self.assertRaisesRegex(ValueError, "publish once, then attach routes"):
+            self.publisher.routes()
+
     def test_secret_redaction(self):
         self.assertNotIn(os.environ["CLOUDFLARE_API_TOKEN"], self.publisher.clean_error("failed " + os.environ["CLOUDFLARE_API_TOKEN"]))
         # A configured credential is redacted and scanned for even when its name looks like no

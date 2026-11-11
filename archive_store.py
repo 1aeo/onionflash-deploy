@@ -15,7 +15,7 @@ import sqlite3
 import tempfile
 import time
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 from onionflash.render import ASSET_FILES
 from onionflash.schema import CATEGORIES
@@ -397,7 +397,7 @@ class ArchiveStore:
             raise ValueError("Refusing to overwrite immutable private archive object")
         self.verify_object(key, sha256, size)
         # A bucket policy can expose an object whose ACL is private.
-        problem = self.publisher.unsigned_read_problem(self.cfg["endpoint_url"], self.bucket, key)
+        problem = self.publisher.unsigned_read_problem(self.cfg["endpoint_url"].rstrip("/") + "/" + self.bucket + "/" + quote(key))
         if problem:
             if old is None:  # An existing object may back earlier archive references.
                 try:
@@ -410,20 +410,20 @@ class ArchiveStore:
 
     def _public_immutable(self, path, key, sha256, size, mime="application/octet-stream"):
         # Storage checks each upload's Content-MD5, so a new object needs no read-back. An
-        # existing one must match in size, sha256 metadata and ETag (its MD5), and anonymous
-        # readers must reach it, since its access may have changed after upload.
+        # existing one must match in size, sha256 metadata and ETag (its MD5). Either way,
+        # anonymous readers must reach it: a bucket policy or a later change can deny them.
         old = self._head(key)
         if old is None:
             self._put(path, key, sha256, size, public=True, mime=mime)
-            return
         # This publisher's single-part uploads have a plain MD5 ETag. An object another tool
         # uploaded in parts has a composite one and fails closed here, as changed.
-        if (old.get("Metadata", {}).get("sha256") != sha256 or old.get("ContentLength") != size
+        elif (old.get("Metadata", {}).get("sha256") != sha256 or old.get("ContentLength") != size
                 or old.get("ETag", "").strip('"') != self._md5(path).hexdigest()):
             raise ValueError("Immutable public archive object changed outside this publisher")
-        problem = self.publisher.unsigned_read_problem(self.cfg["endpoint_url"], self.bucket, key, True)
+        # Probe the URL the Worker reads, which validate_config ties to the public prefix.
+        problem = self.publisher.unsigned_read_problem(self.cfg["public_origin"] + key.removeprefix(self.cfg["public_prefix"]), True)
         if problem:
-            raise ValueError(f"Existing public archive object {key} {problem}")
+            raise ValueError(f"Public archive object {key} {problem}")
 
     def _upload_artifact(self, row, path):
         self._public_immutable(path, self.cfg["public_prefix"] + "objects/" + row["sha256"], row["sha256"], row["size"])

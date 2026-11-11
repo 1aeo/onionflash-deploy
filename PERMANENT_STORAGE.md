@@ -51,7 +51,12 @@ receipts remain private: an unsigned request for any such object must be refused
 (see [backups](README.md#digitalocean-spaces)). Storage checks every
 upload against its Content-MD5, and an object that already exists must match its
 size, sha256 metadata and ETag; unknown or corrupt objects stop publication
-rather than being overwritten.
+rather than being overwritten. When a public object or manifest is uploaded, or
+an upload finds it already stored, it must also answer an unsigned request at
+`public_origin`, or publication stops: check that no bucket policy denies
+anonymous reads and that `public_origin` names this bucket and prefix. Objects
+kept from earlier runs are not checked again, and the publisher never changes the
+access of an object that already exists.
 
 ## Migrate and publish
 

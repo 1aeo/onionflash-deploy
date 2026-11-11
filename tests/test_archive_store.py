@@ -296,13 +296,21 @@ class ArchiveTests(unittest.TestCase):
         path.write_bytes(b"public article")
         sha = hashlib.sha256(b"public article").hexdigest()
         key = self.archive.cfg["public_prefix"] + "objects/" + sha
-        self.archive._public_immutable(path, key, sha, path.stat().st_size)  # a new object: one HEAD and one PUT
-        self.assertEqual(self.unsigned, [])
-        self.archive._public_immutable(path, key, sha, path.stat().st_size)  # reused: anonymous readers must reach it
-        self.assertEqual(self.unsigned, [(self.archive.cfg["endpoint_url"], self.archive.bucket, key, True)])
-        self.exposure = "is not publicly readable"  # for example, its ACL was changed to private
+        # The check asks for the object where the Worker reads it.
+        check = (self.archive.cfg["public_origin"] + "objects/" + sha, True)
+        self.archive._public_immutable(path, key, sha, path.stat().st_size)  # new: HEAD, PUT, anonymous read
+        self.archive._public_immutable(path, key, sha, path.stat().st_size)  # reused: HEAD, anonymous read
+        self.assertEqual(self.unsigned, [check, check])
+        self.assertEqual(self.s3.puts, [key])
+        self.exposure = "is not publicly readable"  # for example, its ACL was later changed to private
         with self.assertRaisesRegex(ValueError, "is not publicly readable"):
             self.archive._public_immutable(path, key, sha, path.stat().st_size)
+        # A bucket policy can deny anonymous reads of a new object too.
+        fresh = self.root / "fresh"
+        fresh.write_bytes(b"another article")
+        fresh_sha = hashlib.sha256(b"another article").hexdigest()
+        with self.assertRaisesRegex(ValueError, "is not publicly readable"):
+            self.archive._public_immutable(fresh, self.archive.cfg["public_prefix"] + "objects/" + fresh_sha, fresh_sha, fresh.stat().st_size)
 
     def test_an_exposed_private_object_that_cannot_be_deleted_is_named_in_the_error(self):
         path = self.root / "private.gz"
@@ -321,7 +329,7 @@ class ArchiveTests(unittest.TestCase):
         key = self.archive.private_prefix + "evidence/example.json.gz"
         receipt = self.archive.put_private(path, key)
         self.assertEqual(self.s3.objects[key]["acl"], "private")
-        self.assertEqual(self.unsigned, [(self.archive.cfg["endpoint_url"], self.archive.bucket, key)])
+        self.assertEqual(self.unsigned, [(self.archive.cfg["endpoint_url"].rstrip("/") + "/" + self.archive.bucket + "/" + key,)])
         self.assertEqual(self.archive.put_private(path, key), receipt)
         # A private ACL is no proof once a bucket policy grants reads: the unsigned
         # request decides. A new object is removed; an existing one may back references.

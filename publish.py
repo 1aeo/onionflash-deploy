@@ -260,18 +260,25 @@ class Publisher:
     def request(self, url, method="GET", data=None, token=None):
         return self.response(url, method, data, token).body
 
-    def unsigned_read_problem(self, endpoint, bucket, key, public=False):
+    def unsigned_read_problem(self, url, public=False):
         """An anonymous request is the real access path: only a 403 proves an object private,
-        and only a success proves it public, whatever ACLs or bucket policies say."""
-        try:
-            self.request(endpoint.rstrip("/") + "/" + bucket + "/" + quote(key), "HEAD")
-            return None if public else "was publicly readable"
-        except HTTPError as exc:
-            if exc.code == 403:
-                return "is not publicly readable" if public else None
-            return f"got the unexpected anonymous response {exc.code}"
-        except OSError as exc:  # URLError, timeouts
-            return f"could not be checked {'for public access' if public else 'for privacy'} ({type(exc).__name__})"
+        and only a success proves it public, whatever ACLs or bucket policies say.
+        Throttling, server errors and network failures are retried like signed requests."""
+        for attempt in range(self.net["attempts"]):
+            if attempt:
+                self.delay(attempt - 1)
+            try:
+                self.request(url, "HEAD")
+                return None if public else "was publicly readable"
+            except HTTPError as exc:
+                if exc.code == 403:
+                    return "is not publicly readable" if public else None
+                problem = f"got the unexpected anonymous response {exc.code}"
+                if exc.code not in (408, 429) and exc.code < 500:
+                    return problem
+            except OSError as exc:  # URLError, timeouts
+                problem = f"could not be checked {'for public access' if public else 'for privacy'} ({type(exc).__name__})"
+        return problem
 
     @property
     def archive(self):
@@ -644,6 +651,8 @@ class Publisher:
 
     def routes(self):
         receipt = json.loads((self.state / "publication.json").read_text())
+        if "manifest" not in receipt:
+            raise ValueError("The publication receipt lists no files to check; publish once, then attach routes")
         options = {"archive": receipt["archive"]} if receipt.get("archive") else {}
         self.verify(self.origin_url(), receipt["manifest"], **options)
         zone = self.secret(ZONE_ID)
@@ -726,7 +735,7 @@ class Publisher:
                     raise RuntimeError(f"Backup upload failed and {key} could not be removed: "
                                        f"{self.clean_error(failure)}; {self.clean_error(cleanup)}") from failure
                 raise
-        problem = self.unsigned_read_problem(cfg["endpoint_url"], cfg["bucket"], key)
+        problem = self.unsigned_read_problem(cfg["endpoint_url"].rstrip("/") + "/" + cfg["bucket"] + "/" + quote(key))
         if problem:
             try:
                 client.delete_object(Bucket=cfg["bucket"], Key=key)
