@@ -1,6 +1,7 @@
 """Cross-layer checks for permanent storage and guarded Worker activation."""
 import copy
 from contextlib import closing
+import hashlib
 import json
 import shutil
 import sqlite3
@@ -58,6 +59,22 @@ class PermanentPublicationTests(unittest.TestCase):
                                           "ARCHIVE_MANIFEST_SHA": info["manifest_sha256"]})
         # No bundled asset shadows a permalink, so the Worker answers them without run_worker_first.
         self.assertNotIn("run_worker_first", config["assets"])
+
+    def test_the_worker_bundle_gets_the_static_feed_and_budget_checks(self):
+        self.add_stories("alpha")
+        with patch.object(self.p, "command") as command, patch.object(self.p, "current_version", return_value=None):
+            with patch.object(publish, "MAX_FILES", 3), self.assertRaisesRegex(ValueError, "file count budget"):
+                self.p.publish()
+            feed = self.p.public / "feed.xml"
+            feed.write_text("<html>not a feed</html>")
+            body = feed.read_bytes()
+            with Store(self.p.database) as store:  # as if the core had rendered it, so the ledger hash matches
+                store.db.execute("UPDATE public_artifacts SET sha256=?,size=? WHERE path='feed.xml'",
+                                 (hashlib.sha256(body).hexdigest(), len(body)))
+                store.db.commit()
+            with self.assertRaisesRegex(ValueError, "Expected RSS feed"):
+                self.p.publish()
+        command.assert_not_called()
 
     def test_incomplete_storage_sync_never_activates_a_worker(self):
         with patch.object(self.p.archive, "sync", return_value={"ready": False, "pending": 1}), patch.object(self.p, "command") as command:

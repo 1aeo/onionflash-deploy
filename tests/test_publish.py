@@ -108,6 +108,7 @@ class DeploymentTests(unittest.TestCase):
                          [("archive", "env_file"), ("archive", "shard_prefix_chars"), ("archive", "worker_timeout_ms")]
                          + [("retention", key) for key in ("batch_size", "hot_days", "interval_seconds", "max_bundle_bytes",
                                                            "receipt_hot_days", "run_budget_seconds")])
+        self.assertIn("move its credentials into the main env_file, then delete it", logs.records[0].getMessage())
         self.assertFalse(publish.RETIRED["archive"] & set(p.cfg["archive"]))
         self.assertEqual(p.cfg["retention"], {"enabled": False})
         # Any other key is a mistake that check, like every command, reports at load.

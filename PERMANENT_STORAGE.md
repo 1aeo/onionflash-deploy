@@ -51,13 +51,11 @@ access of an object that already exists.
 ## Migrate and publish
 
 Use a core version that supports permanent publication and its current deployer.
-Back up first: `./deploy.sh backup --force` below needs `spaces.enabled = true`
-and copies only SQLite, so keep a private copy of the configuration too and,
-without Spaces backups, back up the database yourself.
+Back up first, and keep a private copy of the configuration too.
 
 ```sh
 ./deploy.sh check
-./deploy.sh backup --force
+./deploy.sh backup --force   # SQLite only; needs spaces.enabled = true, otherwise back up the database yourself
 ./deploy.sh run
 ./deploy.sh status
 ```

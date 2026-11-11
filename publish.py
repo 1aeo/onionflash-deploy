@@ -183,7 +183,11 @@ class Publisher:
         self.cfg = tomllib.loads(self.config_path.read_text())
         for section, names in RETIRED.items():
             for key in sorted(names & set(self.cfg.get(section, {}))):
-                LOG.warning("Ignoring setting %s.%s: it is no longer configurable and can be deleted", section, key)
+                if (section, key) == ("archive", "env_file"):
+                    LOG.warning("Ignoring setting %s.%s: it is no longer read; move its credentials into the main env_file, then delete it",
+                                section, key)
+                else:
+                    LOG.warning("Ignoring setting %s.%s: it is no longer configurable and can be deleted", section, key)
                 del self.cfg[section][key]
         self.directory = self.config_path.parent
         load_env(self.path(self.cfg.get("env_file", "secrets.env")))
@@ -530,6 +534,7 @@ class Publisher:
                 if not previous.get("archive"):
                     self.publication_readiness(initial_archive=True)
                 manifest = self.archive.snapshot(stage, generation)
+                self.validate(stage)  # the Worker bundle meets the same budgets and feed checks as a static publication
                 articles = {path for path in manifest if ARTICLE.fullmatch(path)}
                 archive_info = {"manifest_sha256": synchronized["manifest_sha256"],
                                 "generation": generation, "origin": self.archive.cfg["public_origin"]}
