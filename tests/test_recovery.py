@@ -537,6 +537,17 @@ url = "https://example.org/feed.xml"
                 self.assertFalse((self.p.state / "backup.json").exists())
                 self.assertEqual(client.deleted, [client.uploads[0][:2]])
 
+    def test_an_exposed_backup_that_cannot_be_deleted_is_named_in_the_error(self):
+        self.seed_backup()
+        client = FakeSpaces(cleanup_error=True)
+        with patch("boto3.client", return_value=client), self.anonymous(None):
+            with self.assertRaises(ValueError) as caught:
+                self.p.backup(force=True)
+        message = str(caught.exception)
+        self.assertIn(client.uploads[0][1], message)
+        self.assertRegex(message, "publicly readable, and deleting it failed: .*cleanup unavailable")
+        self.assertFalse((self.p.state / "backup.json").exists())
+
     def test_an_explicit_backup_fails_when_spaces_backups_are_disabled(self):
         with patch("boto3.client") as client, self.assertRaisesRegex(ValueError, "Spaces backups are disabled"):
             self.p.execute("backup", force=True)

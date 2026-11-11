@@ -291,6 +291,17 @@ class ArchiveTests(unittest.TestCase):
             self.archive.sync()
         self.assertEqual(self.s3.puts, [])
 
+    def test_an_exposed_private_object_that_cannot_be_deleted_is_named_in_the_error(self):
+        path = self.root / "private.gz"
+        path.write_bytes(b"private evidence")
+        key = self.archive.private_prefix + "evidence/exposed.json.gz"
+        self.exposure = "was publicly readable"
+        def failing_delete(Bucket, Key):
+            raise RuntimeError("cleanup unavailable")
+        self.s3.delete_object = failing_delete
+        with self.assertRaisesRegex(ValueError, "exposed.json.gz was publicly readable, and deleting it failed: .*cleanup unavailable"):
+            self.archive.put_private(path, key)
+
     def test_private_archives_are_immutable_and_verified(self):
         path = self.root / "private.gz"
         path.write_bytes(b"private evidence")

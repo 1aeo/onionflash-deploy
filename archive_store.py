@@ -400,7 +400,11 @@ class ArchiveStore:
         problem = self.publisher.unsigned_read_problem(self.cfg["endpoint_url"], self.bucket, key)
         if problem:
             if old is None:  # An existing object may back earlier archive references.
-                self._call("delete_object", Key=key)
+                try:
+                    self._call("delete_object", Key=key)
+                except Exception as cleanup:  # the publisher redacts the message when it reports it
+                    raise ValueError(f"Private archive object {key} {problem}, and deleting it failed: "
+                                     f"{type(cleanup).__name__}: {cleanup}") from cleanup
             raise ValueError(f"Private archive object {key} {problem}")
         return {"key": key, "sha256": sha256, "size": size}
 

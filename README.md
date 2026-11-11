@@ -167,8 +167,10 @@ decompress it into a new private directory and check it with `PRAGMA quick_check
 Replace the database only with the scheduled job stopped and the application lock
 held, then run `./deploy.sh app build --force`, repeating it while it reports
 `articles_pending` (no LLM calls are needed), before resuming publication.
-Publication refuses a database that lacks an article the live site already
-serves; restore a newer copy instead. Keep the old database until recovery is
+Publication refuses to drop an article the live site already serves. In static
+mode it checks the files in the output directory, not the database, so before
+resuming confirm that the restored copy has the newest published stories
+(`./deploy.sh app status`). Keep the old database until recovery is
 verified. Credentials are never included in backups.
 
 ## Operations

@@ -91,6 +91,19 @@ def read_json(path, default=None):
         return default
 
 
+def credential_values(names=()):
+    """Values of credential-like environment variables, long enough to redact safely."""
+    names = {k for k in os.environ if any(x in k.upper() for x in ("TOKEN", "SECRET", "API_KEY", "SPACES_KEY"))} | set(names)
+    return [os.environ[name] for name in names if len(os.environ.get(name, "")) >= 8]
+
+
+def redact(value, names=()):
+    result = str(value)
+    for secret in credential_values(names):
+        result = result.replace(secret, "[redacted]")
+    return result[-2500:]
+
+
 def load_env(path):
     """KEY=value lines with shell-style quoting and no expansion; the existing environment wins."""
     path = Path(path)
@@ -204,10 +217,7 @@ class Publisher:
         return value
 
     def clean_error(self, value):
-        result = str(value)
-        for secret in self.secret_values():
-            result = result.replace(secret, "[redacted]")
-        return result[-2500:]
+        return redact(value, self.private_names())
 
     def private_names(self):
         """Environment variables holding credentials for Cloudflare, Spaces or the LLM."""
@@ -218,9 +228,7 @@ class Publisher:
         return names - {""}
 
     def secret_values(self):
-        names = {k for k in os.environ if any(x in k.upper() for x in ("TOKEN", "SECRET", "API_KEY", "SPACES_KEY"))}
-        names |= self.private_names()
-        return [os.environ[name] for name in names if len(os.environ.get(name, "")) >= 8]
+        return credential_values(self.private_names())
 
     def delay(self, attempt):
         """Storage retries have their own bounded backoff, independent of collection."""
@@ -706,8 +714,12 @@ class Publisher:
                 raise
         problem = self.unsigned_read_problem(cfg["endpoint_url"], cfg["bucket"], key)
         if problem:
-            client.delete_object(Bucket=cfg["bucket"], Key=key)
-            raise ValueError("The new backup " + problem + "; it has been deleted")
+            try:
+                client.delete_object(Bucket=cfg["bucket"], Key=key)
+            except Exception as cleanup:
+                raise ValueError(f"The new backup {key} {problem}, and deleting it failed: "
+                                 f"{self.clean_error(cleanup)}") from cleanup
+            raise ValueError(f"The new backup {key} {problem}; it has been deleted")
         cutoff = datetime.now(timezone.utc) - timedelta(days=cfg["retention_days"])
         pattern = re.escape(prefix) + r"\d{8}T\d{6}Z(?:(?:-[0-9a-f]{8})?\.sqlite3\.gz|-[0-9a-f]{12}(?:-[0-9a-f]{32})?\.tar\.gz)"
         for page in client.get_paginator("list_objects_v2").paginate(Bucket=cfg["bucket"], Prefix=prefix):
@@ -888,7 +900,7 @@ def main():
         LOG.error("Another Onion Flash deployment is running; command not performed; retry after completion")
         return 75
     except Exception as exc:
-        LOG.error("%s", publisher.clean_error(exc) if publisher else type(exc).__name__ + ": " + str(exc))
+        LOG.error("%s", publisher.clean_error(exc) if publisher else redact(f"{type(exc).__name__}: {exc}"))
         return 1
     finally:
         if publisher is not None:
