@@ -99,7 +99,8 @@ class ReviewRetentionTests(unittest.TestCase):
             publisher = SimpleNamespace(state=state, database=database, public=root / "public",
                 cfg={"retention": {"enabled": True}, "archive": {**archive, "enabled": True,
                      "endpoint_url": "https://s3.example.org", "public_origin": "https://archive.example.org/onionflash/public/"}},
-                net={"attempts": 2, "timeout_seconds": 10}, delay=lambda attempt: None)
+                net={"attempts": 2, "timeout_seconds": 10}, delay=lambda attempt: None,
+                unsigned_read_problem=lambda *request: None)
             storage = FakeSpaces()
             retained = RetentionStore(publisher, storage).archive_evidence(datetime(2026, 11, 10, 12, tzinfo=timezone.utc))
             self.assertEqual(retained["analyses_evicted"], 1)

@@ -1,10 +1,11 @@
 """Cross-layer checks for permanent storage and guarded Worker activation."""
 import copy
-from contextlib import nullcontext
+from contextlib import closing, nullcontext
 import json
 import os
 from pathlib import Path
 import shutil
+import sqlite3
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -14,7 +15,7 @@ import publish
 from archive_store import ArchiveStore, HOT_FILES
 from onionflash.cli import build
 from onionflash.config import DEFAULTS
-from onionflash.store import Store
+from onionflash.store import Store, backup_database
 from test_archive_store import FakeS3
 from test_recovery import OLD, NEW
 
@@ -41,6 +42,17 @@ class PermanentPublicationTests(unittest.TestCase):
         self.app_config = cfg
         with Store(self.p.database) as store:
             build(cfg, store)
+
+    def add_stories(self, *identities):
+        with Store(self.p.database) as store:
+            for identity in identities:
+                story = {"id": identity, "title": "Earlier story", "summary": "An earlier published report.",
+                    "why_it_matters": "", "category": "network", "priority": "normal", "confidence": "reported",
+                    "state": "developing", "tags": ["network"], "sources": [{"url": "https://example.org/report"}],
+                    "published_at": "2025-01-01T00:00:00Z", "updated_at": "2025-01-01T00:00:00Z"}
+                store.db.execute("INSERT INTO stories(id,cluster_key,payload,published_at,updated_at) VALUES(?,?,?,?,?)", (story["id"], story["id"], json.dumps(story), story["published_at"], story["updated_at"]))
+            store.db.commit()
+            build(self.app_config, store)
 
     def test_only_hot_files_enter_cloudflare_and_worker_paths_are_scoped(self):
         result = self.p.archive.sync()
@@ -79,9 +91,32 @@ class PermanentPublicationTests(unittest.TestCase):
     def test_migration_preserves_previously_published_article_paths(self):
         publish.atomic_json(self.p.state / "publication.json", {"version_id": OLD, "manifest": {"news/legacy/index.html": "f" * 64}})
         with patch.object(self.p, "command") as command:
-            with self.assertRaisesRegex(ValueError, "not been verified"):
+            with self.assertRaisesRegex(ValueError, "previously published article"):
                 self.p.publish()
         command.assert_not_called()
+
+    def test_a_restored_older_database_cannot_drop_a_published_permalink(self):
+        self.add_stories("alpha")
+        older = self.root / "older.sqlite3"
+        backup_database(self.p.database, older)
+        self.add_stories("bravo")
+        publish.atomic_json(self.p.state / "publication.json", {"version_id": OLD, "manifest": {}})
+        def upload(arguments, metadata):
+            metadata.write_text(json.dumps({"type": "version-upload", "version_id": NEW,
+                                            "preview_url": "https://candidate.example.workers.dev"}))
+        live = lambda: publish.read_json(self.p.state / "publication.json")["version_id"]
+        with patch.object(self.p, "current_version", side_effect=live), patch.object(self.p, "command", side_effect=upload) as command, \
+                patch.object(self.p, "api", return_value={"subdomain": "example"}), patch.object(self.p, "verify"), \
+                patch.object(self.p, "app_version", return_value="test"), patch.object(self.p, "activate"):
+            self.assertEqual(self.p.publish()["articles"], ["news/alpha/index.html", "news/bravo/index.html"])
+            # The documented recovery: restore the older backup, then rebuild from it.
+            with closing(sqlite3.connect(older)) as source, closing(sqlite3.connect(self.p.database)) as target:
+                source.backup(target)
+            with Store(self.p.database) as store:
+                build(self.app_config, store, force=True)
+            with self.assertRaisesRegex(ValueError, "previously published article"):
+                self.p.publish()
+        self.assertEqual(command.call_count, 1)  # nothing was uploaded after the restore
 
     def test_initial_migration_waits_for_the_bounded_article_backfill(self):
         with Store(self.p.database) as store:
@@ -104,15 +139,7 @@ class PermanentPublicationTests(unittest.TestCase):
         command.assert_not_called()
 
     def test_existing_spaces_copies_remain_ready_during_local_reconstruction(self):
-        with Store(self.p.database) as store:
-            for number in range(3):
-                story = {"id": f"r{number}", "title": "Earlier story", "summary": "An earlier published report.",
-                    "why_it_matters": "", "category": "network", "priority": "normal", "confidence": "reported",
-                    "state": "developing", "tags": ["network"], "sources": [{"url": "https://example.org/report"}],
-                    "published_at": "2025-01-01T00:00:00Z", "updated_at": "2025-01-01T00:00:00Z"}
-                store.db.execute("INSERT INTO stories(id,cluster_key,payload,published_at,updated_at) VALUES(?,?,?,?,?)", (story["id"], story["id"], json.dumps(story), story["published_at"], story["updated_at"]))
-            store.db.commit()
-            build(self.app_config, store)
+        self.add_stories("r0", "r1", "r2")
         self.p.publication_readiness(self.p.validate(self.p.public))
         original = self.p.archive.sync()
         key = "news/r2/index.html"

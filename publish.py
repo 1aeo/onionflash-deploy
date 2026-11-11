@@ -36,6 +36,7 @@ API_BASE = "https://api.cloudflare.com/client/v4"
 MAX_FILES, MAX_FILE_BYTES, MAX_TOTAL_BYTES = 10000, 10 * 1024 * 1024, 100 * 1024 * 1024
 COMMAND_TIMEOUT_SECONDS = 240
 VERIFY_PATHS = ("index.html", "feed.xml", "feed.json")
+ARTICLE = re.compile(r"news/[A-Za-z0-9_-]{1,64}/index\.html")
 # The publisher's own requests and storage clients. Responses may be as large as
 # any validated file, so verification can always read a file back.
 NETWORK = {"timeout_seconds": 30, "attempts": 4, "backoff_seconds": 2, "backoff_cap_seconds": 30,
@@ -246,6 +247,17 @@ class Publisher:
     def request(self, url, method="GET", data=None, token=None):
         return self.response(url, method, data, token).body
 
+    def unsigned_read_problem(self, endpoint, bucket, key):
+        """An anonymous request is the real exposure path of a private object; only a
+        403 proves it private, whatever ACLs or bucket policies say."""
+        try:
+            self.request(endpoint.rstrip("/") + "/" + bucket + "/" + quote(key), "HEAD")
+            return "was publicly readable"
+        except HTTPError as exc:
+            return None if exc.code == 403 else f"got the unexpected anonymous response {exc.code}"
+        except OSError as exc:  # URLError, timeouts
+            return f"could not be checked for privacy ({type(exc).__name__})"
+
     @property
     def archive(self):
         if not self.cfg.get("archive", {}).get("enabled", False):
@@ -391,9 +403,9 @@ class Publisher:
                 try:
                     url = base_url.rstrip("/") + "/" + relative
                     if archive and relative not in HOT_FILES:
-                        # Immutable objects were read back and hashed before activation.
-                        # Verify the Worker's version-bound mapping without buffering
-                        # an ever-growing full-history feed into memory again.
+                        # Storage checked each upload's Content-MD5. Verify the Worker's
+                        # version-bound mapping without buffering an ever-growing
+                        # full-history feed into memory.
                         response = self.response(url, method="HEAD")
                         actual = response.headers.get("etag", "").removeprefix("W/").strip('"')
                     else:
@@ -503,13 +515,11 @@ class Publisher:
                 generation = synchronized["generation"]
                 if not previous.get("archive"):
                     self.publication_readiness(initial_archive=True)
-                    legacy_articles = [path for path in previous.get("manifest", {})
-                                       if re.fullmatch(r"news/[A-Za-z0-9_-]{1,64}/index\.html", path)]
-                    self.archive.manifest(legacy_articles, generation)
                 hot_manifest = self.archive.snapshot_hot(stage, generation)
                 if self.validate(stage, hot_only=True) != hot_manifest:
                     raise ValueError("Hot asset snapshot changed")
                 manifest = {**hot_manifest, **self.archive.manifest(VERIFY_PATHS, generation)}
+                articles = self.archive.articles(generation)
                 archive_info = {"manifest_sha256": synchronized["manifest_sha256"],
                                 "generation": generation, "origin": self.archive.cfg["public_origin"]}
             else:
@@ -518,9 +528,13 @@ class Publisher:
                                     ignore=lambda directory, names: {"app.js"} if Path(directory) == self.public else set())
                 manifest = self.validate(stage)
                 self.publication_readiness(manifest)
-                if any(re.fullmatch(r"news/[A-Za-z0-9_-]{1,64}/index\.html", path) and path not in manifest
-                       for path in previous.get("manifest", {})):
-                    raise ValueError("A previously published article is missing from the local snapshot")
+                articles = {path for path in manifest if ARTICLE.fullmatch(path)}
+            # Never drop a permalink the live publication serves, as a restored older
+            # database would. Static receipts list articles in their manifest.
+            published = [*previous.get("manifest", {}), *previous.get("articles", [])]
+            if {path for path in published if ARTICLE.fullmatch(path)} - articles:
+                raise ValueError("A previously published article is missing from this publication; "
+                                 "restore a database that contains it")
             identity = self.publication_identity(manifest, archive_info)
             before = self.current_version()
             if before != previous.get("version_id"):
@@ -590,7 +604,7 @@ class Publisher:
                        "content_hash": identity, "manifest": manifest,
                        "published_at": datetime.now(timezone.utc).isoformat(), **provenance}
             if archive_info:
-                receipt["archive"] = archive_info
+                receipt.update(archive=archive_info, articles=sorted(articles))
             atomic_json(self.state / "receipts" / (version + ".json"), receipt)
             atomic_json(self.state / "publication.json", receipt)
             LOG.info("Published version %s (%s files) at %s", version, len(manifest), live)
@@ -690,18 +704,10 @@ class Publisher:
                     raise RuntimeError(f"Backup upload failed and {key} could not be removed: "
                                        f"{self.clean_error(failure)}; {self.clean_error(cleanup)}") from failure
                 raise
-        # An anonymous request is the real exposure path; it must be refused,
-        # whatever ACLs or bucket policies say. Anything but a 403 removes the object.
-        try:
-            self.request(cfg["endpoint_url"].rstrip("/") + "/" + cfg["bucket"] + "/" + quote(key), "HEAD")
-            problem = "The new backup was publicly readable"
-        except HTTPError as exc:
-            problem = None if exc.code == 403 else f"Unexpected anonymous response {exc.code} for the new backup"
-        except OSError as exc:  # URLError, timeouts
-            problem = f"The new backup's privacy could not be checked ({type(exc).__name__})"
+        problem = self.unsigned_read_problem(cfg["endpoint_url"], cfg["bucket"], key)
         if problem:
             client.delete_object(Bucket=cfg["bucket"], Key=key)
-            raise ValueError(problem + "; it has been deleted")
+            raise ValueError("The new backup " + problem + "; it has been deleted")
         cutoff = datetime.now(timezone.utc) - timedelta(days=cfg["retention_days"])
         pattern = re.escape(prefix) + r"\d{8}T\d{6}Z(?:(?:-[0-9a-f]{8})?\.sqlite3\.gz|-[0-9a-f]{12}(?:-[0-9a-f]{32})?\.tar\.gz)"
         for page in client.get_paginator("list_objects_v2").paginate(Bucket=cfg["bucket"], Prefix=prefix):
@@ -815,6 +821,7 @@ class Publisher:
             data = read_json(self.state / name)
             if data is not None:
                 data.pop("manifest", None)
+                data.pop("articles", None)
                 report[name] = data
         print(json.dumps(report, indent=2))
 
@@ -829,6 +836,9 @@ class Publisher:
                 self.archive  # Validate storage settings and credential presence without network calls.
             print("Application and deployment configuration valid")
         elif command == "backup":
+            # Scheduled runs skip disabled backups; an explicit request must not look done.
+            if not self.cfg.get("spaces", {}).get("enabled"):
+                raise ValueError("Spaces backups are disabled; set spaces.enabled = true or copy the database yourself")
             self.backup(force=force)
         elif command == "retention":
             self.retain_private_history()

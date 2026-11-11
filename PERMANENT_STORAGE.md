@@ -13,11 +13,6 @@ same historical objects rather than reading files overwritten by a later run.
 The Worker routes only known public article, pagination, topic and feed paths. It never
 receives Spaces credentials or exposes the private prefix. Browser URLs such as
 `https://example.com/onionflash/news/<id>/` do not change.
-Topic HTML is available at `/topics/<schema-topic>/` and its numbered `/page/N/`
-routes, while `/tags/<schema-topic>.xml` retains the topic RSS feed. Only configured
-schema topics are routed to permanent storage; other paths cannot select objects
-or private evidence. Canonical redirects preserve query strings, and GET/HEAD
-retain the existing immutable-cache behavior.
 
 ## Set up a bucket
 
@@ -52,16 +47,21 @@ secret_key_env = "ONIONFLASH_ARCHIVE_SECRET"
 
 Only verified published objects and routing manifests receive a public-read
 object ACL. Raw source bodies, model evidence, database backups and operational
-receipts remain private. The publisher checks object hashes, sizes and ACLs;
-unknown or corrupt objects stop publication rather than being overwritten.
+receipts remain private: an unsigned request for any such object must be refused
+(see [backups](README.md#digitalocean-spaces)). Storage checks every
+upload against its Content-MD5, and an object that already exists must match its
+size, sha256 metadata and ETag; unknown or corrupt objects stop publication
+rather than being overwritten.
 
 ## Migrate and publish
 
 Use a core version that supports permanent publication and its current deployer.
-Back up SQLite and configuration first. In the application config, set
-`site.feed_size = 0`, keep `site.page_size` as the desired page length and remove
-the retired `storage.max_stories` setting. `storage.render_batch_size` defaults
-to 250 and controls work per build, not retention.
+Back up first: `./deploy.sh backup --force` below needs `spaces.enabled = true`
+and copies only SQLite, so keep a private copy of the configuration too and,
+without Spaces backups, back up the database yourself. In the application config,
+set `site.feed_size = 0`, keep `site.page_size` as the desired page length and
+remove the retired `storage.max_stories` setting. `storage.render_batch_size`
+defaults to 250 and controls work per build, not retention.
 
 ```sh
 ./deploy.sh check
@@ -89,8 +89,8 @@ New root manifests and Cloudflare hot snapshots omit the retired `app.js` mappin
 Old content-addressed objects, manifests and per-version receipts are preserved,
 so rolling back an existing Worker version still selects its original contents.
 Obsolete history/topic pagination can leave a new manifest; article permalinks
-are retained. HTML uses `script-src 'none'` and `connect-src 'none'`; RSS keeps
-its existing inline-style allowance for feed rendering.
+are retained. RSS responses allow inline styles for the browser's feed viewer;
+scripts stay disabled.
 
 On ordinary runs, only changed objects and affected manifest shards upload.
 Unchanged articles are reused. Feeds are streamed with bounded memory. A hot-only
@@ -102,13 +102,14 @@ Publication, rollback and recovery work as described in the
 
 ## Private evidence and receipt retention
 
-Optional `[retention]` defaults keep 90 days of source bodies/analysis cache and
-30 days of publication receipts locally. Completed sweeps run daily; full
+Optional `[retention]` defaults keep 90 days of analysis cache and of the source
+bodies of published or ignored items, and 30 days of publication receipts,
+locally; other items keep their source bodies. Completed sweeps run daily; full
 batches continue on subsequent scheduled runs until the backlog drains.
 Enable it only after `[archive]` is
-working. The job first writes a compressed private bundle and verifies its bytes
-and private ACL. It then conditionally compacts unchanged completed rows/files.
-Pending items and concurrent edits are preserved. Source items and historical
+working. The job first writes a compressed private bundle, reads it back and
+checks its privacy as above. It then compacts only rows and files that have not
+changed meanwhile, so concurrent edits are preserved. Source items and historical
 analysis snapshots referenced by unfinished final-review jobs are pinned in hot
 storage, including jobs awaiting operator action. Pins are checked again under
 the compaction transaction after remote storage I/O, so a new review cannot lose
@@ -133,13 +134,12 @@ objects and article history have no automatic expiry.
 ```
 
 Routine private backups contain only a gzip-compressed SQLite snapshot, including
-the permanent publication catalog and last-good public story JSON. An unsigned
-request must confirm the backup object is private. They do not repeatedly copy
-generated pages or the public object archive. Keep deployment configuration and
-publication receipts securely alongside the separately managed credentials. A
-database restore can rebuild article files from the last-good public snapshots
-with `onionflash build --config onionflash.toml --force`; repeat while the bounded
-rebuild reports `articles_pending`. No LLM calls are required for reconstruction.
+the permanent publication catalog and last-good public story JSON. They do not
+repeatedly copy generated pages or the public object archive. Keep deployment
+configuration and publication receipts securely alongside the separately managed
+credentials. After a database restore, article files are rebuilt from the
+last-good public snapshots, as the README's [recovery](README.md#digitalocean-spaces)
+steps describe.
 
 ## Limits and failures
 
@@ -149,6 +149,5 @@ increase `shard_prefix_chars` within its supported range and prepare a new
 manifest; older roots remain available. `archive-sync.json`, `retention.json`,
 the normal run receipt and system logs expose incomplete or failed work.
 
-RSS responses disable scripts while allowing the browser XML viewer's inline
-styling. HTML keeps the application's existing CSP. The canonical browser cache
-TTL is short; immutable origin objects and manifests can be cached for much longer.
+The canonical browser cache TTL is short; immutable origin objects and manifests
+can be cached for much longer.

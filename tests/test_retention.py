@@ -62,6 +62,9 @@ class FakeSpaces:
             body = b"x" + body[1:]
         return {"Body": io.BytesIO(body)}
 
+    def delete_object(self, *, Bucket, Key):
+        del self.objects[Bucket, Key]
+
 
 class RetentionTests(unittest.TestCase):
     def setUp(self):
@@ -71,12 +74,14 @@ class RetentionTests(unittest.TestCase):
         state = self.root / "state"
         state.mkdir()
         archive = tomllib.loads((Path(__file__).parents[1] / "deployment.example.toml").read_text())["archive"]
+        self.exposure = None  # what an unsigned request for a private object finds
         self.publisher = SimpleNamespace(
             state=state, database=state / "news.sqlite3", public=self.root / "public",
             cfg={"retention": {"enabled": True}, "archive": {
                 **archive, "enabled": True, "endpoint_url": "https://s3.example.org",
                 "public_origin": "https://archive.example.org/onionflash/public/",
             }}, net={"attempts": 2, "timeout_seconds": 10}, delay=lambda attempt: None,
+            unsigned_read_problem=lambda *request: self.exposure,
         )
         with self.db() as db:
             db.executescript("""
@@ -193,6 +198,23 @@ class RetentionTests(unittest.TestCase):
                 self.assertEqual(self.rows("items"), before_items)
                 self.assertEqual(self.rows("analyses"), before_analyses)
                 self.assertEqual(self.rows("private_archive_refs"), [])
+
+    def test_bundle_readable_without_credentials_is_removed_and_nothing_is_compacted(self):
+        # For example under a bucket policy: the object ACL still lists only the owner.
+        self.exposure = "was publicly readable"
+        self.item()
+        self.analysis()
+        self.current()
+        receipt, _ = self.receipt(VERSIONS[1])
+        before = self.rows("items"), self.rows("analyses")
+        client = FakeSpaces()
+        for archive in (self.engine(client).archive_evidence, self.engine(client).archive_receipts):
+            with self.assertRaisesRegex(ValueError, "publicly readable"):
+                archive(NOW)
+        self.assertEqual((self.rows("items"), self.rows("analyses")), before)
+        self.assertEqual(self.rows("private_archive_refs"), [])
+        self.assertTrue(receipt.exists())
+        self.assertEqual((len(client.puts), client.objects), (2, {}))
 
     def test_active_review_pins_items_and_historical_analyses_without_starving_other_records(self):
         self.item()

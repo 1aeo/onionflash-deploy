@@ -140,6 +140,17 @@ url = "https://example.org/feed.xml"
         preserved = publish.read_json(self.p.state / "receipts" / (OLD + ".json"))
         self.assertEqual(preserved["manifest"]["app.js"], "a" * 64)
 
+    def test_publication_never_drops_an_article_the_live_receipt_lists(self):
+        self.seed_public()
+        self.fake_cloudflare(OLD)
+        gone = "news/gone/index.html"
+        for previous in ({**receipt(OLD), "manifest": {gone: "a" * 64}}, {**receipt(OLD), "articles": [gone]}):
+            with self.subTest(previous=previous):  # a static or a permanent-storage receipt
+                publish.atomic_json(self.p.state / "publication.json", previous)
+                with self.assertRaisesRegex(ValueError, "previously published article"):
+                    self.p.publish()
+                self.assertEqual(self.calls, [])
+
     def test_failed_live_check_rolls_back_and_fails_without_holding(self):
         self.seed_public()
         publish.atomic_json(self.p.state / "publication.json", receipt(OLD))
@@ -516,7 +527,7 @@ url = "https://example.org/feed.xml"
 
     def test_a_backup_not_proven_private_is_deleted_and_fails(self):
         self.seed_backup()
-        for code, message in [(None, "publicly readable"), (404, "Unexpected anonymous response 404"),
+        for code, message in [(None, "publicly readable"), (404, "unexpected anonymous response 404"),
                               (URLError("reset"), "could not be checked")]:
             with self.subTest(code=code):
                 client = FakeSpaces()
@@ -525,6 +536,11 @@ url = "https://example.org/feed.xml"
                         self.p.backup(force=True)
                 self.assertFalse((self.p.state / "backup.json").exists())
                 self.assertEqual(client.deleted, [client.uploads[0][:2]])
+
+    def test_an_explicit_backup_fails_when_spaces_backups_are_disabled(self):
+        with patch("boto3.client") as client, self.assertRaisesRegex(ValueError, "Spaces backups are disabled"):
+            self.p.execute("backup", force=True)
+        client.assert_not_called()
 
     def test_an_ambiguous_upload_failure_removes_the_object(self):
         self.seed_backup()

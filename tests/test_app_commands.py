@@ -104,9 +104,10 @@ url = "https://example.org/feed.xml"
 
     def test_protected_dotenv_permissions_remain_required(self):
         (self.directory / "secrets.env").chmod(0o644)
-        with patch("onionflash.cli.main") as invoke, redirect_stderr(io.StringIO()):
+        with patch("onionflash.cli.main") as invoke, redirect_stderr(io.StringIO()) as error:
             self.assertEqual(self.run_app("status"), 1)
         invoke.assert_not_called()
+        self.assertIn("mode 600", error.getvalue())  # the operator learns what to fix
 
     def test_busy_mutations_return_75_without_invocation_but_inspection_remains_available(self):
         mutations = [("build",), *(('story', action) for action in ("correct", "retract", "restore", "unlock")),

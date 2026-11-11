@@ -33,10 +33,11 @@ cd onionflash-deploy
 
 Edit the three generated files (all ignored by Git):
 
-1. **`onionflash.toml`**: website URL, sources, LLM endpoint/model, limits, retries,
-   fallback URLs, and SQLite/output paths. For a LAN LLM, explicitly allow its
-   exact addresses in `llm.allowed_networks` and set `allow_http = true` only if
-   that endpoint uses HTTP. Source fetching remains restricted to public HTTPS.
+1. **`onionflash.toml`**: website URL, sources, LLM endpoint/model and timeout,
+   per-run limits, fallback URLs, and SQLite/output paths. For a LAN LLM,
+   explicitly allow its exact addresses in `llm.allowed_networks` and set
+   `allow_http = true` only if that endpoint uses HTTP. Source fetching remains
+   restricted to public HTTPS.
 2. **`secrets.env`**: LLM key, `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN`
    (plus `CLOUDFLARE_ZONE_TOKEN`/`CLOUDFLARE_ZONE_ID` for `routes`), and optionally
    `DO_SPACES_KEY`/`DO_SPACES_SECRET`. Keep mode **600**. `KEY=value` lines use shell-style quoting (a `#` inside a value is
@@ -56,8 +57,10 @@ Edit the three generated files (all ignored by Git):
 ```
 
 The first run may publish only some stories while its durable analysis queue is
-processed. Each later run continues the queue. Processing limits and the run time
-budget are configurable. `run` does not attach hostname routes; inspect the initial
+processed. Each later run continues the queue; `llm.max_items_per_run` sets how
+many items one run analyzes, and the run time budget is fixed (see the
+application's [configuration](https://github.com/1aeo/onionflash#configuration)).
+`run` does not attach hostname routes; inspect the initial
 publication first at the Worker's `workers.dev` origin (`https://<worker_name>.<account
 subdomain>.workers.dev` plus the site's base path).
 
@@ -146,7 +149,7 @@ create the bucket privately first.
 ```
 
 A backup is a gzip-compressed SQLite snapshot taken under the application's
-database lock; the public site is rebuilt from it with `onionflash build`. Each
+database lock; recovery (below) rebuilds the public site from it. Each
 object is uploaded with a **private ACL**, then an unsigned request for it must be
 refused with 403. That checks the actual exposure path, whatever ACLs or bucket
 policies say; a publicly readable object is deleted and the backup fails.
@@ -162,9 +165,11 @@ not advance the interval marker and is retried on a later run.
 For recovery, hold publication, download a selected object with an S3 client,
 decompress it into a new private directory and check it with `PRAGMA quick_check`.
 Replace the database only with the scheduled job stopped and the application lock
-held, then run the application's offline `build` before resuming publication.
-Keep the old database until recovery is verified. Credentials are never included
-in backups.
+held, then run `./deploy.sh app build --force`, repeating it while it reports
+`articles_pending` (no LLM calls are needed), before resuming publication.
+Publication refuses a database that lacks an article the live site already
+serves; restore a newer copy instead. Keep the old database until recovery is
+verified. Credentials are never included in backups.
 
 ## Operations
 
@@ -239,10 +244,8 @@ deployment scripts.
 
 ## Tests
 
-```sh
-python3 -m unittest discover -s tests -v
-node --test tests/test_worker.mjs
-```
+To run the Python and Node suites that CI runs, use the commands in
+[AGENTS.md](AGENTS.md#code).
 
 The deployment tests exercise publication boundaries, credential handling,
 verification retries, rollback after a failed check, partial route failure,
