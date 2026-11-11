@@ -43,15 +43,25 @@ NETWORK = {"timeout_seconds": 30, "attempts": 4, "backoff_seconds": 2, "backoff_
 ACCOUNT_ID, API_TOKEN, ZONE_TOKEN, ZONE_ID = ("CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_API_TOKEN",
                                               "CLOUDFLARE_ZONE_TOKEN", "CLOUDFLARE_ZONE_ID")
 SPACES_KEY, SPACES_SECRET = "DO_SPACES_KEY", "DO_SPACES_SECRET"
+# Settings that became constants. An older deployment.toml may still set them.
+RETIRED = {"archive": {"env_file", "max_uploads_per_run", "max_upload_bytes_per_run", "max_object_bytes",
+                       "max_manifest_bytes", "shard_prefix_chars", "sync_budget_seconds", "cache_ttl_seconds",
+                       "immutable_cache_ttl_seconds", "worker_timeout_ms", "worker_retry_attempts",
+                       "worker_backoff_ms", "worker_backoff_cap_ms"}}
+
+
 def public_files():
-    """Fixed files the application renders (story pages and topic feeds vary)."""
+    """Fixed files the application renders (story, listing and topic paths vary)."""
     from onionflash.render import ASSET_FILES
     return {"index.html", "feed.xml", "feed.json", "_headers", *ASSET_FILES}
 
 
 def public_path_allowed(relative):
-    from archive_store import archive_path_allowed
-    return relative in public_files() or archive_path_allowed(relative)
+    from onionflash.schema import CATEGORIES
+    topic = "|".join(map(re.escape, CATEGORIES))
+    return relative in public_files() or bool(re.fullmatch(
+        r"news/[A-Za-z0-9_-]{1,64}/(?:index\.html|story\.json)|tags/(?:" + topic + r")\.xml"
+        r"|(?:topics/(?:" + topic + r")/)?(?:page/[1-9][0-9]{0,8}/)?index\.html", relative))
 
 
 def atomic_json(path, value):
@@ -169,11 +179,12 @@ class Publisher:
     def __init__(self, config_path):
         self.config_path = Path(config_path).resolve()
         self.cfg = tomllib.loads(self.config_path.read_text())
+        for section, names in RETIRED.items():
+            for key in sorted(names & set(self.cfg.get(section, {}))):
+                LOG.warning("Ignoring setting %s.%s: it is no longer configurable and can be deleted", section, key)
+                del self.cfg[section][key]
         self.directory = self.config_path.parent
         load_env(self.path(self.cfg.get("env_file", "secrets.env")))
-        archive_env = self.cfg.get("archive", {}).get("env_file")
-        if archive_env:
-            load_env(self.path(archive_env))
         for section in ("archive", "retention"):
             if type(self.cfg.get(section, {}).get("enabled", False)) is not bool:
                 raise ValueError(section + ".enabled must be a boolean")
@@ -240,8 +251,8 @@ class Publisher:
                     + random.uniform(0, self.net["jitter_seconds"]))
         time.sleep(delay)
 
-    def response(self, url, method="GET", data=None, token=None):
-        """One bounded urllib request; HEAD exposes metadata without reading a body."""
+    def request(self, url, method="GET", data=None, token=None):
+        """One bounded urllib request; HEAD reads no body."""
         headers = {"User-Agent": "OnionFlashPublisher", "Accept-Encoding": "identity"}
         if data is not None:
             headers["Content-Type"] = "application/json"
@@ -250,13 +261,9 @@ class Publisher:
             request.add_unredirected_header("Authorization", "Bearer " + token)
         with urlopen(request, timeout=self.net["timeout_seconds"]) as response:
             body = b"" if method.upper() == "HEAD" else response.read(self.net["max_response_bytes"] + 1)
-            received = {key.lower(): value for key, value in response.headers.items()}
         if len(body) > self.net["max_response_bytes"]:
             raise ValueError("Response exceeds the size limit: " + url)
-        return body, received
-
-    def request(self, url, method="GET", data=None, token=None):
-        return self.response(url, method, data, token)[0]
+        return body
 
     def unsigned_read_problem(self, url, public=False):
         """An anonymous request is the real access path: only a 403 proves an object private,
@@ -357,9 +364,6 @@ class Publisher:
                   "assets": {"directory": str(directory), "binding": "ASSETS",
                              "html_handling": "auto-trailing-slash", "not_found_handling": "none"},
                   "vars": self.worker_vars(archive)}
-        if archive:
-            config["assets"]["run_worker_first"] = [self.base_path + path for path in (
-                "/news/*", "/page/*", "/topics/*", "/feed.xml", "/feed.json", "/tags/*")]
         target = self.state / "wrangler.json"
         atomic_json(target, config)
         return target
@@ -397,9 +401,6 @@ class Publisher:
             body = path.read_bytes()
             if any(secret in body for secret in secrets):
                 raise ValueError("Credential detected in public output")
-            if relative.endswith(".html"):
-                from public_html import validate_static_html
-                validate_static_html(path)
             files[relative] = hashlib.sha256(body).hexdigest()
         if len(files) > MAX_FILES:
             raise ValueError("Public output exceeds file count budget")
@@ -413,19 +414,14 @@ class Publisher:
         return files
 
     def verify(self, base_url, manifest, *, archive=None):
-        from archive_store import HOT_FILES
-        for relative in VERIFY_PATHS:
+        paths = list(VERIFY_PATHS)
+        if archive:  # One article also proves the Worker's route to permanent storage.
+            paths += sorted(path for path in manifest if ARTICLE.fullmatch(path))[:1]
+        for relative in paths:
             # Newly activated assets may take a short time to reach the edge.
             for attempt in range(self.net["attempts"]):
                 try:
-                    url = base_url.rstrip("/") + "/" + relative
-                    if archive and relative not in HOT_FILES:
-                        # Storage checked each upload's Content-MD5. Verify the Worker's
-                        # version-bound mapping without buffering an ever-growing
-                        # full-history feed into memory.
-                        actual = self.response(url, method="HEAD")[1].get("etag", "").removeprefix("W/").strip('"')
-                    else:
-                        actual = hashlib.sha256(self.request(url)).hexdigest()
+                    actual = hashlib.sha256(self.request(base_url.rstrip("/") + "/" + relative)).hexdigest()
                     if actual != manifest[relative]:
                         raise ValueError("Published hash mismatch: " + relative)
                     break
@@ -529,10 +525,8 @@ class Publisher:
                 generation = synchronized["generation"]
                 if not previous.get("archive"):
                     self.publication_readiness(initial_archive=True)
-                # snapshot_hot checks each hot file's ledger hash, credentials and HTML.
-                manifest = {**self.archive.snapshot_hot(stage, generation),
-                            **self.archive.manifest(("feed.xml", "feed.json"), generation)}
-                articles = self.archive.articles(generation)
+                manifest = self.archive.snapshot(stage, generation)
+                articles = {path for path in manifest if ARTICLE.fullmatch(path)}
                 archive_info = {"manifest_sha256": synchronized["manifest_sha256"],
                                 "generation": generation, "origin": self.archive.cfg["public_origin"]}
             else:
@@ -545,8 +539,9 @@ class Publisher:
                     ledger = self.publication_readiness(manifest)
                 # The database's ledger decides, so a page left behind by a newer database does not count.
                 articles = {path for path in ledger if ARTICLE.fullmatch(path)}
-            # Never drop a permalink the live publication serves, as a restored older
-            # database would. Static receipts list articles in their manifest.
+            # Never drop a permalink the live publication serves, as a restored older database
+            # would. Receipts list articles in their manifest; earlier permanent-storage ones
+            # listed them apart.
             published = [*previous.get("manifest", {}), *previous.get("articles", [])]
             if {path for path in published if ARTICLE.fullmatch(path)} - articles:
                 raise ValueError("A previously published article is missing from this publication; "
@@ -618,7 +613,7 @@ class Publisher:
                        "content_hash": identity, "manifest": manifest,
                        "published_at": datetime.now(timezone.utc).isoformat(), **provenance}
             if archive_info:
-                receipt.update(archive=archive_info, articles=sorted(articles))
+                receipt["archive"] = archive_info
             atomic_json(self.state / "receipts" / (version + ".json"), receipt)
             atomic_json(self.state / "publication.json", receipt)
             if not archive_info:  # Static receipts list every file; rollback needs only the previous one.

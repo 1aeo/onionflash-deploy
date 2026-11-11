@@ -94,27 +94,13 @@ url = "https://example.org/feed.xml"
             self.publisher.validate(public)
 
     def test_invalid_story_and_topic_paths_not_publishable(self):
-        self.assertFalse(publish.public_path_allowed("news/../secret/index.html"))
-        self.assertFalse(publish.public_path_allowed("tags/private.xml"))
-        self.assertTrue(publish.public_path_allowed("news/abc_123/index.html"))
-        self.assertTrue(publish.public_path_allowed("tags/security.xml"))
-        self.assertFalse(publish.public_path_allowed("app.js"))
-
-    def test_public_html_cannot_reintroduce_browser_javascript(self):
-        public = self.public_tree()
-        for html in ['<script src="app.js"></script>', '<ScRiPt>alert(1)</ScRiPt>',
-                     '<p onClick="alert(1)">hello</p>', '<a href="java&#x73;cript:alert(1)">link</a>']:
-            with self.subTest(html=html):
-                (public / "index.html").write_text(html)
-                with self.assertRaisesRegex(ValueError, "browser|JavaScript"):
-                    self.publisher.validate(public)
-        (public / "index.html").write_text('<details><summary>Menu</summary><a href="topics/security/">Security</a></details>')
-        self.assertIn("index.html", self.publisher.validate(public))
-
-    def test_literal_script_scheme_in_news_metadata_is_not_an_executable_url(self):
-        public = self.public_tree()
-        (public / "index.html").write_text('<meta name="description" content="javascript: URLs are the subject of this security report"><p title="JavaScript: disabled">News</p>')
-        self.assertIn("index.html", self.publisher.validate(public))
+        for path in ["news/abc_123/index.html", "news/abc_123/story.json", "page/2/index.html", "tags/security.xml",
+                     "topics/security/index.html", "topics/security/page/2/index.html"]:
+            self.assertTrue(publish.public_path_allowed(path), path)
+        for path in ["news/../secret/index.html", "tags/private.xml", "app.js", "topics/private/index.html",
+                     "topics/security/../private/index.html", "page/0/index.html", "topics/security/page/02/index.html",
+                     "topics/security/page/1000000000/index.html", "topics/security/app.js", "page/1/story.json"]:
+            self.assertFalse(publish.public_path_allowed(path), path)
 
     def test_subdirectory_assets_use_plain_paths_and_root_headers(self):
         public = self.public_tree()
@@ -129,10 +115,16 @@ url = "https://example.org/feed.xml"
     def test_retired_settings_in_an_existing_file_are_ignored(self):
         path = self.directory / "deployment.toml"
         path.write_text(path.read_text().replace("[cloudflare]\n", '[network]\nattempts = 99\n\n'
-                                                 '[cloudflare]\napi_token_env = "OTHER_NAME"\nverify_paths = ["x"]\n'))
-        p = publish.Publisher(path)
+                                                 '[cloudflare]\napi_token_env = "OTHER_NAME"\nverify_paths = ["x"]\n')
+                        .replace("[archive]\n", '[archive]\nenv_file = "archive-secrets.env"\nshard_prefix_chars = 3\n'
+                                 'worker_timeout_ms = 100\n'))
+        with self.assertLogs(publish.LOG, "WARNING") as logs:
+            p = publish.Publisher(path)
         self.assertEqual(p.net, publish.NETWORK)
         self.assertEqual(p.token, os.environ["CLOUDFLARE_API_TOKEN"])
+        self.assertEqual([record.args for record in logs.records],
+                         [("archive", "env_file"), ("archive", "shard_prefix_chars"), ("archive", "worker_timeout_ms")])
+        self.assertFalse(publish.RETIRED["archive"] & set(p.cfg["archive"]))
 
     def test_virtualenv_executable_path_preserves_symlink(self):
         binary = self.directory / ".venv/bin/python"

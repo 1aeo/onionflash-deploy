@@ -37,27 +37,15 @@ test("application subtree uses only the static assets binding", async () => {
     throw new Error("unexpected origin request");
   });
   try {
-    for (const path of ["/onionflash/", "/onionflash/feed.xml?reader=1", "/onionflash/news/abc/", "/onionflash/tags/security.xml", "/onionflash/topics/security/", "/onionflash/topics/security/page/2/?reader=1"]) {
-      const request = new Request(`https://example.com${path}`);
+    for (const [path, init] of [["/onionflash/"], ["/onionflash/feed.xml?reader=1"], ["/onionflash/news/abc/"], ["/onionflash/tags/security.xml"],
+      ["/onionflash/topics/security/"], ["/onionflash/topics/security/page/2/?reader=1"], ["/onionflash/topics/security/page/2/?reader=1", { method: "HEAD" }]]) {
+      const request = new Request(`https://example.com${path}`, init);
       const response = await worker.fetch(request, state.env);
       assert.equal(response.status, 200);
       assert.equal(state.calls.at(-1), request);
     }
-    assert.equal(state.calls.length, 6);
-    assert.equal(origin.mock.callCount(), 0);
-  } finally {
-    origin.mock.restore();
-  }
-});
-
-test("static topic HEAD requests use the same assets request without an origin proxy", async () => {
-  const state = assets();
-  const origin = mock.method(globalThis, "fetch", async () => { throw new Error("unexpected origin request"); });
-  try {
-    const request = new Request("https://example.com/onionflash/topics/security/page/2/?reader=1", { method: "HEAD" });
-    assert.equal((await worker.fetch(request, state.env)).status, 200);
-    assert.equal(state.calls[0], request);
-    assert.equal(state.calls[0].method, "HEAD");
+    assert.equal(state.calls.length, 7);
+    assert.equal(state.calls.at(-1).method, "HEAD");
     assert.equal(origin.mock.callCount(), 0);
   } finally {
     origin.mock.restore();

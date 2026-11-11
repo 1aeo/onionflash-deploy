@@ -7,10 +7,9 @@ DigitalOcean Spaces backups are optional. Visitors never call the LLM.
 The website uses ordinary links, static topic pages and a native menu disclosure;
 it ships no browser JavaScript. Cloudflare's routing Worker runs only on the server.
 
-With `[archive].enabled = true`, Spaces durably stores article pages, public JSON,
-numbered history/topic pages and full-history feeds. Cloudflare serves them under the
-same URLs and retains only the front page and small shared assets in its
-deployment bundle. See [permanent storage setup](PERMANENT_STORAGE.md).
+With `[archive].enabled = true`, Spaces durably stores article pages and their
+public JSON, and Cloudflare serves them under the same URLs; every other file stays
+in the Worker's deployment bundle. See [permanent storage setup](PERMANENT_STORAGE.md).
 
 Production: **https://1aeo.com/onionflash/** · [RSS](https://1aeo.com/onionflash/feed.xml)
 
@@ -125,8 +124,7 @@ outside it. Source timestamps and original first-publication times are preserved
 Topic pages use `/topics/<topic>/` and `/topics/<topic>/page/<number>/`; the
 existing `/tags/<topic>.xml` subscriptions remain available. HTML responses
 disable browser scripts and connections with `script-src 'none'` and
-`connect-src 'none'`. Publication also rejects script elements, event handlers
-and JavaScript URLs in generated HTML.
+`connect-src 'none'`.
 
 An upgrade from a release that shipped browser JavaScript rebuilds the articles in
 bounded batches on scheduled runs. Until that rebuild retires the old `app.js`,
@@ -171,7 +169,7 @@ verified. Credentials are never included in backups.
 ## Operations
 
 Use `./deploy.sh app` for offline application operations. It loads the protected
-dotenv files and the application config named in `deployment.toml`, so environment
+dotenv file and the application config named in `deployment.toml`, so environment
 references such as `${ONIONFLASH_LLM_BASE_URL}` work without sourcing a shell file.
 Only `story`, `rejected`, `build`, and `status` are available; do not supply an
 application `--config`. Cloudflare, Spaces, and LLM keys are removed from the
@@ -242,7 +240,8 @@ hold publication, update the two checkouts to reviewed commits, run `install.sh`
 again, verify with `check`, and explicitly resume. Keep previous Git SHAs for code
 rollback. Production installations should use reviewed tags or commit SHAs.
 
-The publisher's timeouts, retries and size limits are constants in `publish.py`.
+The publisher's and the Worker's timeouts, retries and size limits are constants
+in the code.
 Publication checks retry transient failures and not-yet-propagated files with
 exponential backoff; other client errors fail promptly. Wrangler retries its own API
 calls. LLM and source fallbacks are configured in the application, not hardcoded in

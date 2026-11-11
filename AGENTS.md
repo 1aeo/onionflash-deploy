@@ -22,10 +22,10 @@ go to the operator, not into PR text.
 
 `deployment.toml` holds only operator choices: paths, the schedule, the Worker
 name and compatibility date, and storage destinations. Budgets, limits, timeouts
-and retries are constants in the module that uses them. The `[archive]` and
-`[retention]` sections still hold some such values; remove one only together with
-the code that reads it. Credentials use the standard environment variable names
-listed in the README.
+and retries are constants in the module that uses them. The `[retention]`
+section still holds some such values; remove one only together with the code that
+reads it, and list it in `publish.RETIRED` so older files still load. Credentials
+use the standard environment variable names listed in the README.
 
 ## The application boundary
 
