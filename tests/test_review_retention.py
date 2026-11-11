@@ -51,6 +51,7 @@ class Reviewer:
         self.results, self.calls = list(results), []
 
     def review(self, candidate, packet, *, coverage=None, verification=False):
+        """Return the next scripted result and record which review stage ran."""
         self.calls.append(verification)
         result = self.results.pop(0)
         if isinstance(result, Exception):
