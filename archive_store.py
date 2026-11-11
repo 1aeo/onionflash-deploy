@@ -409,14 +409,19 @@ class ArchiveStore:
         return {"key": key, "sha256": sha256, "size": size}
 
     def _public_immutable(self, path, key, sha256, size, mime="application/octet-stream"):
-        # Storage checks each upload's Content-MD5, so a new object needs no read-back.
-        # An existing one must match in size, sha256 metadata and ETag (its MD5).
+        # Storage checks each upload's Content-MD5, so a new object needs no read-back. An
+        # existing one must match in size, sha256 metadata and ETag (its MD5), and anonymous
+        # readers must reach it, since its access may have changed after upload.
         old = self._head(key)
         if old is None:
             self._put(path, key, sha256, size, public=True, mime=mime)
-        elif (old.get("Metadata", {}).get("sha256") != sha256 or old.get("ContentLength") != size
-              or old.get("ETag", "").strip('"') != self._md5(path).hexdigest()):
+            return
+        if (old.get("Metadata", {}).get("sha256") != sha256 or old.get("ContentLength") != size
+                or old.get("ETag", "").strip('"') != self._md5(path).hexdigest()):
             raise ValueError("Immutable public archive object changed outside this publisher")
+        problem = self.publisher.unsigned_read_problem(self.cfg["endpoint_url"], self.bucket, key, True)
+        if problem:
+            raise ValueError(f"Existing public archive object {key} {problem}")
 
     def _upload_artifact(self, row, path):
         self._public_immutable(path, self.cfg["public_prefix"] + "objects/" + row["sha256"], row["sha256"], row["size"])

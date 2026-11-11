@@ -111,13 +111,19 @@ url = "https://example.org/feed.xml"
 
     def test_setup_errors_never_print_a_credential(self):
         # A credential expanded into an invalid setting reaches the error before the publisher exists.
-        self.app_config.write_text(self.app_config.read_text().replace(
-            "https://example.com/onionflash/", "https://example.com:${CLOUDFLARE_API_TOKEN}/onionflash/"))
-        with patch("onionflash.cli.main") as invoke, redirect_stderr(io.StringIO()) as error:
-            self.assertEqual(self.run_app("status"), 1)
-        invoke.assert_not_called()
-        self.assertNotIn("private-cloudflare-token", error.getvalue())
-        self.assertIn("[redacted]", error.getvalue())
+        # Every name a credential file assigns is redacted, whether or not it looks like a secret.
+        env_file = self.directory / "secrets.env"
+        env_file.write_text(env_file.read_text() + "\nCUSTOM_PRIVATE_VALUE=custom-private-value\n")
+        original = self.app_config.read_text()
+        for name, value in (("CLOUDFLARE_API_TOKEN", "private-cloudflare-token"), ("CUSTOM_PRIVATE_VALUE", "custom-private-value")):
+            with self.subTest(name=name):
+                self.app_config.write_text(original.replace(
+                    "https://example.com/onionflash/", "https://example.com:${%s}/onionflash/" % name))
+                with patch("onionflash.cli.main") as invoke, redirect_stderr(io.StringIO()) as error:
+                    self.assertEqual(self.run_app("status"), 1)
+                invoke.assert_not_called()
+                self.assertNotIn(value, error.getvalue())
+                self.assertIn("[redacted]", error.getvalue())
 
     def test_busy_mutations_return_75_without_invocation_but_inspection_remains_available(self):
         mutations = [("build",), *(('story', action) for action in ("correct", "retract", "restore", "unlock")),

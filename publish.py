@@ -91,9 +91,13 @@ def read_json(path, default=None):
         return default
 
 
+CREDENTIAL_NAMES = set()  # every name a credential file assigns, whatever it is called
+
+
 def credential_values(names=()):
     """Values of credential-like environment variables, long enough to redact safely."""
-    names = {k for k in os.environ if any(x in k.upper() for x in ("TOKEN", "SECRET", "API_KEY", "SPACES_KEY"))} | set(names)
+    names = {k for k in os.environ if any(x in k.upper() for x in ("TOKEN", "SECRET", "API_KEY", "SPACES_KEY"))}
+    names |= CREDENTIAL_NAMES | set(names)
     return [os.environ[name] for name in names if len(os.environ.get(name, "")) >= 8]
 
 
@@ -123,6 +127,7 @@ def load_env(path):
         tokens = shlex.split(raw)
         if len(tokens) > 1:
             raise ValueError("Quote values containing spaces; put comments on their own line")
+        CREDENTIAL_NAMES.add(key)
         os.environ.setdefault(key, tokens[0] if tokens else "")
 
 
@@ -255,16 +260,18 @@ class Publisher:
     def request(self, url, method="GET", data=None, token=None):
         return self.response(url, method, data, token).body
 
-    def unsigned_read_problem(self, endpoint, bucket, key):
-        """An anonymous request is the real exposure path of a private object; only a
-        403 proves it private, whatever ACLs or bucket policies say."""
+    def unsigned_read_problem(self, endpoint, bucket, key, public=False):
+        """An anonymous request is the real access path: only a 403 proves an object private,
+        and only a success proves it public, whatever ACLs or bucket policies say."""
         try:
             self.request(endpoint.rstrip("/") + "/" + bucket + "/" + quote(key), "HEAD")
-            return "was publicly readable"
+            return None if public else "was publicly readable"
         except HTTPError as exc:
-            return None if exc.code == 403 else f"got the unexpected anonymous response {exc.code}"
+            if exc.code == 403:
+                return "is not publicly readable" if public else None
+            return f"got the unexpected anonymous response {exc.code}"
         except OSError as exc:  # URLError, timeouts
-            return f"could not be checked for privacy ({type(exc).__name__})"
+            return f"could not be checked {'for public access' if public else 'for privacy'} ({type(exc).__name__})"
 
     @property
     def archive(self):
@@ -497,11 +504,14 @@ class Publisher:
             if initial_archive and db.execute("SELECT 1 FROM public_render_queue WHERE last_error IS NULL LIMIT 1").fetchone():
                 raise ValueError("Initial permanent-storage migration still has articles pending")
             if manifest is not None:
+                ledger = set()
                 for path, sha in db.execute("SELECT path,sha256 FROM public_artifacts"):
                     if path == "app.js":
                         continue  # Retired in new releases; immutable old versions remain intact.
                     if manifest.get(path) != sha:
                         raise ValueError("Local publication snapshot is incomplete: " + path)
+                    ledger.add(path)
+                return ledger
 
 
     def publish(self):
@@ -535,8 +545,9 @@ class Publisher:
                     shutil.copytree(self.public, stage, symlinks=True,
                                     ignore=lambda directory, names: {"app.js"} if Path(directory) == self.public else set())
                 manifest = self.validate(stage)
-                self.publication_readiness(manifest)
-                articles = {path for path in manifest if ARTICLE.fullmatch(path)}
+                # The database's ledger decides, so a page left behind by a newer database does not count.
+                ledger = self.publication_readiness(manifest)
+                articles = {path for path in (manifest if ledger is None else ledger) if ARTICLE.fullmatch(path)}
             # Never drop a permalink the live publication serves, as a restored older
             # database would. Static receipts list articles in their manifest.
             published = [*previous.get("manifest", {}), *previous.get("articles", [])]

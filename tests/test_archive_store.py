@@ -291,6 +291,19 @@ class ArchiveTests(unittest.TestCase):
             self.archive.sync()
         self.assertEqual(self.s3.puts, [])
 
+    def test_an_existing_public_object_must_be_readable_without_credentials(self):
+        path = self.root / "object"
+        path.write_bytes(b"public article")
+        sha = hashlib.sha256(b"public article").hexdigest()
+        key = self.archive.cfg["public_prefix"] + "objects/" + sha
+        self.archive._public_immutable(path, key, sha, path.stat().st_size)  # a new object: one HEAD and one PUT
+        self.assertEqual(self.unsigned, [])
+        self.archive._public_immutable(path, key, sha, path.stat().st_size)  # reused: anonymous readers must reach it
+        self.assertEqual(self.unsigned, [(self.archive.cfg["endpoint_url"], self.archive.bucket, key, True)])
+        self.exposure = "is not publicly readable"  # for example, its ACL was changed to private
+        with self.assertRaisesRegex(ValueError, "is not publicly readable"):
+            self.archive._public_immutable(path, key, sha, path.stat().st_size)
+
     def test_an_exposed_private_object_that_cannot_be_deleted_is_named_in_the_error(self):
         path = self.root / "private.gz"
         path.write_bytes(b"private evidence")

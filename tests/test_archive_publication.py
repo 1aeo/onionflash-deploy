@@ -36,6 +36,9 @@ class PermanentPublicationTests(unittest.TestCase):
         self.s3 = FakeS3()
         self.p._archive = ArchiveStore(self.p, client=self.s3)
         self.addCleanup(self.p.close)
+        # Storage is faked, so its anonymous access is too: public objects are readable and private ones refused.
+        anonymous = patch.object(self.p, "unsigned_read_problem", return_value=None)
+        anonymous.start(); self.addCleanup(anonymous.stop)
         cfg = copy.deepcopy(DEFAULTS)
         cfg["site"]["base_url"] = self.p.base_url
         cfg["storage"].update(database=str(self.p.database), output_dir=str(self.p.public))
@@ -117,6 +120,32 @@ class PermanentPublicationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "previously published article"):
                 self.p.publish()
         self.assertEqual(command.call_count, 1)  # nothing was uploaded after the restore
+
+    def test_a_restored_older_database_cannot_drop_a_static_permalink_behind_a_leftover_page(self):
+        self.p.cfg["archive"]["enabled"] = False
+        self.add_stories("alpha")
+        older = self.root / "older.sqlite3"
+        backup_database(self.p.database, older)
+        self.add_stories("bravo")
+        publish.atomic_json(self.p.state / "publication.json", {"version_id": OLD, "manifest": {}})
+        def upload(arguments, metadata):
+            metadata.write_text(json.dumps({"type": "version-upload", "version_id": NEW,
+                                            "preview_url": "https://candidate.example.workers.dev"}))
+        live = lambda: publish.read_json(self.p.state / "publication.json")["version_id"]
+        with patch.object(self.p, "current_version", side_effect=live), patch.object(self.p, "command", side_effect=upload) as command, \
+                patch.object(self.p, "api", return_value={"subdomain": "example"}), patch.object(self.p, "verify"), \
+                patch.object(self.p, "app_version", return_value="test"), patch.object(self.p, "activate"):
+            self.p.publish()
+            self.assertIn("news/bravo/index.html", publish.read_json(self.p.state / "publication.json")["manifest"])
+            with closing(sqlite3.connect(older)) as source, closing(sqlite3.connect(self.p.database)) as target:
+                source.backup(target)
+            with Store(self.p.database) as store:
+                build(self.app_config, store, force=True)
+            # The newer page stays in the output, but the restored database no longer has it.
+            self.assertTrue((self.p.public / "news/bravo/index.html").is_file())
+            with self.assertRaisesRegex(ValueError, "previously published article"):
+                self.p.publish()
+        self.assertEqual(command.call_count, 1)
 
     def test_initial_migration_waits_for_the_bounded_article_backfill(self):
         with Store(self.p.database) as store:
