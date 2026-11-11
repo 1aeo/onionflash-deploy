@@ -128,13 +128,10 @@ disable browser scripts and connections with `script-src 'none'` and
 `connect-src 'none'`. Publication also rejects script elements, event handlers
 and JavaScript URLs in generated HTML.
 
-When upgrading an existing database, run the upgraded core build until it reports
-`no_browser_js_ready: true`. This is a one-time bounded rebuild of accepted
-article pages: the deployer will not upload or activate a partially migrated
-site, or publish a database whose migration marker is missing. Every existing
-article permalink remains in the publication catalog. The old `app.js` is retired
-from new packages after that check; historical Worker versions and immutable
-storage objects are retained for rollback.
+An upgrade from a release that shipped browser JavaScript rebuilds the articles in
+bounded batches on scheduled runs. Until that rebuild retires the old `app.js`,
+publication refuses it and the live site stays unchanged; see the application's
+[upgrade notes](https://github.com/1aeo/onionflash/blob/main/docs/PERMANENT_HISTORY.md#upgrade-from-the-browser-script-version).
 
 ## DigitalOcean Spaces
 
@@ -211,8 +208,9 @@ publication, so the next scheduled run cannot undo it. It refuses to run when th
 active version differs from the recorded publication. Correct the content or code
 before resuming; the first publication after resuming uploads again.
 `state/publication.json` records the live version, its predecessor and the exact
-file hashes; `state/receipts/` keeps such a record for each published version,
-including any permanent-storage root, for rollback and retention.
+file hashes. `state/receipts/` keeps that record for the live and previous
+versions, which rollback restores; with permanent storage it keeps one for every
+version, including its root, for retention.
 
 A run that fails with "Active Worker version differs from the publication receipt"
 names the live and recorded versions. A failed restore, a run interrupted after

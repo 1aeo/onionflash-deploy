@@ -1,9 +1,10 @@
 import io
-from contextlib import redirect_stdout
+from contextlib import closing, redirect_stdout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
+import sqlite3
 import tempfile
 import threading
 import unittest
@@ -278,24 +279,47 @@ url = "https://example.org/feed.xml"
                 self.publisher.publish()
         api.assert_not_called()
 
+    def test_output_without_the_core_ledger_is_never_published(self):
+        self.publisher.public.mkdir(parents=True)
+        with patch.object(self.publisher, "api") as api, self.assertRaisesRegex(ValueError, "Run the core build"):
+            self.publisher.publish()
+        api.assert_not_called()
+
     def test_unchanged_content_checks_active_version_without_uploading(self):
         p = self.publisher
         p.public.mkdir(parents=True)
-        (p.public / "index.html").write_text("safe")
-        manifest = {"index.html": "dummy"}
-        identity = p.publication_identity(manifest)
-        publish.atomic_json(p.state / "publication.json", {"content_hash": identity, "version_id": "expected"})
-        with patch.object(p, "validate", return_value=manifest), patch.object(p, "current_version", return_value="expected") as version, \
+        ledger = {"index.html": "a" * 64}
+        with closing(sqlite3.connect(p.database)) as db:
+            db.executescript("CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT);"
+                             "CREATE TABLE public_artifacts(path TEXT PRIMARY KEY, sha256 TEXT);")
+            db.executemany("INSERT INTO public_artifacts VALUES(?,?)", ledger.items())
+            db.commit()
+        publish.atomic_json(p.state / "publication.json", {"content_hash": p.publication_identity(ledger),
+                                                           "manifest": ledger, "version_id": "expected"})
+        # The ledger still matches the last validated publication: no copy, scan or upload.
+        with patch("publish.shutil.copytree") as copy, patch.object(p, "validate") as validate, \
+                patch.object(p, "current_version", return_value="expected") as version, \
                 patch.object(p, "command") as command, patch.object(p, "api") as api:
             self.assertEqual(p.publish()["version_id"], "expected")
+        copy.assert_not_called()
+        validate.assert_not_called()
         version.assert_called_once()
         command.assert_not_called()
         api.assert_not_called()
 
-        with patch.object(p, "validate", return_value=manifest), patch.object(p, "current_version", return_value="external"), patch.object(p, "command") as command:
+        with patch.object(p, "current_version", return_value="external"), patch.object(p, "command") as command:
             with self.assertRaisesRegex(ValueError, "differs.*live external, recorded expected"):
                 p.publish()
         command.assert_not_called()
+
+        # A hash cleared by a rollback or an interrupted run, or one from another Worker,
+        # sends the same ledger through the full copy and validation.
+        for receipt in ({"manifest": ledger, "version_id": "expected"},
+                        {"content_hash": "0" * 64, "manifest": ledger, "version_id": "expected"}):
+            publish.atomic_json(p.state / "publication.json", receipt)
+            with patch.object(p, "validate", side_effect=ValueError("validated")), \
+                    patch.object(p, "current_version", return_value="expected"), self.assertRaisesRegex(ValueError, "validated"):
+                p.publish()
 
     def test_backup_invalid_retention_rejected_before_storage_access(self):
         self.publisher.cfg["spaces"].update(enabled=True, retention_days=0)

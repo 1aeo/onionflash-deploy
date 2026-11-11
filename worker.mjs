@@ -54,7 +54,8 @@ function archivePath(path, env) {
 
 function mime(key) {
   if (key.endsWith(".html")) return "text/html; charset=utf-8";
-  if (key.endsWith(".xml")) return "application/rss+xml; charset=utf-8";
+  // Like the static site, RSS feeds keep the generic XML type, which browsers display instead of downloading.
+  if (key.endsWith(".xml")) return "application/xml; charset=utf-8";
   return key === "feed.json" ? "application/feed+json; charset=utf-8" : "application/json; charset=utf-8";
 }
 
@@ -64,7 +65,8 @@ function publicHeaders(key, ttl, sha, size) {
     "Content-Type": type,
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "strict-origin-when-cross-origin",
-    "Content-Security-Policy": key.endsWith(".html") ? HTML_POLICY : DATA_POLICY + (key.endsWith(".xml") ? "; style-src 'unsafe-inline'" : ""),
+    // The browser's XML viewer styles feeds with inline CSS and data: icons.
+    "Content-Security-Policy": key.endsWith(".html") ? HTML_POLICY : DATA_POLICY + (key.endsWith(".xml") ? "; style-src 'unsafe-inline'; img-src data:" : ""),
     "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
     "Cache-Control": `public, max-age=${ttl}, must-revalidate`,
     "ETag": `"${sha}"`,
@@ -96,8 +98,9 @@ async function originRequest(url, method, settings, consume) {
         headers: { "Accept-Encoding": "identity" },
         cf: { cacheEverything: true, cacheTtlByStatus: { "200-299": settings.objectTtl, "403-404": 0, "500-599": 0 } },
       });
-      // consume returns refusals rather than throwing, so only failed fetches or reads, 429 and 5xx are retried.
-      if (response.status !== 429 && response.status < 500) return await consume(response, controller);
+      // consume reads any body within this attempt's timeout and returns refusals rather than
+      // throwing, so only failed fetches or reads, 429 and 5xx are retried.
+      if (response.status !== 429 && response.status < 500) return await consume(response);
       await response.body?.cancel();
     } catch (failure) {
       if (attempt + 1 === settings.attempts) throw failure;
@@ -113,54 +116,27 @@ async function originRequest(url, method, settings, consume) {
   throw new Error("Archive request failed");
 }
 
-function idleBody(response, originController, timeout, expectedSize) {
+// The body if it has at most limit bytes and the expected SHA-256, otherwise null.
+async function verifiedBytes(response, limit, hash) {
   const reader = response.body?.getReader();
-  if (!reader) {
-    if (expectedSize === 0) return null;
-    throw new Error("Archive object body missing");
+  if (!reader) return null;
+  const chunks = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > limit) return null;
+      chunks.push(value);
+    }
+  } finally {
+    await reader.cancel();
   }
-  let finished = false;
-  let received = 0;
-  const stop = reason => {
-    if (finished) return;
-    finished = true;
-    originController.abort();
-    // Cancellation must not delay delivery of the timeout/error to the client.
-    void reader.cancel(reason).catch(() => {});
-    try { reader.releaseLock(); } catch { /* A pending read settles on cancel. */ }
-  };
-  return new ReadableStream({
-    async pull(output) {
-      let timer;
-      try {
-        const next = await Promise.race([
-          reader.read(),
-          new Promise((_, reject) => {
-            timer = setTimeout(() => reject(new Error("Archive object read timed out")), timeout);
-          }),
-        ]);
-        if (finished) return;
-        if (next.done) {
-          finished = true;
-          reader.releaseLock();
-          if (received !== expectedSize) output.error(new Error("Archive object length mismatch"));
-          else output.close();
-          return;
-        }
-        received += next.value.byteLength;
-        if (received > expectedSize) throw new Error("Archive object length mismatch");
-        output.enqueue(next.value);
-      } catch (failure) {
-        if (!finished) {
-          output.error(failure);
-          stop(failure);
-        }
-      } finally {
-        clearTimeout(timer);
-      }
-    },
-    cancel(reason) { stop(reason); },
-  }, { highWaterMark: 0 }); // Only time an actual read, not slow consumer demand.
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+  return await sha256(bytes) === hash ? bytes : null;
 }
 
 async function manifest(origin, hash, settings) {
@@ -171,26 +147,8 @@ async function manifest(origin, hash, settings) {
       await response.body?.cancel();
       return null;
     }
-    const reader = response.body?.getReader();
-    if (!reader) return null;
-    const chunks = [];
-    let total = 0;
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        total += value.byteLength;
-        if (total > settings.manifestBytes) return null;
-        chunks.push(value);
-      }
-    } finally {
-      await reader.cancel();
-    }
-    const bytes = new Uint8Array(total);
-    let offset = 0;
-    for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
-    if (await sha256(bytes) !== hash) return null;
-    return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+    const bytes = await verifiedBytes(response, settings.manifestBytes, hash);
+    return bytes && JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
   });
 }
 
@@ -215,25 +173,22 @@ async function archived(request, env, key) {
   if (shard?.schema !== 1 || !shard.entries || typeof shard.entries !== "object" || Array.isArray(shard.entries)) throw new Error("Invalid archive shard");
   const entry = shard.entries[key];
   if (entry === undefined) return error(404);
-  if (!entry || !HASH.test(entry.sha256 || "") || !Number.isSafeInteger(entry.size) || entry.size < 0 || entry.content_type !== mime(key)) throw new Error("Invalid archive entry");
+  // Headers follow the path, so roots that recorded another content type stay readable.
+  if (!entry || !HASH.test(entry.sha256 || "") || !Number.isSafeInteger(entry.size) || entry.size < 0) throw new Error("Invalid archive entry");
   const headers = publicHeaders(key, settings.ttl, entry.sha256, entry.size);
   if (request.headers.get("if-none-match") === headers.get("etag")) {
     headers.delete("Content-Length");
     return new Response(null, { status: 304, headers });
   }
-  return originRequest(new URL(`objects/${entry.sha256}`, origin), request.method, settings, async (response, originController) => {
+  return originRequest(new URL(`objects/${entry.sha256}`, origin), request.method, settings, async response => {
     if (!response.ok || Number(response.headers.get("content-length")) !== entry.size || response.headers.get("x-amz-meta-sha256") !== entry.sha256) {
       await response.body?.cancel();
       return error(response.status === 403 || response.status === 404 ? 404 : 503);
     }
-    if (request.method === "HEAD") {
-      if (response.body) {
-        originController.abort();
-        void response.body.cancel().catch(() => {});
-      }
-      return new Response(null, { status: 200, headers });
-    }
-    return new Response(idleBody(response, originController, settings.timeout, entry.size), { status: 200, headers });
+    if (request.method === "HEAD") return new Response(null, { status: 200, headers });
+    // Serve only the bytes the manifest names, so an object replaced in storage fails closed.
+    const bytes = await verifiedBytes(response, entry.size, entry.sha256);
+    return bytes ? new Response(bytes, { status: 200, headers }) : error(503);
   });
 }
 

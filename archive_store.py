@@ -20,8 +20,7 @@ from urllib.parse import quote, urlsplit
 from onionflash.render import ASSET_FILES
 from onionflash.schema import CATEGORIES
 
-RETIRED_FILES = frozenset({"app.js"})
-HOT_FILES = frozenset({"index.html", "_headers", *ASSET_FILES}) - RETIRED_FILES
+HOT_FILES = frozenset({"index.html", "_headers", *ASSET_FILES})
 SHA = re.compile(r"[a-f0-9]{64}\Z")
 CHUNK = 65536
 
@@ -51,7 +50,7 @@ def content_type(path):
     if path.endswith(".html"):
         return "text/html; charset=utf-8"
     if path.endswith(".xml"):
-        return "application/rss+xml; charset=utf-8"
+        return "application/xml; charset=utf-8"
     if path == "feed.json":
         return "application/feed+json; charset=utf-8"
     return "application/json; charset=utf-8"
@@ -203,9 +202,6 @@ class ArchiveStore:
         pending = db.execute("SELECT value FROM metadata WHERE key='publication_build_pending'").fetchone()
         if pending and pending[0] == "1":
             raise ValueError("Public build has not completed")
-        ready = db.execute("SELECT value FROM metadata WHERE key='publication_no_browser_js_ready'").fetchone()
-        if ready is None or ready[0] != "1":
-            raise ValueError("No-browser-JavaScript migration is incomplete; run the upgraded core build")
         row = db.execute("SELECT value FROM metadata WHERE key='publication_generation'").fetchone()
         if row is None:
             raise ValueError("Build the incremental public catalog before publishing")
@@ -249,15 +245,6 @@ class ArchiveStore:
                     BEGIN INSERT INTO archive_dirty_paths(path) SELECT OLD.path WHERE NOT EXISTS (SELECT 1 FROM archive_dirty_paths WHERE path=OLD.path); END;
             """)
             with db:
-                # Retire routing entries only. Old content-addressed objects,
-                # immutable manifests and version receipts remain for rollback.
-                for retired in RETIRED_FILES:
-                    row = db.execute("SELECT shard FROM archive_index WHERE path=?", (retired,)).fetchone()
-                    if row:
-                        db.execute("DELETE FROM archive_index WHERE path=?", (retired,))
-                        db.execute("INSERT INTO archive_shards(shard,dirty) VALUES(?,1) ON CONFLICT(shard) DO UPDATE SET dirty=1", (row[0],))
-                    db.execute("DELETE FROM archive_dirty_paths WHERE path=?", (retired,))
-                self._invalidate_dirty_root(db)
                 if self._meta(db, "archive_destination") != destination:
                     db.execute("DELETE FROM archive_index")
                     db.execute("DELETE FROM archive_shards")
@@ -280,11 +267,10 @@ class ArchiveStore:
 
     @staticmethod
     def _pending(db):
-        excluded = HOT_FILES | RETIRED_FILES
-        placeholders = ",".join("?" for _ in excluded)
+        placeholders = ",".join("?" for _ in HOT_FILES)
         return db.execute(
             f"SELECT COUNT(*) FROM public_artifacts WHERE path NOT IN ({placeholders}) "
-            "AND (uploaded_sha256 IS NULL OR uploaded_sha256 != sha256)", tuple(excluded),
+            "AND (uploaded_sha256 IS NULL OR uploaded_sha256 != sha256)", tuple(HOT_FILES),
         ).fetchone()[0]
 
     def _file(self, relative):
@@ -535,13 +521,12 @@ class ArchiveStore:
             snapshot = Path(temporary)
             with self._database(shared=True) as db:
                 generation = self._generation(db)
-                excluded = HOT_FILES | RETIRED_FILES
-                placeholders = ",".join("?" for _ in excluded)
+                placeholders = ",".join("?" for _ in HOT_FILES)
                 rows = db.execute(
                     f"SELECT * FROM public_artifacts WHERE path NOT IN ({placeholders}) "
                     "AND (uploaded_sha256 IS NULL OR uploaded_sha256 != sha256) "
                     "ORDER BY CASE WHEN path LIKE 'news/%' THEN 0 WHEN path LIKE 'page/%' THEN 1 ELSE 2 END,path LIMIT ?",
-                    (*excluded, self.cfg["max_uploads_per_run"]),
+                    (*HOT_FILES, self.cfg["max_uploads_per_run"]),
                 ).fetchall()
                 selected, total = [], 0
                 for raw in rows:
@@ -589,10 +574,9 @@ class ArchiveStore:
             if self._meta(db, "archive_manifest_generation") != current_generation or self._pending(db):
                 raise ValueError("Archive routing manifest is not ready")
             for path in paths:
-                if path not in HOT_FILES and not archive_path_allowed(path):
+                if not archive_path_allowed(path):
                     raise ValueError("Unexpected verification path")
-                row = (db.execute("SELECT sha256 FROM public_artifacts WHERE path=?", (path,)).fetchone() if path in HOT_FILES
-                       else db.execute("SELECT sha256 FROM archive_index WHERE path=?", (path,)).fetchone())
+                row = db.execute("SELECT sha256 FROM archive_index WHERE path=?", (path,)).fetchone()
                 if row is None or not SHA.fullmatch(str(row[0])):
                     raise ValueError("Public artifact has not been verified in Spaces")
                 result[path] = row[0]

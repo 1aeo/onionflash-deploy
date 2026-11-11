@@ -74,7 +74,6 @@ class ArchiveTests(unittest.TestCase):
         self.db.executescript("""CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT);
             INSERT INTO metadata VALUES('publication_generation','1');
             INSERT INTO metadata VALUES('publication_build_pending','0');
-            INSERT INTO metadata VALUES('publication_no_browser_js_ready','1');
             CREATE TABLE public_artifacts(path TEXT PRIMARY KEY,sha256 TEXT,size INTEGER,content_type TEXT,updated_at TEXT,uploaded_sha256 TEXT);
         """)
         self.s3 = FakeS3()
@@ -111,7 +110,7 @@ class ArchiveTests(unittest.TestCase):
         self.assertTrue(result["ready"])
         self.assertEqual(result["uploaded"], 1)
         self.assertEqual(self.lookup(result, "news/example/index.html")["sha256"], sha)
-        self.assertEqual(self.archive.manifest(["index.html", "news/example/index.html"], result["generation"])["news/example/index.html"], sha)
+        self.assertEqual(self.archive.manifest(["news/example/index.html"], result["generation"]), {"news/example/index.html": sha})
         hot = self.root / "hot"
         self.assertEqual(set(self.archive.snapshot_hot(hot, result["generation"])), HOT_FILES)
         self.assertEqual({p.name for p in hot.iterdir()}, HOT_FILES)
@@ -379,50 +378,13 @@ class ArchiveTests(unittest.TestCase):
         with self.assertRaises(KeyError):
             self.lookup(after, paths[1])
 
-    def test_retired_script_leaves_new_root_and_hot_snapshot_but_old_root_survives(self):
-        self.artifact("news/permanent/index.html", b"<p>Permanent article</p>")
-        first = self.archive.sync()
-        # Simulate an older all-file archive catalog, including immutable script
-        # bytes and a root which an existing version can still select.
-        script = b"console.log('legacy browser behavior')"
-        script_sha = self.artifact("app.js", script)
-        prefix = self.archive.cfg["public_prefix"]
-        self.s3.objects[prefix + "objects/" + script_sha] = {
-            "body": script, "metadata": {"sha256": script_sha}, "acl": "public-read", "type": "text/javascript", "cache": "immutable"}
-        self.archive._initialize()
-        shard = hashlib.sha256(b"app.js").hexdigest()[:self.archive.cfg["shard_prefix_chars"]]
-        self.db.execute("INSERT INTO archive_index VALUES(?,?,?,?,?)", ("app.js", script_sha, len(script), "text/javascript", shard))
-        self.db.execute("INSERT INTO archive_shards(shard,dirty) VALUES(?,1) ON CONFLICT(shard) DO UPDATE SET dirty=1", (shard,))
-        self.db.commit()
-        with tempfile.TemporaryDirectory(dir=self.publisher.state) as temporary:
-            old_hash = self.archive._prepare_manifest("1", Path(temporary))
-        old = {"manifest_sha256": old_hash}
-        self.assertEqual(self.lookup(old, "app.js")["sha256"], script_sha)
-        existing_objects = dict(self.s3.objects)
-        self.generation(2)
-        current = self.archive.sync()
-        self.assertTrue(current["ready"])
-        self.assertNotEqual(current["manifest_sha256"], old_hash)
-        with self.assertRaises(KeyError):
-            self.lookup(current, "app.js")
-        self.assertEqual(self.lookup(old, "app.js")["sha256"], script_sha)
-        self.assertEqual(self.lookup(first, "news/permanent/index.html"), self.lookup(current, "news/permanent/index.html"))
-        for key, value in existing_objects.items():
-            self.assertEqual(self.s3.objects[key], value)
-        snapshot = self.root / "no-script-hot"
-        self.assertNotIn("app.js", self.archive.snapshot_hot(snapshot, current["generation"]))
-        self.assertFalse((snapshot / "app.js").exists())
-
-    def test_static_migration_gate_prevents_any_archive_upload(self):
-        for value in [None, "0"]:
-            with self.subTest(value=value):
-                self.db.execute("DELETE FROM metadata WHERE key='publication_no_browser_js_ready'")
-                if value is not None:
-                    self.db.execute("INSERT INTO metadata VALUES('publication_no_browser_js_ready',?)", (value,))
-                self.db.commit()
-                with self.assertRaisesRegex(ValueError, "upgraded core build"):
-                    self.archive.sync()
-                self.assertEqual(self.s3.puts, [])
+    def test_a_script_left_by_an_unfinished_upgrade_blocks_any_upload(self):
+        # The core keeps the old app.js in its ledger until every article is rebuilt without it.
+        self.artifact("news/a/index.html", b"<p>Rebuilt story</p>")
+        self.artifact("app.js", b"legacy")
+        with self.assertRaisesRegex(ValueError, "Unexpected public archive path"):
+            self.archive.sync()
+        self.assertEqual(self.s3.puts, [])
 
     def test_scripted_archive_html_is_rejected_after_hash_validation(self):
         self.artifact("topics/security/index.html", b'<p onclick="alert(1)">Bad</p>')
@@ -470,13 +432,14 @@ class ArchiveTests(unittest.TestCase):
         self.artifact("feed.xml", b"<rss/>")
         first = self.archive.sync()
         puts = list(self.s3.puts)
-        self.db.execute("UPDATE public_artifacts SET content_type='application/xml' WHERE path='feed.xml'")
+        self.db.execute("UPDATE public_artifacts SET content_type='application/rss+xml' WHERE path='feed.xml'")
         self.db.commit()
         self.generation(2)
         second = self.archive.sync()
         self.assertTrue(second["ready"])
         self.assertEqual(self.s3.puts, puts)
-        self.assertEqual(self.lookup(second, "feed.xml")["content_type"], "application/rss+xml; charset=utf-8")
+        # RSS feeds keep the static site's generic XML type, whatever the core's ledger records.
+        self.assertEqual(self.lookup(second, "feed.xml")["content_type"], "application/xml; charset=utf-8")
 
     def test_oversized_artifact_raises_instead_of_waiting_forever(self):
         self.artifact("feed.xml", b"x" * 2048)

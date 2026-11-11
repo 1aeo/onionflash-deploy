@@ -81,14 +81,20 @@ url = "https://example.org/feed.xml"
         self.p = publish.Publisher(self.directory / "deployment.toml")
 
     def seed_public(self):
+        """Generated output and the core's ledger of it."""
         self.p.public.mkdir(parents=True)
-        for name in publish.public_files():
-            body = b"generated public content"
-            if name == "feed.xml":
-                body = b"<rss version='2.0'><channel><title>News</title></channel></rss>"
-            elif name == "feed.json":
-                body = b'{"items":[]}'
-            (self.p.public / name).write_bytes(body)
+        with closing(sqlite3.connect(self.p.database)) as db:
+            db.executescript("CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT);"
+                             "CREATE TABLE public_artifacts(path TEXT PRIMARY KEY, sha256 TEXT);")
+            for name in publish.public_files():
+                body = b"generated public content"
+                if name == "feed.xml":
+                    body = b"<rss version='2.0'><channel><title>News</title></channel></rss>"
+                elif name == "feed.json":
+                    body = b'{"items":[]}'
+                (self.p.public / name).write_bytes(body)
+                db.execute("INSERT INTO public_artifacts VALUES(?,?)", (name, publish.hashlib.sha256(body).hexdigest()))
+            db.commit()
 
     def fake_cloudflare(self, live, *, failing_check=None):
         """Patch wrangler, the API and checks; record calls in self.calls."""
@@ -106,7 +112,7 @@ url = "https://example.org/feed.xml"
         def activate(version, config):
             self.calls.append("activate " + version)
             self.live[0] = version
-        def verify(url, manifest):
+        def verify(url, manifest, archive=None):
             self.calls.append("verify " + ("preview" if url.startswith(preview) else "live"))
             if failing_check and self.calls[-1] == "verify " + failing_check:
                 raise ValueError("check failed")
@@ -122,23 +128,15 @@ url = "https://example.org/feed.xml"
 
     def test_publish_checks_the_preview_before_activating_and_records_the_receipt(self):
         self.seed_public()
-        self.fake_cloudflare(OLD)
-        receipt = self.p.publish()
-        self.assertEqual(self.calls, ["versions upload", "verify preview", "activate " + NEW, "verify live"])
-        self.assertEqual((receipt["version_id"], receipt["previous_version_id"]), (NEW, OLD))
-        self.assertEqual(publish.read_json(self.p.state / "publication.json")["version_id"], NEW)
-
-    def test_new_static_snapshot_omits_retired_script_and_old_receipt_is_unchanged(self):
-        self.seed_public()
-        (self.p.public / "app.js").write_text("legacy javascript")
-        previous = receipt(OLD)
-        previous["manifest"]["app.js"] = "a" * 64
-        publish.atomic_json(self.p.state / "publication.json", previous)
+        publish.atomic_json(self.p.state / "receipts" / (OTHER + ".json"), receipt(OTHER))
         self.fake_cloudflare(OLD)
         result = self.p.publish()
-        self.assertNotIn("app.js", result["manifest"])
-        preserved = publish.read_json(self.p.state / "receipts" / (OLD + ".json"))
-        self.assertEqual(preserved["manifest"]["app.js"], "a" * 64)
+        self.assertEqual(self.calls, ["versions upload", "verify preview", "activate " + NEW, "verify live"])
+        self.assertEqual((result["version_id"], result["previous_version_id"]), (NEW, OLD))
+        self.assertEqual(publish.read_json(self.p.state / "publication.json")["version_id"], NEW)
+        # Static receipts list every file, so only the live one and the rollback target are kept.
+        self.assertEqual({path.name for path in (self.p.state / "receipts").iterdir()}, {OLD + ".json", NEW + ".json"})
+        self.assertEqual(publish.read_json(self.p.state / "receipts" / (OLD + ".json")), receipt(OLD))
 
     def test_publication_never_drops_an_article_the_live_receipt_lists(self):
         self.seed_public()
@@ -255,7 +253,7 @@ url = "https://example.org/feed.xml"
     def test_failed_check_does_not_roll_back_an_external_version(self):
         self.seed_public()
         self.fake_cloudflare(OLD)
-        def verify(url, manifest):
+        def verify(url, manifest, archive=None):
             if "candidate-" not in url:
                 self.live[0] = OTHER
                 raise ValueError("external deployment happened during verification")
@@ -279,7 +277,7 @@ url = "https://example.org/feed.xml"
     def test_external_activation_during_preview_is_preserved(self):
         self.seed_public()
         self.fake_cloudflare(OLD)
-        def verify(url, manifest):
+        def verify(url, manifest, archive=None):
             self.live[0] = OTHER
         with patch.object(self.p, "verify", side_effect=verify):
             with self.assertRaisesRegex(ValueError, "changed during preview"):

@@ -11,8 +11,11 @@ The Worker version binds one immutable root manifest, so rollback selects the
 same historical objects rather than reading files overwritten by a later run.
 
 The Worker routes only known public article, pagination, topic and feed paths. It never
-receives Spaces credentials or exposes the private prefix. Browser URLs such as
-`https://example.com/onionflash/news/<id>/` do not change.
+receives Spaces credentials or exposes the private prefix, and it serves an object
+only if its bytes match the manifest's hash. Browser URLs such as
+`https://example.com/onionflash/news/<id>/` do not change. RSS feeds use the
+generic XML type, and their policy allows the browser feed viewer's inline styles
+and `data:` icons; scripts stay disabled.
 
 ## Set up a bucket
 
@@ -83,19 +86,6 @@ For a large initial migration, repeat runs while `articles_pending` or archive
 pending counts remain. Existing article routes are not switched until previously
 published pages have verified permanent copies. A partial build, generation
 change, failed upload or exhausted work budget retains the existing publication.
-For the upgrade that removes browser JavaScript, both the publisher and archive
-sync require `publication_no_browser_js_ready=1` in the core's publication ledger.
-The upgraded core sets it only after all accepted article pages have the new
-static template. Later ordinary rebuild queues do not reset that completed
-migration. Missing or incomplete migration state stops before uploads or
-activation and requests another upgraded core build.
-
-New root manifests and Cloudflare hot snapshots omit the retired `app.js` mapping.
-Old content-addressed objects, manifests and per-version receipts are preserved,
-so rolling back an existing Worker version still selects its original contents.
-Obsolete history/topic pagination can leave a new manifest; article permalinks
-are retained. RSS responses allow inline styles for the browser's feed viewer;
-scripts stay disabled.
 
 On ordinary runs, only changed objects and affected manifest shards upload.
 Unchanged articles are reused. Feeds are streamed with bounded memory. A hot-only
@@ -152,7 +142,9 @@ Per-run object/byte/time limits and parser/manifest limits protect resources.
 They do not delete published news. If a sharded manifest becomes too large,
 increase `shard_prefix_chars` within its supported range and prepare a new
 manifest; older roots remain available. `archive-sync.json`, `retention.json`,
-the normal run receipt and system logs expose incomplete or failed work.
+the normal run receipt and system logs expose incomplete or failed work. An object
+replaced in storage gets a 503 until it is restored and its edge-cached copy
+expires or is purged.
 
 The canonical browser cache TTL is short; immutable origin objects and manifests
 can be cached for much longer.

@@ -61,7 +61,6 @@ class PermanentPublicationTests(unittest.TestCase):
         result = self.p.archive.sync()
         snapshot = self.root / "snapshot"
         hot = self.p.archive.snapshot_hot(snapshot, result["generation"])
-        self.assertEqual(set(self.p.validate(snapshot, hot_only=True)), HOT_FILES)
         info = {"manifest_sha256": result["manifest_sha256"]}
         config = json.loads(self.p.make_config(self.p.prepare_assets(snapshot), archive=info).read_text())
         self.assertEqual(config["vars"]["ARCHIVE_MANIFEST_SHA"], info["manifest_sha256"])
@@ -69,21 +68,6 @@ class PermanentPublicationTests(unittest.TestCase):
         self.assertIn("/onionflash/topics/*", config["assets"]["run_worker_first"])
         self.assertNotIn("/onionflash/*", config["assets"]["run_worker_first"])
         self.assertEqual(set(hot), HOT_FILES)
-        self.assertNotIn("app.js", hot)
-
-    def test_missing_or_pending_static_migration_blocks_before_archive_sync(self):
-        for value in [None, "0"]:
-            with self.subTest(value=value):
-                with Store(self.p.database) as store:
-                    store.db.execute("DELETE FROM metadata WHERE key='publication_no_browser_js_ready'")
-                    if value is not None:
-                        store.set_meta(publication_no_browser_js_ready=value)
-                    store.db.commit()
-                with patch.object(self.p.archive, "sync") as sync, patch.object(self.p, "command") as command:
-                    with self.assertRaisesRegex(ValueError, "upgraded core build"):
-                        self.p.publish()
-                sync.assert_not_called()
-                command.assert_not_called()
 
     def test_incomplete_storage_sync_never_activates_a_worker(self):
         with patch.object(self.p.archive, "sync", return_value={"ready": False, "pending": 1}), patch.object(self.p, "command") as command:
@@ -205,8 +189,7 @@ class PermanentPublicationTests(unittest.TestCase):
     def test_large_feeds_are_verified_with_head_not_buffered(self):
         sha = "f" * 64
         body_read = Mock(side_effect=AssertionError("HEAD must not read the feed body"))
-        response = SimpleNamespace(status=200, headers={"ETag": '"' + sha + '"', "Content-Length": "100000000"},
-                                   geturl=lambda: self.p.base_url + "feed.xml", read=body_read)
+        response = SimpleNamespace(headers={"ETag": '"' + sha + '"', "Content-Length": "100000000"}, read=body_read)
         self.p.net["max_response_bytes"] = 1
         with patch("publish.VERIFY_PATHS", ("feed.xml",)), \
                 patch("publish.urlopen", return_value=nullcontext(response)) as request:

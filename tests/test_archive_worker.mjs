@@ -9,9 +9,9 @@ const types = {
   "news/a/index.html": "text/html; charset=utf-8",
   "news/a/story.json": "application/json; charset=utf-8",
   "page/2/index.html": "text/html; charset=utf-8",
-  "feed.xml": "application/rss+xml; charset=utf-8",
-  "tags/security.xml": "application/rss+xml; charset=utf-8",
-  "tags/bridges.xml": "application/rss+xml; charset=utf-8",
+  "feed.xml": "application/xml; charset=utf-8",
+  "tags/security.xml": "application/xml; charset=utf-8",
+  "tags/bridges.xml": "application/xml; charset=utf-8",
   "topics/security/index.html": "text/html; charset=utf-8",
   "topics/security/page/2/index.html": "text/html; charset=utf-8",
   "topics/bridges/index.html": "text/html; charset=utf-8",
@@ -19,14 +19,14 @@ const types = {
   "feed.json": "application/feed+json; charset=utf-8",
 };
 
-function fixture(override = {}, contents = {}) {
+function fixture(override = {}, contents = {}, recorded = {}) {
   const objects = new Map();
   const shards = {};
   const entries = {};
   for (const [key, content_type] of Object.entries(types)) {
     const body = new TextEncoder().encode(contents[key] ?? `public content for ${key}`);
     const sha256 = hash(body);
-    entries[key] = { sha256, size: body.length, content_type };
+    entries[key] = { sha256, size: body.length, content_type: recorded[key] ?? content_type };
     objects.set(`${origin}objects/${sha256}`, { body, sha256 });
     const prefix = hash(key).slice(0, 2);
     shards[prefix] ??= { schema: 1, entries: {} };
@@ -116,7 +116,8 @@ test("HEAD and conditional requests preserve bounded metadata semantics", async 
 });
 
 test("HTML, XML and JSON get distinct safe response policies", async () => {
-  const state = fixture();
+  // Roots written by earlier releases record the RSS type; the response type follows the path.
+  const state = fixture({}, {}, { "feed.xml": "application/rss+xml; charset=utf-8" });
   await withOrigin(state, async () => {
     const html = await worker.fetch(new Request("https://example.com/onionflash/news/a/"), state.env);
     const xml = await worker.fetch(new Request("https://example.com/onionflash/feed.xml"), state.env);
@@ -124,8 +125,10 @@ test("HTML, XML and JSON get distinct safe response policies", async () => {
     assert.match(html.headers.get("content-security-policy"), /script-src 'none'/);
     assert.match(html.headers.get("content-security-policy"), /connect-src 'none'/);
     assert.match(html.headers.get("content-security-policy"), /style-src 'self'/);
+    assert.equal(xml.status, 200);
+    assert.equal(xml.headers.get("content-type"), "application/xml; charset=utf-8");
     assert.match(xml.headers.get("content-security-policy"), /script-src 'none'/);
-    assert.match(xml.headers.get("content-security-policy"), /style-src 'unsafe-inline'/);
+    assert.match(xml.headers.get("content-security-policy"), /style-src 'unsafe-inline'; img-src data:/);
     assert.match(json.headers.get("content-security-policy"), /script-src 'none'/);
     assert.doesNotMatch(json.headers.get("content-security-policy"), /unsafe-inline/);
   });
@@ -291,7 +294,7 @@ test("only transient origin failures are retried, within the configured limit", 
   }
 });
 
-test("object body streams and an upstream error body is never exposed", async () => {
+test("an upstream error body is never exposed", async () => {
   const state = fixture();
   await withOrigin(state, async () => {
     const response = await worker.fetch(new Request("https://example.com/onionflash/feed.xml"), state.env);
@@ -317,86 +320,23 @@ test("a rolled-back root keeps retrieving the previous immutable article", async
   });
 });
 
-test("an object that stalls after headers is cancelled within the idle-read deadline", async () => {
-  const state = fixture({ ARCHIVE_TIMEOUT_MS: "100" }, { "feed.xml": "test" });
-  let cancelled = false;
-  let signal;
-  const stream = new ReadableStream({
-    start(controller) { controller.enqueue(new Uint8Array([116])); },
-    pull() { return new Promise(() => {}); },
-    cancel() { cancelled = true; },
-  });
-  await withOrigin(state, async () => {
-    const response = await worker.fetch(new Request("https://example.com/onionflash/feed.xml"), state.env);
-    assert.equal(response.status, 200);
-    const started = Date.now();
-    await assert.rejects(response.arrayBuffer(), /read timed out/);
-    assert.ok(Date.now() - started < 1000, "stalled body must not hang after headers");
-    assert.equal(cancelled, true);
-    assert.equal(signal.aborted, true);
-    assert.equal(stream.locked, false);
-  }, (input, options) => {
-    if (!String(input).includes("/objects/")) return state.respond(input, options);
-    signal = options.signal;
-    return new Response(stream, { headers: { "content-length": "4", "x-amz-meta-sha256": state.entries["feed.xml"].sha256 } });
-  });
-});
-
-test("slow consumer backpressure does not start an origin idle-read timeout", async () => {
-  const state = fixture({ ARCHIVE_TIMEOUT_MS: "100" }, { "feed.xml": "test" });
-  let position = 0;
-  let cancelled = false;
-  let signal;
-  const bytes = new TextEncoder().encode("test");
-  const stream = new ReadableStream({
-    pull(controller) {
-      if (position === bytes.length) controller.close();
-      else controller.enqueue(bytes.subarray(position, ++position));
-    },
-    cancel() { cancelled = true; },
-  }, { highWaterMark: 0 });
-  await withOrigin(state, async () => {
-    const response = await worker.fetch(new Request("https://example.com/onionflash/feed.xml"), state.env);
-    const reader = response.body.getReader();
-    const first = await reader.read();
-    assert.deepEqual([...first.value], [116]);
-    await new Promise(resolve => setTimeout(resolve, 150));
-    assert.equal(position, 1, "do not prefetch while the consumer has no demand");
-    assert.equal(signal.aborted, false);
-    const rest = [];
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      rest.push(...value);
+test("an object whose bytes or metadata differ from its manifest entry is never served", async () => {
+  const state = fixture({}, { "feed.xml": "test" });
+  const sha = state.entries["feed.xml"].sha256;
+  // Replaced, short and long bodies carry the publisher's metadata; only their bytes differ.
+  for (const [body, length, metadata, methods] of [
+    ["TEST", "4", sha, ["GET"]], ["tes", "4", sha, ["GET"]], ["test!", "4", sha, ["GET"]],
+    ["test", "5", sha, ["GET", "HEAD"]], ["test", "4", "0".repeat(64), ["GET", "HEAD"]], ["test", "4", null, ["GET", "HEAD"]],
+  ]) {
+    for (const method of methods) {
+      await withOrigin(state, async () => {
+        const response = await worker.fetch(new Request("https://example.com/onionflash/feed.xml", { method }), state.env);
+        assert.equal(response.status, 503, `${method} ${body} ${length} ${metadata}`);
+      }, (input, options) => {
+        if (!String(input).includes("/objects/")) return state.respond(input, options);
+        const headers = { "content-length": length, ...(metadata ? { "x-amz-meta-sha256": metadata } : {}) };
+        return new Response(method === "HEAD" ? null : body, { headers });
+      });
     }
-    assert.equal(new TextDecoder().decode(new Uint8Array([116, ...rest])), "test");
-    assert.equal(cancelled, false);
-    assert.equal(stream.locked, false);
-  }, (input, options) => {
-    if (!String(input).includes("/objects/")) return state.respond(input, options);
-    signal = options.signal;
-    return new Response(stream, { headers: { "content-length": "4", "x-amz-meta-sha256": state.entries["feed.xml"].sha256 } });
-  });
-});
-
-test("cancelling a client read and unexpected HEAD bodies release the origin", async () => {
-  for (const method of ["GET", "HEAD"]) {
-    const state = fixture({ ARCHIVE_TIMEOUT_MS: "100" }, { "feed.xml": "test" });
-    let cancelled = false;
-    let signal;
-    const stream = new ReadableStream({ cancel() { cancelled = true; } });
-    await withOrigin(state, async () => {
-      const response = await worker.fetch(new Request("https://example.com/onionflash/feed.xml", { method }), state.env);
-      assert.equal(response.status, 200);
-      if (method === "GET") await response.body.cancel("reader left");
-      else assert.equal(await response.text(), "");
-      assert.equal(cancelled, true);
-      assert.equal(signal.aborted, true);
-      assert.equal(stream.locked, false);
-    }, (input, options) => {
-      if (!String(input).includes("/objects/")) return state.respond(input, options);
-      signal = options.signal;
-      return new Response(stream, { headers: { "content-length": "4", "x-amz-meta-sha256": state.entries["feed.xml"].sha256 } });
-    });
   }
 });
