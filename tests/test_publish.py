@@ -316,8 +316,19 @@ url = "https://example.org/feed.xml"
         activate.assert_not_called()
         self.assertFalse((self.publisher.state / "publication-hold.json").exists())
 
+    def test_routes_explain_a_receipt_without_files(self):
+        publish.atomic_json(self.publisher.state / "publication.json", {"version_id": "live-version"})
+        with self.assertRaisesRegex(ValueError, "publish once, then attach routes"):
+            self.publisher.routes()
+
     def test_secret_redaction(self):
         self.assertNotIn(os.environ["CLOUDFLARE_API_TOKEN"], self.publisher.clean_error("failed " + os.environ["CLOUDFLARE_API_TOKEN"]))
+        # A configured credential is redacted and scanned for even when its name looks like no
+        # secret and it was set in the environment rather than a credential file.
+        self.publisher.cfg.setdefault("archive", {})["access_key_env"] = "ARCHIVE_IDENTITY"
+        with patch.dict(os.environ, {"ARCHIVE_IDENTITY": "archive-identity-value"}):
+            self.assertEqual(self.publisher.clean_error("failed archive-identity-value"), "failed [redacted]")
+            self.assertIn("archive-identity-value", self.publisher.secret_values())
 
     def test_status_remains_readable_during_a_running_job(self):
         publish.atomic_json(self.publisher.state / "publication.json", {"version_id": "observed-version", "manifest": {"private": "omit"}})

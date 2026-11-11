@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 import sys
 
-from publish import BusyLock, Publisher, lock
+from publish import BusyLock, Publisher, lock, redact
 
 ACTIONS = {
     "story": {"show", "history", "correct", "retract", "restore", "unlock"},
@@ -61,8 +61,9 @@ def main(argv=None):
         print("onionflash app: another deployment is running; command not performed; retry after completion", file=sys.stderr)
         return 75
     except Exception as exc:
-        # Setup can fail after dotenv loading, before Publisher is available.
-        print(f"onionflash app: command failed ({type(exc).__name__})", file=sys.stderr)
+        # Setup errors name files, settings and variables, never their values.
+        message = publisher.clean_error(exc) if publisher else redact(f"{type(exc).__name__}: {exc}")
+        print("onionflash app: " + message, file=sys.stderr)
         return 1
     finally:
         if publisher is not None:

@@ -2,7 +2,6 @@ import base64
 import hashlib
 import io
 import json
-import re
 import sqlite3
 import tempfile
 import tomllib
@@ -13,7 +12,9 @@ from unittest.mock import patch
 
 from botocore.exceptions import ClientError, EndpointConnectionError
 
-from archive_store import ArchiveBudgetReached, ArchiveStore, HOT_FILES, ALL_USERS, content_type
+from archive_store import ArchiveBudgetReached, ArchiveStore, HOT_FILES, content_type
+
+ALL_USERS = "http://acs.amazonaws.com/groups/global/AllUsers"
 
 
 class FakeS3:
@@ -44,13 +45,13 @@ class FakeS3:
     def get_object(self, Bucket, Key):
         return {"Body": io.BytesIO(self.objects[Key]["body"])}
 
+    def delete_object(self, Bucket, Key):
+        del self.objects[Key]
+
     def get_object_acl(self, Bucket, Key):
         grants = [{"Grantee": {"Type": "CanonicalUser", "ID": "owner"}, "Permission": "FULL_CONTROL"}]
-        acl = self.objects[Key]["acl"]
-        if acl == "public-read":
+        if self.objects[Key]["acl"] == "public-read":
             grants.append({"Grantee": {"Type": "Group", "URI": ALL_USERS}, "Permission": "READ"})
-        elif acl == "public-write":
-            grants.append({"Grantee": {"Type": "Group", "URI": ALL_USERS}, "Permission": "WRITE"})
         return {"Owner": {"ID": "owner"}, "Grants": grants}
 
 
@@ -61,9 +62,11 @@ class ArchiveTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         cfg = tomllib.loads((Path(__file__).parents[1] / "deployment.example.toml").read_text())["archive"]
         self.waits = []
+        self.unsigned, self.exposure = [], None  # unsigned privacy checks and their finding
         self.publisher = SimpleNamespace(cfg={"archive": cfg}, public=self.root / "public", database=self.root / "news.sqlite3",
                                          state=self.root / "state", net={"attempts": 2, "timeout_seconds": 10},
-                                         secret_values=lambda: ["fake-credential-123"], delay=self.waits.append)
+                                         secret_values=lambda: ["fake-credential-123"], delay=self.waits.append,
+                                         unsigned_read_problem=lambda *request: self.unsigned.append(request) or self.exposure)
         self.publisher.public.mkdir()
         self.publisher.state.mkdir()
         self.db = sqlite3.connect(self.publisher.database)
@@ -73,7 +76,6 @@ class ArchiveTests(unittest.TestCase):
             INSERT INTO metadata VALUES('publication_build_pending','0');
             INSERT INTO metadata VALUES('publication_no_browser_js_ready','1');
             CREATE TABLE public_artifacts(path TEXT PRIMARY KEY,sha256 TEXT,size INTEGER,content_type TEXT,updated_at TEXT,uploaded_sha256 TEXT);
-            CREATE TABLE public_catalog(story_id TEXT PRIMARY KEY);
         """)
         self.s3 = FakeS3()
         self.archive = ArchiveStore(self.publisher, self.s3)
@@ -86,9 +88,6 @@ class ArchiveTests(unittest.TestCase):
         target.write_bytes(body)
         sha = hashlib.sha256(body).hexdigest()
         self.db.execute("INSERT INTO public_artifacts VALUES(?,?,?,?,?,NULL) ON CONFLICT(path) DO UPDATE SET sha256=excluded.sha256,size=excluded.size,content_type=excluded.content_type", (path, sha, len(body), content_type(path), "2026-11-10T00:00:00Z"))
-        article = re.fullmatch(r"news/([A-Za-z0-9_-]{1,64})/index\.html", path)
-        if article:
-            self.db.execute("INSERT OR IGNORE INTO public_catalog(story_id) VALUES(?)", (article[1],))
         self.db.commit()
         return sha
 
@@ -223,20 +222,16 @@ class ArchiveTests(unittest.TestCase):
         self.assertEqual(repaired["manifest_sha256"], current["manifest_sha256"])
         self.assertEqual(self.lookup(repaired, path)["sha256"], new_sha)
 
-    def test_public_body_corruption_or_bad_acl_is_not_accepted(self):
+    def test_public_object_changed_in_storage_is_not_accepted_or_overwritten(self):
         sha = self.artifact("feed.xml", b"<rss/>")
         self.archive.sync()
         key = self.archive.cfg["public_prefix"] + "objects/" + sha
         self.db.execute("UPDATE public_artifacts SET uploaded_sha256=NULL WHERE path='feed.xml'")
         self.db.commit()
-        self.s3.objects[key]["body"] = b"<bad/>"
-        with self.assertRaisesRegex(ValueError, "content verification"):
+        self.s3.objects[key]["body"] = b"<bad/>"  # same size and metadata, other bytes
+        with self.assertRaisesRegex(ValueError, "changed outside this publisher"):
             self.archive.sync()
         self.assertEqual(self.s3.puts.count(key), 1)
-        self.s3.objects[key]["body"] = b"<rss/>"
-        self.s3.objects[key]["acl"] = "public-write"
-        with self.assertRaisesRegex(ValueError, "ACL"):
-            self.archive.sync()
 
     def test_generation_change_defers_activation_and_next_sync_resumes(self):
         self.artifact("feed.xml", b"<rss/>")
@@ -296,63 +291,58 @@ class ArchiveTests(unittest.TestCase):
             self.archive.sync()
         self.assertEqual(self.s3.puts, [])
 
+    def test_an_existing_public_object_must_be_readable_without_credentials(self):
+        path = self.root / "object"
+        path.write_bytes(b"public article")
+        sha = hashlib.sha256(b"public article").hexdigest()
+        key = self.archive.cfg["public_prefix"] + "objects/" + sha
+        # The check asks for the object where the Worker reads it.
+        check = (self.archive.cfg["public_origin"] + "objects/" + sha, True)
+        self.archive._public_immutable(path, key, sha, path.stat().st_size)  # new: HEAD, PUT, anonymous read
+        self.archive._public_immutable(path, key, sha, path.stat().st_size)  # reused: HEAD, anonymous read
+        self.assertEqual(self.unsigned, [check, check])
+        self.assertEqual(self.s3.puts, [key])
+        self.exposure = "is not publicly readable"  # for example, its ACL was later changed to private
+        with self.assertRaisesRegex(ValueError, "is not publicly readable"):
+            self.archive._public_immutable(path, key, sha, path.stat().st_size)
+        # A bucket policy can deny anonymous reads of a new object too.
+        fresh = self.root / "fresh"
+        fresh.write_bytes(b"another article")
+        fresh_sha = hashlib.sha256(b"another article").hexdigest()
+        with self.assertRaisesRegex(ValueError, "is not publicly readable"):
+            self.archive._public_immutable(fresh, self.archive.cfg["public_prefix"] + "objects/" + fresh_sha, fresh_sha, fresh.stat().st_size)
+
+    def test_an_exposed_private_object_that_cannot_be_deleted_is_named_in_the_error(self):
+        path = self.root / "private.gz"
+        path.write_bytes(b"private evidence")
+        key = self.archive.private_prefix + "evidence/exposed.json.gz"
+        self.exposure = "was publicly readable"
+        def failing_delete(Bucket, Key):
+            raise RuntimeError("cleanup unavailable")
+        self.s3.delete_object = failing_delete
+        with self.assertRaisesRegex(ValueError, "exposed.json.gz was publicly readable, and deleting it failed: .*cleanup unavailable"):
+            self.archive.put_private(path, key)
+
     def test_private_archives_are_immutable_and_verified(self):
         path = self.root / "private.gz"
         path.write_bytes(b"private evidence")
         key = self.archive.private_prefix + "evidence/example.json.gz"
         receipt = self.archive.put_private(path, key)
         self.assertEqual(self.s3.objects[key]["acl"], "private")
+        self.assertEqual(self.unsigned, [(self.archive.cfg["endpoint_url"].rstrip("/") + "/" + self.archive.bucket + "/" + key,)])
         self.assertEqual(self.archive.put_private(path, key), receipt)
+        # A private ACL is no proof once a bucket policy grants reads: the unsigned
+        # request decides. A new object is removed; an existing one may back references.
+        self.exposure = "was publicly readable"
+        for target in (key, self.archive.private_prefix + "evidence/new.json.gz"):
+            with self.assertRaisesRegex(ValueError, "publicly readable"):
+                self.archive.put_private(path, target)
+        self.assertEqual(set(self.s3.objects), {key})
+        self.exposure = None
         path.write_bytes(b"different evidence")
         with self.assertRaisesRegex(ValueError, "immutable"):
             self.archive.put_private(path, key)
         self.assertEqual(self.s3.puts.count(key), 1)
-
-    def test_missing_artifact_record_holds_new_root_without_removing_published_permalink(self):
-        path = "news/old/index.html"
-        self.artifact(path, b"permanent")
-        first = self.archive.sync()
-        self.db.execute("DELETE FROM public_artifacts WHERE path=?", (path,))
-        self.db.commit()
-        self.generation(2)
-        puts = list(self.s3.puts)
-        with self.assertRaisesRegex(ValueError, "Retained article publication records"):
-            self.archive.sync()
-        self.assertEqual(self.s3.puts, puts)
-        self.assertEqual(self.lookup(first, path)["sha256"], hashlib.sha256(b"permanent").hexdigest())
-        self.assertIsNotNone(self.db.execute("SELECT path FROM archive_index WHERE path=?", (path,)).fetchone())
-
-    def test_orphan_scripted_remote_article_cannot_enter_or_reuse_a_new_ready_root(self):
-        path = "news/orphan/index.html"
-        sha = self.artifact(path, b'<script src="../../app.js"></script><p>Old remote article</p>')
-        # An immutable root produced before the static-HTML validator existed.
-        with patch("public_html.validate_static_html"):
-            old = self.archive.sync()
-        self.db.execute("DELETE FROM public_artifacts WHERE path=?", (path,))
-        self.db.execute("DELETE FROM public_catalog WHERE story_id='orphan'")
-        self.db.commit()
-        (self.publisher.public / path).unlink()
-        self.artifact("feed.xml", b"<rss>Unrelated pending change</rss>")
-        self.generation(2)
-        puts = list(self.s3.puts)
-        with self.assertRaisesRegex(ValueError, "Retained article publication records"):
-            self.archive.sync()
-        self.assertEqual(self.s3.puts, puts)  # No object or new root uploaded.
-        with tempfile.TemporaryDirectory(dir=self.publisher.state) as temporary:
-            with self.assertRaisesRegex(ValueError, "Retained article publication records"):
-                self.archive._prepare_manifest("2", Path(temporary))
-        self.assertEqual(self.lookup(old, path)["sha256"], sha)
-        self.assertIn(self.archive.cfg["public_prefix"] + "objects/" + sha, self.s3.objects)
-        self.assertEqual(self.db.execute("SELECT value FROM metadata WHERE key='archive_manifest_sha256'").fetchone()[0], old["manifest_sha256"])
-
-    def test_retained_article_requires_both_catalog_and_artifact_records(self):
-        path = "news/known/index.html"
-        self.artifact(path, b"<p>Accepted article</p>")
-        self.archive.sync()
-        self.db.execute("DELETE FROM public_catalog WHERE story_id='known'")
-        self.db.commit()
-        with self.assertRaisesRegex(ValueError, "Retained article publication records"):
-            self.archive.sync()
 
     def test_obsolete_pagination_path_leaves_active_manifest_but_not_history(self):
         path = "page/3/index.html"
@@ -448,10 +438,17 @@ class ArchiveTests(unittest.TestCase):
 
     def test_destination_change_reuploads_to_the_new_namespace(self):
         self.artifact("feed.xml", b"<rss/>")
+        self.artifact("page/3/index.html", b"old page three")
         self.archive.sync()
+        # The core removes pagination that a larger page size makes obsolete.
+        self.db.execute("DELETE FROM public_artifacts WHERE path='page/3/index.html'")
+        self.db.commit()
+        self.generation(2)
         self.archive.cfg["public_prefix"] = "newproject/public/"
         result = self.archive.sync()
         self.assertTrue(result["ready"])
+        with self.assertRaises(KeyError):
+            self.lookup(result, "page/3/index.html")
         self.assertTrue(any(key.startswith("newproject/public/objects/") for key in self.s3.objects))
         self.assertTrue(any(key.startswith("onionflash/public/objects/") for key in self.s3.objects))
 

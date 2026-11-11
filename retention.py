@@ -155,7 +155,7 @@ class RetentionStore:
             path.write_bytes(body)
             path.chmod(0o600)
             result = self.archive.put_private(path, key, sha256=checksum)
-        # The shared helper verifies bytes and ACL. Bind its receipt to this
+        # The shared helper verifies bytes and privacy. Bind its receipt to this
         # exact bundle before any local data can be removed.
         expected = {"key": key, "sha256": checksum, "size": len(body)}
         if not isinstance(result, dict) or any(result.get(key) != value for key, value in expected.items()):

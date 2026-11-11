@@ -15,7 +15,7 @@ import sqlite3
 import tempfile
 import time
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 from onionflash.render import ASSET_FILES
 from onionflash.schema import CATEGORIES
@@ -23,7 +23,6 @@ from onionflash.schema import CATEGORIES
 RETIRED_FILES = frozenset({"app.js"})
 HOT_FILES = frozenset({"index.html", "_headers", *ASSET_FILES}) - RETIRED_FILES
 SHA = re.compile(r"[a-f0-9]{64}\Z")
-ALL_USERS = "http://acs.amazonaws.com/groups/global/AllUsers"
 CHUNK = 65536
 
 
@@ -221,33 +220,10 @@ class ArchiveStore:
     def _set_meta(db, **values):
         db.executemany("INSERT INTO metadata(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", values.items())
 
-    @staticmethod
-    def _validate_retained_articles(db):
-        """An old remote HTML mapping needs current accepted publication records.
-
-        Local files may be rebuilding, but absent ledger rows cannot establish
-        that an immutable old article has completed the static-template upgrade.
-        Keep its old route/object intact and stop the new publication instead.
-        """
-        if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='archive_index'").fetchone():
-            return
-        if not db.execute("SELECT 1 FROM archive_index WHERE path LIKE 'news/%/index.html' LIMIT 1").fetchone():
-            return
-        if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='public_catalog'").fetchone():
-            raise ValueError("Retained article publication records are missing; restore the accepted catalog before publishing")
-        missing = db.execute("""SELECT 1 FROM archive_index a
-            LEFT JOIN public_artifacts p ON p.path=a.path
-            LEFT JOIN public_catalog c ON c.story_id=substr(a.path,6,length(a.path)-16)
-            WHERE a.path LIKE 'news/%/index.html' AND (p.path IS NULL OR c.story_id IS NULL)
-            LIMIT 1""").fetchone()
-        if missing:
-            raise ValueError("Retained article publication records are missing; restore the accepted catalog and artifact ledger before publishing")
-
     def _initialize(self):
         destination = hashlib.sha256(str((self.cfg["endpoint_url"], self.bucket, self.cfg["public_prefix"])).encode()).hexdigest()
         with self._database() as db:
             self._generation(db)
-            self._validate_retained_articles(db)
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS archive_index (
                     path TEXT PRIMARY KEY, sha256 TEXT NOT NULL, size INTEGER NOT NULL,
@@ -283,8 +259,6 @@ class ArchiveStore:
                     db.execute("DELETE FROM archive_dirty_paths WHERE path=?", (retired,))
                 self._invalidate_dirty_root(db)
                 if self._meta(db, "archive_destination") != destination:
-                    if db.execute("SELECT COUNT(*) FROM archive_index a LEFT JOIN public_artifacts p ON p.path=a.path WHERE p.path IS NULL").fetchone()[0]:
-                        raise ValueError("Restore missing published artifact records before changing archive destination")
                     db.execute("DELETE FROM archive_index")
                     db.execute("DELETE FROM archive_shards")
                     db.execute("DELETE FROM archive_dirty_paths")
@@ -354,30 +328,23 @@ class ArchiveStore:
             from public_html import validate_static_html
             validate_static_html(destination)
 
-    def _acl(self, key, public):
+    def _acl(self, key):
         acl = self._call("get_object_acl", Key=key)
         owner = acl.get("Owner", {}).get("ID")
         if not owner or not acl.get("Grants"):
             raise ValueError("Archive object ACL cannot be verified")
-        world_read = False
         for grant in acl["Grants"]:
-            who, permission = grant.get("Grantee", {}), grant.get("Permission")
-            if who.get("Type") == "CanonicalUser" and who.get("ID") == owner and permission == "FULL_CONTROL":
-                continue
-            if public and who.get("Type") == "Group" and who.get("URI") == ALL_USERS and permission == "READ":
-                world_read = True
-                continue
-            raise ValueError("Unexpected archive object ACL")
-        if public and not world_read:
-            raise ValueError("Published archive object is not publicly readable")
+            who = grant.get("Grantee", {})
+            if who.get("Type") != "CanonicalUser" or who.get("ID") != owner or grant.get("Permission") != "FULL_CONTROL":
+                raise ValueError("Unexpected archive object ACL")
 
-    def verify_object(self, key, sha256, size, public=False):
+    def verify_object(self, key, sha256, size):
         if not SHA.fullmatch(str(sha256)) or type(size) is not int or not 0 <= size <= self.cfg["max_object_bytes"]:
             raise ValueError("Invalid archive verification bounds")
         head = self._head(key)
         if head is None or head.get("ContentLength") != size or head.get("Metadata", {}).get("sha256") != sha256:
             raise ValueError("Archive object metadata verification failed")
-        self._acl(key, public)
+        self._acl(key)
         def download():
             result = self.client.get_object(Bucket=self.bucket, Key=key)
             digest, count = hashlib.sha256(), 0
@@ -393,11 +360,13 @@ class ArchiveStore:
         self._retry(download)
         return head
 
-    def _put(self, path, key, sha256, size, *, public, mime):
-        md5 = hashlib.md5(usedforsecurity=False)
+    @staticmethod
+    def _md5(path):
         with path.open("rb") as stream:
-            while chunk := stream.read(CHUNK):
-                md5.update(chunk)
+            return hashlib.file_digest(stream, lambda: hashlib.md5(usedforsecurity=False))
+
+    def _put(self, path, key, sha256, size, *, public, mime):
+        md5 = self._md5(path)
         def upload():
             with path.open("rb") as stream:
                 return self.client.put_object(
@@ -426,16 +395,35 @@ class ArchiveStore:
             self._put(path, key, sha256, size, public=False, mime="application/gzip")
         elif old.get("Metadata", {}).get("sha256") != sha256 or old.get("ContentLength") != size:
             raise ValueError("Refusing to overwrite immutable private archive object")
-        self.verify_object(key, sha256, size, public=False)
+        self.verify_object(key, sha256, size)
+        # A bucket policy can expose an object whose ACL is private.
+        problem = self.publisher.unsigned_read_problem(self.cfg["endpoint_url"].rstrip("/") + "/" + self.bucket + "/" + quote(key))
+        if problem:
+            if old is None:  # An existing object may back earlier archive references.
+                try:
+                    self._call("delete_object", Key=key)
+                except Exception as cleanup:  # the publisher redacts the message when it reports it
+                    raise ValueError(f"Private archive object {key} {problem}, and deleting it failed: "
+                                     f"{type(cleanup).__name__}: {cleanup}") from cleanup
+            raise ValueError(f"Private archive object {key} {problem}")
         return {"key": key, "sha256": sha256, "size": size}
 
     def _public_immutable(self, path, key, sha256, size, mime="application/octet-stream"):
+        # Storage checks each upload's Content-MD5, so a new object needs no read-back. An
+        # existing one must match in size, sha256 metadata and ETag (its MD5). Either way,
+        # anonymous readers must reach it: a bucket policy or a later change can deny them.
         old = self._head(key)
         if old is None:
             self._put(path, key, sha256, size, public=True, mime=mime)
-        elif old.get("Metadata", {}).get("sha256") != sha256 or old.get("ContentLength") != size:
+        # This publisher's single-part uploads have a plain MD5 ETag. An object another tool
+        # uploaded in parts has a composite one and fails closed here, as changed.
+        elif (old.get("Metadata", {}).get("sha256") != sha256 or old.get("ContentLength") != size
+                or old.get("ETag", "").strip('"') != self._md5(path).hexdigest()):
             raise ValueError("Immutable public archive object changed outside this publisher")
-        self.verify_object(key, sha256, size, public=True)
+        # Probe the URL the Worker reads, which validate_config ties to the public prefix.
+        problem = self.publisher.unsigned_read_problem(self.cfg["public_origin"] + key.removeprefix(self.cfg["public_prefix"]), True)
+        if problem:
+            raise ValueError(f"Public archive object {key} {problem}")
 
     def _upload_artifact(self, row, path):
         self._public_immutable(path, self.cfg["public_prefix"] + "objects/" + row["sha256"], row["sha256"], row["size"])
@@ -470,7 +458,6 @@ class ArchiveStore:
     def _prepare_manifest(self, generation, directory):
         import json
         with self._database() as db:
-            self._validate_retained_articles(db)
             if not self._same_generation(db, generation):
                 return None
             with db:
@@ -610,6 +597,13 @@ class ArchiveStore:
                     raise ValueError("Public artifact has not been verified in Spaces")
                 result[path] = row[0]
         return result
+
+    def articles(self, generation):
+        """Article permalinks the routing manifest of this generation maps."""
+        with self._database(shared=True) as db:
+            if self._generation(db) != str(generation) or self._meta(db, "archive_manifest_generation") != str(generation):
+                raise ValueError("Archive routing manifest is not ready")
+            return {path for (path,) in db.execute("SELECT path FROM archive_index WHERE path LIKE 'news/%/index.html'")}
 
     def snapshot_hot(self, destination, generation):
         destination = Path(destination)

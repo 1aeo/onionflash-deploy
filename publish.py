@@ -36,6 +36,7 @@ API_BASE = "https://api.cloudflare.com/client/v4"
 MAX_FILES, MAX_FILE_BYTES, MAX_TOTAL_BYTES = 10000, 10 * 1024 * 1024, 100 * 1024 * 1024
 COMMAND_TIMEOUT_SECONDS = 240
 VERIFY_PATHS = ("index.html", "feed.xml", "feed.json")
+ARTICLE = re.compile(r"news/[A-Za-z0-9_-]{1,64}/index\.html")
 # The publisher's own requests and storage clients. Responses may be as large as
 # any validated file, so verification can always read a file back.
 NETWORK = {"timeout_seconds": 30, "attempts": 4, "backoff_seconds": 2, "backoff_cap_seconds": 30,
@@ -90,6 +91,23 @@ def read_json(path, default=None):
         return default
 
 
+CREDENTIAL_NAMES = set()  # every name a credential file assigns, whatever it is called
+
+
+def credential_values(names=()):
+    """Values of credential-like environment variables, long enough to redact safely."""
+    found = {k for k in os.environ if any(x in k.upper() for x in ("TOKEN", "SECRET", "API_KEY", "SPACES_KEY"))}
+    found |= CREDENTIAL_NAMES | set(names)
+    return [os.environ[name] for name in found if len(os.environ.get(name, "")) >= 8]
+
+
+def redact(value, names=()):
+    result = str(value)
+    for secret in credential_values(names):
+        result = result.replace(secret, "[redacted]")
+    return result[-2500:]
+
+
 def load_env(path):
     """KEY=value lines with shell-style quoting and no expansion; the existing environment wins."""
     path = Path(path)
@@ -109,6 +127,7 @@ def load_env(path):
         tokens = shlex.split(raw)
         if len(tokens) > 1:
             raise ValueError("Quote values containing spaces; put comments on their own line")
+        CREDENTIAL_NAMES.add(key)
         os.environ.setdefault(key, tokens[0] if tokens else "")
 
 
@@ -203,10 +222,7 @@ class Publisher:
         return value
 
     def clean_error(self, value):
-        result = str(value)
-        for secret in self.secret_values():
-            result = result.replace(secret, "[redacted]")
-        return result[-2500:]
+        return redact(value, self.private_names())
 
     def private_names(self):
         """Environment variables holding credentials for Cloudflare, Spaces or the LLM."""
@@ -217,9 +233,7 @@ class Publisher:
         return names - {""}
 
     def secret_values(self):
-        names = {k for k in os.environ if any(x in k.upper() for x in ("TOKEN", "SECRET", "API_KEY", "SPACES_KEY"))}
-        names |= self.private_names()
-        return [os.environ[name] for name in names if len(os.environ.get(name, "")) >= 8]
+        return credential_values(self.private_names())
 
     def delay(self, attempt):
         """Storage retries have their own bounded backoff, independent of collection."""
@@ -245,6 +259,26 @@ class Publisher:
 
     def request(self, url, method="GET", data=None, token=None):
         return self.response(url, method, data, token).body
+
+    def unsigned_read_problem(self, url, public=False):
+        """An anonymous request is the real access path: only a 403 proves an object private,
+        and only a success proves it public, whatever ACLs or bucket policies say.
+        Throttling, server errors and network failures are retried like signed requests."""
+        for attempt in range(self.net["attempts"]):
+            if attempt:
+                self.delay(attempt - 1)
+            try:
+                self.request(url, "HEAD")
+                return None if public else "was publicly readable"
+            except HTTPError as exc:
+                if exc.code == 403:
+                    return "is not publicly readable" if public else None
+                problem = f"got the unexpected anonymous response {exc.code}"
+                if exc.code not in (408, 429) and exc.code < 500:
+                    return problem
+            except OSError as exc:  # URLError, timeouts
+                problem = f"could not be checked {'for public access' if public else 'for privacy'} ({type(exc).__name__})"
+        return problem
 
     @property
     def archive(self):
@@ -391,9 +425,9 @@ class Publisher:
                 try:
                     url = base_url.rstrip("/") + "/" + relative
                     if archive and relative not in HOT_FILES:
-                        # Immutable objects were read back and hashed before activation.
-                        # Verify the Worker's version-bound mapping without buffering
-                        # an ever-growing full-history feed into memory again.
+                        # Storage checked each upload's Content-MD5. Verify the Worker's
+                        # version-bound mapping without buffering an ever-growing
+                        # full-history feed into memory.
                         response = self.response(url, method="HEAD")
                         actual = response.headers.get("etag", "").removeprefix("W/").strip('"')
                     else:
@@ -460,7 +494,10 @@ class Publisher:
         atomic_json(self.state / "publication.json", restored)
 
     def publication_readiness(self, manifest=None, *, initial_archive=False):
-        """Keep incomplete first migrations and local restores off the live site."""
+        """Keep incomplete first migrations and local restores off the live site.
+
+        Given a manifest, returns the paths the database's artifact ledger lists, all of
+        them verified in the manifest; returns None when there is no database ledger."""
         if not self.database.is_file():
             return  # Legacy standalone generated trees have no publication ledger.
         import sqlite3
@@ -477,11 +514,14 @@ class Publisher:
             if initial_archive and db.execute("SELECT 1 FROM public_render_queue WHERE last_error IS NULL LIMIT 1").fetchone():
                 raise ValueError("Initial permanent-storage migration still has articles pending")
             if manifest is not None:
+                ledger = set()
                 for path, sha in db.execute("SELECT path,sha256 FROM public_artifacts"):
                     if path == "app.js":
                         continue  # Retired in new releases; immutable old versions remain intact.
                     if manifest.get(path) != sha:
                         raise ValueError("Local publication snapshot is incomplete: " + path)
+                    ledger.add(path)
+                return ledger
 
 
     def publish(self):
@@ -503,13 +543,11 @@ class Publisher:
                 generation = synchronized["generation"]
                 if not previous.get("archive"):
                     self.publication_readiness(initial_archive=True)
-                    legacy_articles = [path for path in previous.get("manifest", {})
-                                       if re.fullmatch(r"news/[A-Za-z0-9_-]{1,64}/index\.html", path)]
-                    self.archive.manifest(legacy_articles, generation)
                 hot_manifest = self.archive.snapshot_hot(stage, generation)
                 if self.validate(stage, hot_only=True) != hot_manifest:
                     raise ValueError("Hot asset snapshot changed")
                 manifest = {**hot_manifest, **self.archive.manifest(VERIFY_PATHS, generation)}
+                articles = self.archive.articles(generation)
                 archive_info = {"manifest_sha256": synchronized["manifest_sha256"],
                                 "generation": generation, "origin": self.archive.cfg["public_origin"]}
             else:
@@ -517,10 +555,15 @@ class Publisher:
                     shutil.copytree(self.public, stage, symlinks=True,
                                     ignore=lambda directory, names: {"app.js"} if Path(directory) == self.public else set())
                 manifest = self.validate(stage)
-                self.publication_readiness(manifest)
-                if any(re.fullmatch(r"news/[A-Za-z0-9_-]{1,64}/index\.html", path) and path not in manifest
-                       for path in previous.get("manifest", {})):
-                    raise ValueError("A previously published article is missing from the local snapshot")
+                # The database's ledger decides, so a page left behind by a newer database does not count.
+                ledger = self.publication_readiness(manifest)
+                articles = {path for path in (manifest if ledger is None else ledger) if ARTICLE.fullmatch(path)}
+            # Never drop a permalink the live publication serves, as a restored older
+            # database would. Static receipts list articles in their manifest.
+            published = [*previous.get("manifest", {}), *previous.get("articles", [])]
+            if {path for path in published if ARTICLE.fullmatch(path)} - articles:
+                raise ValueError("A previously published article is missing from this publication; "
+                                 "restore a database that contains it")
             identity = self.publication_identity(manifest, archive_info)
             before = self.current_version()
             if before != previous.get("version_id"):
@@ -590,7 +633,7 @@ class Publisher:
                        "content_hash": identity, "manifest": manifest,
                        "published_at": datetime.now(timezone.utc).isoformat(), **provenance}
             if archive_info:
-                receipt["archive"] = archive_info
+                receipt.update(archive=archive_info, articles=sorted(articles))
             atomic_json(self.state / "receipts" / (version + ".json"), receipt)
             atomic_json(self.state / "publication.json", receipt)
             LOG.info("Published version %s (%s files) at %s", version, len(manifest), live)
@@ -608,6 +651,8 @@ class Publisher:
 
     def routes(self):
         receipt = json.loads((self.state / "publication.json").read_text())
+        if "manifest" not in receipt:
+            raise ValueError("The publication receipt lists no files to check; publish once, then attach routes")
         options = {"archive": receipt["archive"]} if receipt.get("archive") else {}
         self.verify(self.origin_url(), receipt["manifest"], **options)
         zone = self.secret(ZONE_ID)
@@ -690,18 +735,14 @@ class Publisher:
                     raise RuntimeError(f"Backup upload failed and {key} could not be removed: "
                                        f"{self.clean_error(failure)}; {self.clean_error(cleanup)}") from failure
                 raise
-        # An anonymous request is the real exposure path; it must be refused,
-        # whatever ACLs or bucket policies say. Anything but a 403 removes the object.
-        try:
-            self.request(cfg["endpoint_url"].rstrip("/") + "/" + cfg["bucket"] + "/" + quote(key), "HEAD")
-            problem = "The new backup was publicly readable"
-        except HTTPError as exc:
-            problem = None if exc.code == 403 else f"Unexpected anonymous response {exc.code} for the new backup"
-        except OSError as exc:  # URLError, timeouts
-            problem = f"The new backup's privacy could not be checked ({type(exc).__name__})"
+        problem = self.unsigned_read_problem(cfg["endpoint_url"].rstrip("/") + "/" + cfg["bucket"] + "/" + quote(key))
         if problem:
-            client.delete_object(Bucket=cfg["bucket"], Key=key)
-            raise ValueError(problem + "; it has been deleted")
+            try:
+                client.delete_object(Bucket=cfg["bucket"], Key=key)
+            except Exception as cleanup:
+                raise ValueError(f"The new backup {key} {problem}, and deleting it failed: "
+                                 f"{self.clean_error(cleanup)}") from cleanup
+            raise ValueError(f"The new backup {key} {problem}; it has been deleted")
         cutoff = datetime.now(timezone.utc) - timedelta(days=cfg["retention_days"])
         pattern = re.escape(prefix) + r"\d{8}T\d{6}Z(?:(?:-[0-9a-f]{8})?\.sqlite3\.gz|-[0-9a-f]{12}(?:-[0-9a-f]{32})?\.tar\.gz)"
         for page in client.get_paginator("list_objects_v2").paginate(Bucket=cfg["bucket"], Prefix=prefix):
@@ -815,6 +856,7 @@ class Publisher:
             data = read_json(self.state / name)
             if data is not None:
                 data.pop("manifest", None)
+                data.pop("articles", None)
                 report[name] = data
         print(json.dumps(report, indent=2))
 
@@ -829,6 +871,9 @@ class Publisher:
                 self.archive  # Validate storage settings and credential presence without network calls.
             print("Application and deployment configuration valid")
         elif command == "backup":
+            # Scheduled runs skip disabled backups; an explicit request must not look done.
+            if not self.cfg.get("spaces", {}).get("enabled"):
+                raise ValueError("Spaces backups are disabled; set spaces.enabled = true or copy the database yourself")
             self.backup(force=force)
         elif command == "retention":
             self.retain_private_history()
@@ -878,7 +923,7 @@ def main():
         LOG.error("Another Onion Flash deployment is running; command not performed; retry after completion")
         return 75
     except Exception as exc:
-        LOG.error("%s", publisher.clean_error(exc) if publisher else type(exc).__name__ + ": " + str(exc))
+        LOG.error("%s", publisher.clean_error(exc) if publisher else redact(f"{type(exc).__name__}: {exc}"))
         return 1
     finally:
         if publisher is not None:

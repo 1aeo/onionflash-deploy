@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from contextlib import closing, redirect_stdout
 from concurrent.futures import ThreadPoolExecutor
-from unittest.mock import ANY, patch
+from unittest.mock import ANY, MagicMock, patch
 from urllib.error import HTTPError, URLError
 
 import publish
@@ -139,6 +139,17 @@ url = "https://example.org/feed.xml"
         self.assertNotIn("app.js", result["manifest"])
         preserved = publish.read_json(self.p.state / "receipts" / (OLD + ".json"))
         self.assertEqual(preserved["manifest"]["app.js"], "a" * 64)
+
+    def test_publication_never_drops_an_article_the_live_receipt_lists(self):
+        self.seed_public()
+        self.fake_cloudflare(OLD)
+        gone = "news/gone/index.html"
+        for previous in ({**receipt(OLD), "manifest": {gone: "a" * 64}}, {**receipt(OLD), "articles": [gone]}):
+            with self.subTest(previous=previous):  # a static or a permanent-storage receipt
+                publish.atomic_json(self.p.state / "publication.json", previous)
+                with self.assertRaisesRegex(ValueError, "previously published article"):
+                    self.p.publish()
+                self.assertEqual(self.calls, [])
 
     def test_failed_live_check_rolls_back_and_fails_without_holding(self):
         self.seed_public()
@@ -464,19 +475,21 @@ url = "https://example.org/feed.xml"
     def test_missing_status_record_can_disappear_without_error(self):
         self.assertEqual(publish.read_json(self.directory / "missing.json", {}), {})
 
-    def anonymous(self, code):
-        """Patch the publisher's unsigned request: None means it succeeded, an
-        exception is raised as is, and a number is an HTTP status."""
-        self.checked_urls = []
+    def anonymous(self, *codes):
+        """Patch the publisher's unsigned request, one outcome per request (the last
+        repeats): None means it succeeded, an exception is raised as is, and a number
+        is an HTTP status. Retry delays are skipped."""
+        self.checked_urls, outcomes = [], list(codes)
         def request(url, method="GET", data=None, token=None):
             self.assertEqual((method, token), ("HEAD", None))
             self.checked_urls.append(url)
+            code = outcomes.pop(0) if len(outcomes) > 1 else outcomes[0]
             if isinstance(code, Exception):
                 raise code
             if code is not None:
                 raise HTTPError(url, code, "anonymous", {}, None)
             return b""
-        return patch.object(self.p, "request", side_effect=request)
+        return patch.multiple(self.p, request=MagicMock(side_effect=request), delay=MagicMock())
 
     def test_backup_is_a_private_sqlite_snapshot_and_respects_the_interval(self):
         self.seed_backup()
@@ -516,15 +529,44 @@ url = "https://example.org/feed.xml"
 
     def test_a_backup_not_proven_private_is_deleted_and_fails(self):
         self.seed_backup()
-        for code, message in [(None, "publicly readable"), (404, "Unexpected anonymous response 404"),
-                              (URLError("reset"), "could not be checked")]:
+        # A success or a 404 is final; a network failure is retried up to the attempt limit.
+        for code, message, requests in [(None, "publicly readable", 1), (404, "unexpected anonymous response 404", 1),
+                                        (URLError("reset"), "could not be checked", self.p.net["attempts"])]:
             with self.subTest(code=code):
                 client = FakeSpaces()
                 with patch("boto3.client", return_value=client), self.anonymous(code):
                     with self.assertRaisesRegex(ValueError, message):
                         self.p.backup(force=True)
+                self.assertEqual(len(self.checked_urls), requests)
                 self.assertFalse((self.p.state / "backup.json").exists())
                 self.assertEqual(client.deleted, [client.uploads[0][:2]])
+
+    def test_a_throttled_or_failed_privacy_check_is_retried(self):
+        self.seed_backup()
+        for first in (503, 429, 408, URLError("reset")):
+            with self.subTest(first=first):
+                client = FakeSpaces()
+                with patch("boto3.client", return_value=client), self.anonymous(first, 403):
+                    self.p.backup(force=True)
+                    self.p.delay.assert_called_once_with(0)  # backoff before the retry
+                self.assertEqual(len(self.checked_urls), 2)
+                self.assertEqual(client.deleted, [])
+
+    def test_an_exposed_backup_that_cannot_be_deleted_is_named_in_the_error(self):
+        self.seed_backup()
+        client = FakeSpaces(cleanup_error=True)
+        with patch("boto3.client", return_value=client), self.anonymous(None):
+            with self.assertRaises(ValueError) as caught:
+                self.p.backup(force=True)
+        message = str(caught.exception)
+        self.assertIn(client.uploads[0][1], message)
+        self.assertRegex(message, "publicly readable, and deleting it failed: .*cleanup unavailable")
+        self.assertFalse((self.p.state / "backup.json").exists())
+
+    def test_an_explicit_backup_fails_when_spaces_backups_are_disabled(self):
+        with patch("boto3.client") as client, self.assertRaisesRegex(ValueError, "Spaces backups are disabled"):
+            self.p.execute("backup", force=True)
+        client.assert_not_called()
 
     def test_an_ambiguous_upload_failure_removes_the_object(self):
         self.seed_backup()
