@@ -96,9 +96,9 @@ CREDENTIAL_NAMES = set()  # every name a credential file assigns, whatever it is
 
 def credential_values(names=()):
     """Values of credential-like environment variables, long enough to redact safely."""
-    names = {k for k in os.environ if any(x in k.upper() for x in ("TOKEN", "SECRET", "API_KEY", "SPACES_KEY"))}
-    names |= CREDENTIAL_NAMES | set(names)
-    return [os.environ[name] for name in names if len(os.environ.get(name, "")) >= 8]
+    found = {k for k in os.environ if any(x in k.upper() for x in ("TOKEN", "SECRET", "API_KEY", "SPACES_KEY"))}
+    found |= CREDENTIAL_NAMES | set(names)
+    return [os.environ[name] for name in found if len(os.environ.get(name, "")) >= 8]
 
 
 def redact(value, names=()):
@@ -487,7 +487,10 @@ class Publisher:
         atomic_json(self.state / "publication.json", restored)
 
     def publication_readiness(self, manifest=None, *, initial_archive=False):
-        """Keep incomplete first migrations and local restores off the live site."""
+        """Keep incomplete first migrations and local restores off the live site.
+
+        Given a manifest, returns the paths the database's artifact ledger lists, all of
+        them verified in the manifest; returns None when there is no database ledger."""
         if not self.database.is_file():
             return  # Legacy standalone generated trees have no publication ledger.
         import sqlite3

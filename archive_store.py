@@ -416,6 +416,8 @@ class ArchiveStore:
         if old is None:
             self._put(path, key, sha256, size, public=True, mime=mime)
             return
+        # This publisher's single-part uploads have a plain MD5 ETag. An object another tool
+        # uploaded in parts has a composite one and fails closed here, as changed.
         if (old.get("Metadata", {}).get("sha256") != sha256 or old.get("ContentLength") != size
                 or old.get("ETag", "").strip('"') != self._md5(path).hexdigest()):
             raise ValueError("Immutable public archive object changed outside this publisher")

@@ -220,8 +220,12 @@ activation, a lost `state/` directory or a deployment made outside this publishe
 can cause it, and neither `rollback` nor `resume` clears it. Hold publication and
 inspect the live version. To discard it, deploy the recorded version again from the
 Worker's deployments in the Cloudflare dashboard (or with `wrangler versions deploy`).
-To keep it, replace `state/publication.json` with `{"version_id": "<live version>"}`,
-so the next run uploads and checks a new version. Then resume.
+To keep it, replace `state/publication.json` with that version's record from
+`state/receipts/` if one exists, or else with `{"version_id": "<live version>"}`,
+so the next run uploads and checks a new version. Then resume. A version-only
+receipt lists no articles, so that next publication cannot refuse to drop a
+permalink: use it only with a database that has every published story, such as
+the one the live version was built from.
 
 The installer and scheduled job share a lock. A concurrent scheduled run exits
 without overlapping work. A busy administrative command exits **75** with a clear
