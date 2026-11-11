@@ -1,41 +1,21 @@
 import io
-from contextlib import redirect_stdout
+from contextlib import closing, redirect_stdout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
-from pathlib import Path
-import tempfile
+import sqlite3
 import threading
 import unittest
 from unittest.mock import patch
 from urllib.error import HTTPError, URLError
 
 import publish
+from tests.fakes import make_publisher
 
 
 class DeploymentTests(unittest.TestCase):
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temporary.cleanup)
-        self.directory = Path(self.temporary.name)
-        environment = patch.dict(os.environ, {"CLOUDFLARE_ACCOUNT_ID": "a" * 32,
-                                               "CLOUDFLARE_API_TOKEN": "unit-test-not-a-real-secret",
-                                               "CLOUDFLARE_ZONE_TOKEN": "zone-test-not-a-real-secret",
-                                               "CLOUDFLARE_ZONE_ID": "b" * 32})
-        environment.start()
-        self.addCleanup(environment.stop)
-        config = (publish.ROOT / "deployment.example.toml").read_text()
-        (self.directory / "deployment.toml").write_text(config)
-        (self.directory / "onionflash.toml").write_text('''[site]
-base_url = "https://example.com/onionflash/"
-[storage]
-database = "state/news.sqlite3"
-output_dir = "build/public"
-[[sources]]
-id = "test"
-url = "https://example.org/feed.xml"
-''')
-        self.publisher = publish.Publisher(self.directory / "deployment.toml")
+        self.directory, self.publisher = make_publisher(self)
 
     def serve(self, handle):
         """A local HTTP server whose every request is passed to handle(handler)."""
@@ -93,27 +73,13 @@ url = "https://example.org/feed.xml"
             self.publisher.validate(public)
 
     def test_invalid_story_and_topic_paths_not_publishable(self):
-        self.assertFalse(publish.public_path_allowed("news/../secret/index.html"))
-        self.assertFalse(publish.public_path_allowed("tags/private.xml"))
-        self.assertTrue(publish.public_path_allowed("news/abc_123/index.html"))
-        self.assertTrue(publish.public_path_allowed("tags/security.xml"))
-        self.assertFalse(publish.public_path_allowed("app.js"))
-
-    def test_public_html_cannot_reintroduce_browser_javascript(self):
-        public = self.public_tree()
-        for html in ['<script src="app.js"></script>', '<ScRiPt>alert(1)</ScRiPt>',
-                     '<p onClick="alert(1)">hello</p>', '<a href="java&#x73;cript:alert(1)">link</a>']:
-            with self.subTest(html=html):
-                (public / "index.html").write_text(html)
-                with self.assertRaisesRegex(ValueError, "browser|JavaScript"):
-                    self.publisher.validate(public)
-        (public / "index.html").write_text('<details><summary>Menu</summary><a href="topics/security/">Security</a></details>')
-        self.assertIn("index.html", self.publisher.validate(public))
-
-    def test_literal_script_scheme_in_news_metadata_is_not_an_executable_url(self):
-        public = self.public_tree()
-        (public / "index.html").write_text('<meta name="description" content="javascript: URLs are the subject of this security report"><p title="JavaScript: disabled">News</p>')
-        self.assertIn("index.html", self.publisher.validate(public))
+        for path in ["news/abc_123/index.html", "news/abc_123/story.json", "page/2/index.html", "tags/security.xml",
+                     "topics/security/index.html", "topics/security/page/2/index.html"]:
+            self.assertTrue(publish.public_path_allowed(path), path)
+        for path in ["news/../secret/index.html", "tags/private.xml", "app.js", "topics/private/index.html",
+                     "topics/security/../private/index.html", "page/0/index.html", "topics/security/page/02/index.html",
+                     "topics/security/page/1000000000/index.html", "topics/security/app.js", "page/1/story.json"]:
+            self.assertFalse(publish.public_path_allowed(path), path)
 
     def test_subdirectory_assets_use_plain_paths_and_root_headers(self):
         public = self.public_tree()
@@ -128,10 +94,27 @@ url = "https://example.org/feed.xml"
     def test_retired_settings_in_an_existing_file_are_ignored(self):
         path = self.directory / "deployment.toml"
         path.write_text(path.read_text().replace("[cloudflare]\n", '[network]\nattempts = 99\n\n'
-                                                 '[cloudflare]\napi_token_env = "OTHER_NAME"\nverify_paths = ["x"]\n'))
-        p = publish.Publisher(path)
+                                                 '[cloudflare]\napi_token_env = "OTHER_NAME"\nverify_paths = ["x"]\n')
+                        .replace("[archive]\n", '[archive]\nenv_file = "archive-secrets.env"\nshard_prefix_chars = 3\n'
+                                 'worker_timeout_ms = 100\n')
+                        # Every [retention] key that earlier examples set.
+                        .replace("[retention]\n", "[retention]\ninterval_seconds = 86400\nhot_days = 90\nreceipt_hot_days = 30\n"
+                                 "batch_size = 100\nmax_bundle_bytes = 16777216\nrun_budget_seconds = 60\n"))
+        with self.assertLogs(publish.LOG, "WARNING") as logs:
+            p = publish.Publisher(path)
         self.assertEqual(p.net, publish.NETWORK)
         self.assertEqual(p.token, os.environ["CLOUDFLARE_API_TOKEN"])
+        self.assertEqual([record.args for record in logs.records],
+                         [("archive", "env_file"), ("archive", "shard_prefix_chars"), ("archive", "worker_timeout_ms")]
+                         + [("retention", key) for key in ("batch_size", "hot_days", "interval_seconds", "max_bundle_bytes",
+                                                           "receipt_hot_days", "run_budget_seconds")])
+        self.assertIn("move its credentials into the main env_file, then delete it", logs.records[0].getMessage())
+        self.assertFalse(publish.RETIRED["archive"] & set(p.cfg["archive"]))
+        self.assertEqual(p.cfg["retention"], {"enabled": False})
+        # Any other key is a mistake that check, like every command, reports at load.
+        path.write_text((publish.ROOT / "deployment.example.toml").read_text().replace("[retention]\n", "[retention]\nenable = true\n"))
+        with self.assertRaisesRegex(ValueError, "Unknown retention settings: enable"):
+            publish.Publisher(path)
 
     def test_virtualenv_executable_path_preserves_symlink(self):
         binary = self.directory / ".venv/bin/python"
@@ -278,24 +261,47 @@ url = "https://example.org/feed.xml"
                 self.publisher.publish()
         api.assert_not_called()
 
+    def test_output_without_the_core_ledger_is_never_published(self):
+        self.publisher.public.mkdir(parents=True)
+        with patch.object(self.publisher, "api") as api, self.assertRaisesRegex(ValueError, "Run the core build"):
+            self.publisher.publish()
+        api.assert_not_called()
+
     def test_unchanged_content_checks_active_version_without_uploading(self):
         p = self.publisher
         p.public.mkdir(parents=True)
-        (p.public / "index.html").write_text("safe")
-        manifest = {"index.html": "dummy"}
-        identity = p.publication_identity(manifest)
-        publish.atomic_json(p.state / "publication.json", {"content_hash": identity, "version_id": "expected"})
-        with patch.object(p, "validate", return_value=manifest), patch.object(p, "current_version", return_value="expected") as version, \
+        ledger = {"index.html": "a" * 64}
+        with closing(sqlite3.connect(p.database)) as db:
+            db.executescript("CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT);"
+                             "CREATE TABLE public_artifacts(path TEXT PRIMARY KEY, sha256 TEXT);")
+            db.executemany("INSERT INTO public_artifacts VALUES(?,?)", ledger.items())
+            db.commit()
+        publish.atomic_json(p.state / "publication.json", {"content_hash": p.publication_identity(ledger),
+                                                           "manifest": ledger, "version_id": "expected"})
+        # The ledger still matches the last validated publication: no copy, scan or upload.
+        with patch("publish.shutil.copytree") as copy, patch.object(p, "validate") as validate, \
+                patch.object(p, "current_version", return_value="expected") as version, \
                 patch.object(p, "command") as command, patch.object(p, "api") as api:
             self.assertEqual(p.publish()["version_id"], "expected")
+        copy.assert_not_called()
+        validate.assert_not_called()
         version.assert_called_once()
         command.assert_not_called()
         api.assert_not_called()
 
-        with patch.object(p, "validate", return_value=manifest), patch.object(p, "current_version", return_value="external"), patch.object(p, "command") as command:
+        with patch.object(p, "current_version", return_value="external"), patch.object(p, "command") as command:
             with self.assertRaisesRegex(ValueError, "differs.*live external, recorded expected"):
                 p.publish()
         command.assert_not_called()
+
+        # A hash cleared by a rollback or an interrupted run, or one from another Worker,
+        # sends the same ledger through the full copy and validation.
+        for receipt in ({"manifest": ledger, "version_id": "expected"},
+                        {"content_hash": "0" * 64, "manifest": ledger, "version_id": "expected"}):
+            publish.atomic_json(p.state / "publication.json", receipt)
+            with patch.object(p, "validate", side_effect=ValueError("validated")), \
+                    patch.object(p, "current_version", return_value="expected"), self.assertRaisesRegex(ValueError, "validated"):
+                p.publish()
 
     def test_backup_invalid_retention_rejected_before_storage_access(self):
         self.publisher.cfg["spaces"].update(enabled=True, retention_days=0)

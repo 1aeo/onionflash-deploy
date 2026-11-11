@@ -1,37 +1,24 @@
 """Cross-layer checks for permanent storage and guarded Worker activation."""
 import copy
-from contextlib import closing, nullcontext
+from contextlib import closing
+import hashlib
 import json
-import os
-from pathlib import Path
 import shutil
 import sqlite3
-import tempfile
 import unittest
-from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import publish
-from archive_store import ArchiveStore, HOT_FILES
+from archive_store import ArchiveStore
 from onionflash.cli import build
 from onionflash.config import DEFAULTS
 from onionflash.store import Store, backup_database
-from test_archive_store import FakeS3
-from test_recovery import OLD, NEW
+from tests.fakes import FakeS3, NEW, OLD, make_publisher
 
 
 class PermanentPublicationTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name).resolve()
-        env = patch.dict(os.environ, {"CLOUDFLARE_ACCOUNT_ID": "a" * 32,
-            "CLOUDFLARE_API_TOKEN": "fake-cloudflare-credential", "CLOUDFLARE_ZONE_TOKEN": "fake-zone-credential",
-            "CLOUDFLARE_ZONE_ID": "b" * 32, "DO_SPACES_KEY": "fake-storage-key", "DO_SPACES_SECRET": "fake-storage-secret"})
-        env.start(); self.addCleanup(env.stop)
-        (self.root / "deployment.toml").write_text((publish.ROOT / "deployment.example.toml").read_text())
-        (self.root / "onionflash.toml").write_text('[site]\nbase_url="https://example.com/onionflash/"\n[storage]\ndatabase="state/news.sqlite3"\noutput_dir="public"\n[[sources]]\nid="test"\nurl="https://example.org/feed.xml"\n')
-        self.p = publish.Publisher(self.root / "deployment.toml")
+        self.root, self.p = make_publisher(self, output_dir="public")
         self.p.cfg["archive"]["enabled"] = True
         self.s3 = FakeS3()
         self.p._archive = ArchiveStore(self.p, client=self.s3)
@@ -57,33 +44,37 @@ class PermanentPublicationTests(unittest.TestCase):
             store.db.commit()
             build(self.app_config, store)
 
-    def test_only_hot_files_enter_cloudflare_and_worker_paths_are_scoped(self):
+    def test_every_file_but_the_permalinks_enters_the_worker_bundle(self):
+        self.add_stories("alpha")
         result = self.p.archive.sync()
         snapshot = self.root / "snapshot"
-        hot = self.p.archive.snapshot_hot(snapshot, result["generation"])
-        self.assertEqual(set(self.p.validate(snapshot, hot_only=True)), HOT_FILES)
+        manifest = self.p.archive.snapshot(snapshot, result["generation"])
+        ledger = self.p.publication_readiness()
+        self.assertEqual(manifest, {path: sha for path, sha in ledger.items() if path != "news/alpha/story.json"})
+        self.assertFalse((snapshot / "news").exists())
+        self.assertTrue((snapshot / "tags/security.xml").is_file())
         info = {"manifest_sha256": result["manifest_sha256"]}
         config = json.loads(self.p.make_config(self.p.prepare_assets(snapshot), archive=info).read_text())
-        self.assertEqual(config["vars"]["ARCHIVE_MANIFEST_SHA"], info["manifest_sha256"])
-        self.assertIn("/onionflash/news/*", config["assets"]["run_worker_first"])
-        self.assertIn("/onionflash/topics/*", config["assets"]["run_worker_first"])
-        self.assertNotIn("/onionflash/*", config["assets"]["run_worker_first"])
-        self.assertEqual(set(hot), HOT_FILES)
-        self.assertNotIn("app.js", hot)
+        self.assertEqual(config["vars"], {"BASE_PATH": "/onionflash", "ARCHIVE_ORIGIN": self.p.archive.cfg["public_origin"],
+                                          "ARCHIVE_MANIFEST_SHA": info["manifest_sha256"]})
+        # No bundled asset shadows a permalink, so the Worker answers them without run_worker_first.
+        self.assertNotIn("run_worker_first", config["assets"])
 
-    def test_missing_or_pending_static_migration_blocks_before_archive_sync(self):
-        for value in [None, "0"]:
-            with self.subTest(value=value):
-                with Store(self.p.database) as store:
-                    store.db.execute("DELETE FROM metadata WHERE key='publication_no_browser_js_ready'")
-                    if value is not None:
-                        store.set_meta(publication_no_browser_js_ready=value)
-                    store.db.commit()
-                with patch.object(self.p.archive, "sync") as sync, patch.object(self.p, "command") as command:
-                    with self.assertRaisesRegex(ValueError, "upgraded core build"):
-                        self.p.publish()
-                sync.assert_not_called()
-                command.assert_not_called()
+    def test_the_worker_bundle_gets_the_static_feed_and_budget_checks(self):
+        self.add_stories("alpha")
+        with patch.object(self.p, "command") as command, patch.object(self.p, "current_version", return_value=None):
+            with patch.object(publish, "MAX_FILES", 3), self.assertRaisesRegex(ValueError, "file count budget"):
+                self.p.publish()
+            feed = self.p.public / "feed.xml"
+            feed.write_text("<html>not a feed</html>")
+            body = feed.read_bytes()
+            with Store(self.p.database) as store:  # as if the core had rendered it, so the ledger hash matches
+                store.db.execute("UPDATE public_artifacts SET sha256=?,size=? WHERE path='feed.xml'",
+                                 (hashlib.sha256(body).hexdigest(), len(body)))
+                store.db.commit()
+            with self.assertRaisesRegex(ValueError, "Expected RSS feed"):
+                self.p.publish()
+        command.assert_not_called()
 
     def test_incomplete_storage_sync_never_activates_a_worker(self):
         with patch.object(self.p.archive, "sync", return_value={"ready": False, "pending": 1}), patch.object(self.p, "command") as command:
@@ -111,7 +102,8 @@ class PermanentPublicationTests(unittest.TestCase):
         with patch.object(self.p, "current_version", side_effect=live), patch.object(self.p, "command", side_effect=upload) as command, \
                 patch.object(self.p, "api", return_value={"subdomain": "example"}), patch.object(self.p, "verify"), \
                 patch.object(self.p, "app_version", return_value="test"), patch.object(self.p, "activate"):
-            self.assertEqual(self.p.publish()["articles"], ["news/alpha/index.html", "news/bravo/index.html"])
+            self.assertEqual({path for path in self.p.publish()["manifest"] if path.startswith("news/")},
+                             {"news/alpha/index.html", "news/bravo/index.html"})
             # The documented recovery: restore the older backup, then rebuild from it.
             with closing(sqlite3.connect(older)) as source, closing(sqlite3.connect(self.p.database)) as target:
                 source.backup(target)
@@ -172,7 +164,7 @@ class PermanentPublicationTests(unittest.TestCase):
         self.p.publication_readiness(self.p.validate(self.p.public))
         original = self.p.archive.sync()
         key = "news/r2/index.html"
-        old_sha = self.p.archive.manifest([key], original["generation"])[key]
+        old_sha = self.p.archive.snapshot(self.root / "before", original["generation"])[key]
         shutil.rmtree(self.p.public)
         self.app_config["storage"]["render_batch_size"] = 1
         with Store(self.p.database) as store:
@@ -181,7 +173,7 @@ class PermanentPublicationTests(unittest.TestCase):
         self.assertFalse((self.p.public / key).exists())
         ready = self.p.archive.sync()
         self.assertTrue(ready["ready"])
-        self.assertEqual(self.p.archive.manifest([key], ready["generation"])[key], old_sha)
+        self.assertEqual(self.p.archive.snapshot(self.root / "after", ready["generation"])[key], old_sha)
         self.assertIn(self.p.archive.cfg["public_prefix"] + "objects/" + old_sha, self.s3.objects)
 
     def test_prepared_archive_is_bound_to_the_publication_receipt(self):
@@ -195,24 +187,28 @@ class PermanentPublicationTests(unittest.TestCase):
         with patch.object(self.p, "current_version", return_value=OLD), patch.object(self.p, "command", side_effect=command), patch.object(self.p, "api", return_value={"subdomain": "example"}), patch.object(self.p, "verify") as verify, patch.object(self.p, "app_version", return_value="test"), patch.object(self.p, "activate") as activate:
             result = self.p.publish()
         self.assertEqual(result["version_id"], NEW)
-        self.assertIn("archive", result)
-        self.assertEqual(set(result["manifest"]), HOT_FILES | {"feed.xml", "feed.json"})
+        self.assertEqual(result["manifest"], self.p.publication_readiness())
         self.assertEqual(verify.call_args.kwargs["archive"], result["archive"])
         self.assertEqual(len(commands), 1)
         activate.assert_called_once()
         self.assertEqual(publish.read_json(self.p.state / "receipts" / (NEW + ".json"))["archive"], result["archive"])
+        # The uploaded version binds the root this receipt records.
+        config = json.loads((self.p.state / "wrangler.json").read_text())
+        self.assertEqual(config["vars"]["ARCHIVE_MANIFEST_SHA"], result["archive"]["manifest_sha256"])
 
-    def test_large_feeds_are_verified_with_head_not_buffered(self):
-        sha = "f" * 64
-        body_read = Mock(side_effect=AssertionError("HEAD must not read the feed body"))
-        response = SimpleNamespace(status=200, headers={"ETag": '"' + sha + '"', "Content-Length": "100000000"},
-                                   geturl=lambda: self.p.base_url + "feed.xml", read=body_read)
-        self.p.net["max_response_bytes"] = 1
-        with patch("publish.VERIFY_PATHS", ("feed.xml",)), \
-                patch("publish.urlopen", return_value=nullcontext(response)) as request:
-            self.p.verify(self.p.base_url, {"feed.xml": sha}, archive={"manifest_sha256": "a" * 64})
-        self.assertEqual(request.call_args.args[0].get_method(), "HEAD")
-        body_read.assert_not_called()
+    def test_checks_also_read_one_article_through_permanent_storage(self):
+        bodies = {path: path.encode() for path in ("index.html", "feed.xml", "feed.json", "news/b/index.html", "news/a/index.html")}
+        manifest = {path: publish.hashlib.sha256(body).hexdigest() for path, body in bodies.items()}
+        read = []
+        def request(url):
+            read.append(url.removeprefix(self.p.base_url))
+            return bodies[read[-1]]
+        with patch.object(self.p, "request", side_effect=request):
+            self.p.verify(self.p.base_url, manifest)
+            self.assertEqual(read, ["index.html", "feed.xml", "feed.json"])
+            read.clear()
+            self.p.verify(self.p.base_url, manifest, archive={"manifest_sha256": "f" * 64})
+        self.assertEqual(read, ["index.html", "feed.xml", "feed.json", "news/a/index.html"])
 
     def test_worker_and_binding_changes_invalidate_unchanged_asset_identity(self):
         fake_root = self.root / "code"
@@ -225,4 +221,5 @@ class PermanentPublicationTests(unittest.TestCase):
             second = self.p.publication_identity({"index.html": "same"})
             self.p.base_path = "/different"
             third = self.p.publication_identity({"index.html": "same"})
-        self.assertEqual(len({first, second, third}), 3)
+            roots = {self.p.publication_identity({"index.html": "same"}, {"manifest_sha256": c * 64}) for c in "ab"}
+        self.assertEqual(len({first, second, third, *roots}), 5)

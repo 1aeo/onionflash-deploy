@@ -22,10 +22,9 @@ go to the operator, not into PR text.
 
 `deployment.toml` holds only operator choices: paths, the schedule, the Worker
 name and compatibility date, and storage destinations. Budgets, limits, timeouts
-and retries are constants in the module that uses them. The `[archive]` and
-`[retention]` sections still hold some such values; remove one only together with
-the code that reads it. Credentials use the standard environment variable names
-listed in the README.
+and retries are constants in the module that uses them. A removed setting stays
+listed in `publish.RETIRED` so older files still load. Credentials use the
+standard environment variable names listed in the README.
 
 ## The application boundary
 
@@ -40,10 +39,9 @@ This repository uses the application only through its public interfaces:
   `publication_*` metadata keys.
 
 Do not read other application tables or parse its private JSON; ask the
-application to expose what is needed instead. The current exceptions are in
-`retention.py`, which compacts old `items` and `analyses` rows and protects
-unfinished review evidence by reading `review_jobs`. Both are to move behind an
-application interface.
+application to expose what is needed instead. The current exception is
+`retention.py`, which compacts old `items` and `analyses` rows; it is to move
+behind an application interface.
 
 ## Code
 

@@ -14,7 +14,6 @@ import logging
 from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
-from types import SimpleNamespace
 import random
 import re
 import secrets
@@ -44,15 +43,27 @@ NETWORK = {"timeout_seconds": 30, "attempts": 4, "backoff_seconds": 2, "backoff_
 ACCOUNT_ID, API_TOKEN, ZONE_TOKEN, ZONE_ID = ("CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_API_TOKEN",
                                               "CLOUDFLARE_ZONE_TOKEN", "CLOUDFLARE_ZONE_ID")
 SPACES_KEY, SPACES_SECRET = "DO_SPACES_KEY", "DO_SPACES_SECRET"
+# Settings that became constants. An older deployment.toml may still set them.
+RETIRED = {"archive": {"env_file", "max_uploads_per_run", "max_upload_bytes_per_run", "max_object_bytes",
+                       "max_manifest_bytes", "shard_prefix_chars", "sync_budget_seconds", "cache_ttl_seconds",
+                       "immutable_cache_ttl_seconds", "worker_timeout_ms", "worker_retry_attempts",
+                       "worker_backoff_ms", "worker_backoff_cap_ms"},
+           "retention": {"interval_seconds", "hot_days", "receipt_hot_days", "batch_size", "max_bundle_bytes",
+                         "run_budget_seconds"}}
+
+
 def public_files():
-    """Fixed files the application renders (story pages and topic feeds vary)."""
+    """Fixed files the application renders (story, listing and topic paths vary)."""
     from onionflash.render import ASSET_FILES
-    return {"index.html", "feed.xml", "feed.json", "_headers", *ASSET_FILES} - {"app.js"}
+    return {"index.html", "feed.xml", "feed.json", "_headers", *ASSET_FILES}
 
 
 def public_path_allowed(relative):
-    from archive_store import archive_path_allowed
-    return relative in public_files() or archive_path_allowed(relative)
+    from onionflash.schema import CATEGORIES
+    topic = "|".join(map(re.escape, CATEGORIES))
+    return relative in public_files() or bool(re.fullmatch(
+        r"news/[A-Za-z0-9_-]{1,64}/(?:index\.html|story\.json)|tags/(?:" + topic + r")\.xml"
+        r"|(?:topics/(?:" + topic + r")/)?(?:page/[1-9][0-9]{0,8}/)?index\.html", relative))
 
 
 def atomic_json(path, value):
@@ -170,14 +181,21 @@ class Publisher:
     def __init__(self, config_path):
         self.config_path = Path(config_path).resolve()
         self.cfg = tomllib.loads(self.config_path.read_text())
+        for section, names in RETIRED.items():
+            for key in sorted(names & set(self.cfg.get(section, {}))):
+                if (section, key) == ("archive", "env_file"):
+                    LOG.warning("Ignoring setting %s.%s: it is no longer read; move its credentials into the main env_file, then delete it",
+                                section, key)
+                else:
+                    LOG.warning("Ignoring setting %s.%s: it is no longer configurable and can be deleted", section, key)
+                del self.cfg[section][key]
         self.directory = self.config_path.parent
         load_env(self.path(self.cfg.get("env_file", "secrets.env")))
-        archive_env = self.cfg.get("archive", {}).get("env_file")
-        if archive_env:
-            load_env(self.path(archive_env))
         for section in ("archive", "retention"):
             if type(self.cfg.get(section, {}).get("enabled", False)) is not bool:
                 raise ValueError(section + ".enabled must be a boolean")
+        if unknown := set(self.cfg.get("retention", {})) - {"enabled"}:
+            raise ValueError("Unknown retention settings: " + ", ".join(sorted(unknown)))
         if self.cfg.get("retention", {}).get("enabled") and not self.cfg.get("archive", {}).get("enabled"):
             raise ValueError("Private retention requires configured permanent storage")
         self.state = self.path(self.cfg.get("state_dir", "state"))
@@ -241,8 +259,8 @@ class Publisher:
                     + random.uniform(0, self.net["jitter_seconds"]))
         time.sleep(delay)
 
-    def response(self, url, method="GET", data=None, token=None):
-        """One bounded urllib request; HEAD exposes metadata without reading a body."""
+    def request(self, url, method="GET", data=None, token=None):
+        """One bounded urllib request; HEAD reads no body."""
         headers = {"User-Agent": "OnionFlashPublisher", "Accept-Encoding": "identity"}
         if data is not None:
             headers["Content-Type"] = "application/json"
@@ -251,14 +269,9 @@ class Publisher:
             request.add_unredirected_header("Authorization", "Bearer " + token)
         with urlopen(request, timeout=self.net["timeout_seconds"]) as response:
             body = b"" if method.upper() == "HEAD" else response.read(self.net["max_response_bytes"] + 1)
-            result = SimpleNamespace(status=response.status, headers={key.lower(): value for key, value in response.headers.items()},
-                                     body=body, url=response.geturl())
         if len(body) > self.net["max_response_bytes"]:
             raise ValueError("Response exceeds the size limit: " + url)
-        return result
-
-    def request(self, url, method="GET", data=None, token=None):
-        return self.response(url, method, data, token).body
+        return body
 
     def unsigned_read_problem(self, url, public=False):
         """An anonymous request is the real access path: only a 403 proves an object private,
@@ -359,9 +372,6 @@ class Publisher:
                   "assets": {"directory": str(directory), "binding": "ASSETS",
                              "html_handling": "auto-trailing-slash", "not_found_handling": "none"},
                   "vars": self.worker_vars(archive)}
-        if archive:
-            config["assets"]["run_worker_first"] = [self.base_path + path for path in (
-                "/news/*", "/page/*", "/topics/*", "/feed.xml", "/feed.json", "/tags/*")]
         target = self.state / "wrangler.json"
         atomic_json(target, config)
         return target
@@ -381,8 +391,7 @@ class Publisher:
         (target / "_headers").replace(assets / "_headers")
         return assets
 
-    def validate(self, directory, *, hot_only=False):
-        from archive_store import HOT_FILES
+    def validate(self, directory):
         files, total = {}, 0
         secrets = [value.encode() for value in self.secret_values()]
         for path in sorted(directory.rglob("*")):
@@ -391,7 +400,7 @@ class Publisher:
             if not path.is_file():
                 continue
             relative = path.relative_to(directory).as_posix()
-            if not public_path_allowed(relative) or (hot_only and relative not in HOT_FILES):
+            if not public_path_allowed(relative):
                 raise ValueError("Unexpected public file: " + relative)
             size = path.stat().st_size
             total += size
@@ -400,38 +409,27 @@ class Publisher:
             body = path.read_bytes()
             if any(secret in body for secret in secrets):
                 raise ValueError("Credential detected in public output")
-            if relative.endswith(".html"):
-                from public_html import validate_static_html
-                validate_static_html(path)
             files[relative] = hashlib.sha256(body).hexdigest()
         if len(files) > MAX_FILES:
             raise ValueError("Public output exceeds file count budget")
-        for relative in (HOT_FILES if hot_only else {*public_files(), *VERIFY_PATHS}):
+        for relative in public_files():
             if relative not in files:
                 raise ValueError("Missing required public file: " + relative)
-        if not hot_only:
-            import xml.etree.ElementTree as ET
-            root = ET.parse(directory / "feed.xml").getroot()
-            if root.tag != "rss":
-                raise ValueError("Expected RSS feed")
-            json.loads((directory / "feed.json").read_text())
+        import xml.etree.ElementTree as ET
+        if ET.parse(directory / "feed.xml").getroot().tag != "rss":
+            raise ValueError("Expected RSS feed")
+        json.loads((directory / "feed.json").read_text())
         return files
 
     def verify(self, base_url, manifest, *, archive=None):
-        from archive_store import HOT_FILES
-        for relative in VERIFY_PATHS:
+        paths = list(VERIFY_PATHS)
+        if archive:  # One article also proves the Worker's route to permanent storage.
+            paths += sorted(path for path in manifest if ARTICLE.fullmatch(path))[:1]
+        for relative in paths:
             # Newly activated assets may take a short time to reach the edge.
             for attempt in range(self.net["attempts"]):
                 try:
-                    url = base_url.rstrip("/") + "/" + relative
-                    if archive and relative not in HOT_FILES:
-                        # Storage checked each upload's Content-MD5. Verify the Worker's
-                        # version-bound mapping without buffering an ever-growing
-                        # full-history feed into memory.
-                        response = self.response(url, method="HEAD")
-                        actual = response.headers.get("etag", "").removeprefix("W/").strip('"')
-                    else:
-                        actual = hashlib.sha256(self.request(url)).hexdigest()
+                    actual = hashlib.sha256(self.request(base_url.rstrip("/") + "/" + relative)).hexdigest()
                     if actual != manifest[relative]:
                         raise ValueError("Published hash mismatch: " + relative)
                     break
@@ -494,12 +492,11 @@ class Publisher:
         atomic_json(self.state / "publication.json", restored)
 
     def publication_readiness(self, manifest=None, *, initial_archive=False):
-        """Keep incomplete first migrations and local restores off the live site.
-
-        Given a manifest, returns the paths the database's artifact ledger lists, all of
-        them verified in the manifest; returns None when there is no database ledger."""
+        """Keep incomplete builds, first migrations and local restores off the live
+        site; return the core's ledger of public files and their hashes, every one of
+        them verified in the manifest when one is given."""
         if not self.database.is_file():
-            return  # Legacy standalone generated trees have no publication ledger.
+            raise ValueError("Run the core build before publishing")
         import sqlite3
         from contextlib import closing
         with lock(str(self.database) + ".lock", shared=True), closing(sqlite3.connect(self.database.as_uri() + "?mode=ro", uri=True)) as db:
@@ -508,20 +505,13 @@ class Publisher:
             pending = db.execute("SELECT value FROM metadata WHERE key='publication_build_pending'").fetchone()
             if pending and pending[0] == "1":
                 raise ValueError("Publication build is incomplete; existing site retained")
-            ready = db.execute("SELECT value FROM metadata WHERE key='publication_no_browser_js_ready'").fetchone()
-            if ready is None or ready[0] != "1":
-                raise ValueError("No-browser-JavaScript migration is incomplete; run the upgraded core build")
             if initial_archive and db.execute("SELECT 1 FROM public_render_queue WHERE last_error IS NULL LIMIT 1").fetchone():
                 raise ValueError("Initial permanent-storage migration still has articles pending")
-            if manifest is not None:
-                ledger = set()
-                for path, sha in db.execute("SELECT path,sha256 FROM public_artifacts"):
-                    if path == "app.js":
-                        continue  # Retired in new releases; immutable old versions remain intact.
-                    if manifest.get(path) != sha:
-                        raise ValueError("Local publication snapshot is incomplete: " + path)
-                    ledger.add(path)
-                return ledger
+            ledger = dict(db.execute("SELECT path,sha256 FROM public_artifacts"))
+        for path, sha in ledger.items():
+            if manifest is not None and manifest.get(path) != sha:
+                raise ValueError("Local publication snapshot is incomplete: " + path)
+        return ledger
 
 
     def publish(self):
@@ -530,7 +520,7 @@ class Publisher:
             raise ValueError("Publication is on hold; inspect status and use the explicit resume command")
         if not self.public.is_dir():
             raise ValueError("Build the public output first")
-        self.publication_readiness()
+        ledger = self.publication_readiness()
         previous = read_json(self.state / "publication.json", {})
         archive_info = None
         with tempfile.TemporaryDirectory(prefix="release-", dir=self.state) as temporary:
@@ -543,23 +533,24 @@ class Publisher:
                 generation = synchronized["generation"]
                 if not previous.get("archive"):
                     self.publication_readiness(initial_archive=True)
-                hot_manifest = self.archive.snapshot_hot(stage, generation)
-                if self.validate(stage, hot_only=True) != hot_manifest:
-                    raise ValueError("Hot asset snapshot changed")
-                manifest = {**hot_manifest, **self.archive.manifest(VERIFY_PATHS, generation)}
-                articles = self.archive.articles(generation)
+                manifest = self.archive.snapshot(stage, generation)
+                self.validate(stage)  # the Worker bundle meets the same budgets and feed checks as a static publication
+                articles = {path for path in manifest if ARTICLE.fullmatch(path)}
                 archive_info = {"manifest_sha256": synchronized["manifest_sha256"],
                                 "generation": generation, "origin": self.archive.cfg["public_origin"]}
             else:
-                with lock(str(self.database) + ".lock", shared=True):
-                    shutil.copytree(self.public, stage, symlinks=True,
-                                    ignore=lambda directory, names: {"app.js"} if Path(directory) == self.public else set())
-                manifest = self.validate(stage)
+                manifest = ledger
+                # Copy and validate unless the recorded publication was validated from this ledger and Worker.
+                if previous.get("content_hash") != self.publication_identity(ledger):
+                    with lock(str(self.database) + ".lock", shared=True):
+                        shutil.copytree(self.public, stage, symlinks=True)
+                    manifest = self.validate(stage)
+                    ledger = self.publication_readiness(manifest)
                 # The database's ledger decides, so a page left behind by a newer database does not count.
-                ledger = self.publication_readiness(manifest)
-                articles = {path for path in (manifest if ledger is None else ledger) if ARTICLE.fullmatch(path)}
-            # Never drop a permalink the live publication serves, as a restored older
-            # database would. Static receipts list articles in their manifest.
+                articles = {path for path in ledger if ARTICLE.fullmatch(path)}
+            # Never drop a permalink the live publication serves, as a restored older database
+            # would. Receipts list articles in their manifest; earlier permanent-storage ones
+            # listed them apart.
             published = [*previous.get("manifest", {}), *previous.get("articles", [])]
             if {path for path in published if ARTICLE.fullmatch(path)} - articles:
                 raise ValueError("A previously published article is missing from this publication; "
@@ -573,14 +564,12 @@ class Publisher:
                 LOG.info("Public output unchanged; skipping Cloudflare upload")
                 return previous
             config = self.make_config(self.prepare_assets(stage), archive=archive_info)
-            options = {"archive": archive_info} if archive_info else {}
             # Resolve fallible metadata before any activation, including a first deploy.
             live = self.base_url if (self.state / "routes.json").exists() else self.origin_url()
             provenance = {"app_version": self.app_version(),
                           "app_commit": self.git_commit(self.path(self.cfg.get("app_source", "../onionflash"))),
                           "deployment_commit": self.git_commit(ROOT)}
-            # A small per-version receipt preserves the previous archive root for
-            # manual rollback and private retention.
+            # Rollback restores the previous publication from its receipt.
             if previous.get("version_id") == before and previous.get("manifest"):
                 prior_path = self.state / "receipts" / (before + ".json")
                 if not prior_path.exists():
@@ -614,12 +603,12 @@ class Publisher:
                 parsed = urlsplit(preview)
                 if parsed.scheme != "https" or not parsed.hostname or not parsed.hostname.endswith(".workers.dev") or parsed.username:
                     raise ValueError("Invalid Cloudflare preview URL")
-                self.verify(preview.rstrip("/") + self.base_path, manifest, **options)
+                self.verify(preview.rstrip("/") + self.base_path, manifest, archive=archive_info)
                 if self.current_version() != before:
                     raise ValueError("Active Worker version changed during preview; external version retained")
                 self.activate(version, self.control_config())
             try:
-                self.verify(live, manifest, **options)
+                self.verify(live, manifest, archive=archive_info)
             except Exception as failure:
                 if before is not None:
                     if self.current_version() != version:
@@ -633,9 +622,13 @@ class Publisher:
                        "content_hash": identity, "manifest": manifest,
                        "published_at": datetime.now(timezone.utc).isoformat(), **provenance}
             if archive_info:
-                receipt.update(archive=archive_info, articles=sorted(articles))
+                receipt["archive"] = archive_info
             atomic_json(self.state / "receipts" / (version + ".json"), receipt)
             atomic_json(self.state / "publication.json", receipt)
+            if not archive_info:  # Static receipts list every file; rollback needs only the previous one.
+                for old in (self.state / "receipts").glob("*.json"):
+                    if old.stem not in {version, before}:
+                        old.unlink()
             LOG.info("Published version %s (%s files) at %s", version, len(manifest), live)
             return receipt
 
@@ -653,8 +646,7 @@ class Publisher:
         receipt = json.loads((self.state / "publication.json").read_text())
         if "manifest" not in receipt:
             raise ValueError("The publication receipt lists no files to check; publish once, then attach routes")
-        options = {"archive": receipt["archive"]} if receipt.get("archive") else {}
-        self.verify(self.origin_url(), receipt["manifest"], **options)
+        self.verify(self.origin_url(), receipt["manifest"], archive=receipt.get("archive"))
         zone = self.secret(ZONE_ID)
         if not re.fullmatch(r"[0-9a-f]{32}", zone):
             raise ValueError("Invalid zone ID")
@@ -676,7 +668,7 @@ class Publisher:
                 route = self.api(f"/zones/{zone}/workers/routes", "POST", {"pattern": pattern, "script": self.cf["worker_name"]}, zone=True)
                 created.append(route["id"])
                 LOG.info("Added scoped route %s", pattern)
-            self.verify(self.base_url, receipt["manifest"], **options)
+            self.verify(self.base_url, receipt["manifest"], archive=receipt.get("archive"))
         except Exception:
             for route_id in reversed(created):
                 self.api(f"/zones/{zone}/workers/routes/{route_id}", "DELETE", zone=True)
@@ -796,26 +788,16 @@ class Publisher:
             result["report"] = None
 
     def retain_private_history(self):
-        if not self.cfg.get("retention", {}).get("enabled"):
-            return
-        from retention import RetentionStore
-        seconds = self.cfg["retention"].get("run_budget_seconds", 60)
-        if type(seconds) is not int or not 1 <= seconds <= 3600:
-            raise ValueError("Invalid retention run budget")
-        engine = RetentionStore(self, s3_client=self.archive.client)
-        destination = {key: self.archive.cfg[key] for key in ("endpoint_url", "region", "bucket", "private_prefix")}
-        policy = hashlib.sha256(json.dumps(engine.cfg, sort_keys=True).encode()).hexdigest()
+        """One scheduled sweep: a new destination or a limited batch does not wait for the interval."""
+        import retention
         previous = read_json(self.state / "retention.json", {})
         age = time.time() - previous.get("timestamp", 0)
-        if (previous.get("batch_complete") and previous.get("destination") == destination
-                and previous.get("policy_hash") == policy and 0 <= age < engine.cfg["interval_seconds"]):
+        if (previous.get("batch_complete") and previous.get("destination") == retention.destination(self.archive)
+                and 0 <= age < retention.INTERVAL_SECONDS):
             return
-        with engine.archive.budget(seconds):
-            result = engine.run()
-        result.update(timestamp=time.time(), destination=destination, policy_hash=policy,
-                      batch_complete=(result["evidence"]["records_archived"] < engine.cfg["batch_size"]
-                                      and result["receipts"]["receipts_archived"] < engine.cfg["batch_size"]))
-        atomic_json(self.state / "retention.json", result)
+        with self.archive.budget(retention.RUN_BUDGET_SECONDS):
+            result = retention.archive_evidence(self.archive)
+        atomic_json(self.state / "retention.json", {**result, "timestamp": time.time()})
 
 
     def run_cycle(self):
@@ -875,8 +857,6 @@ class Publisher:
             if not self.cfg.get("spaces", {}).get("enabled"):
                 raise ValueError("Spaces backups are disabled; set spaces.enabled = true or copy the database yourself")
             self.backup(force=force)
-        elif command == "retention":
-            self.retain_private_history()
         elif command == "hold":
             atomic_json(self.state / "publication-hold.json", {"reason": "manual hold", "timestamp": time.time()})
         elif command == "resume":
@@ -892,7 +872,7 @@ def main():
     os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default=str(ROOT / "deployment.toml"))
-    parser.add_argument("command", choices=["check", "run", "publish", "backup", "routes", "schedule", "status", "rollback", "hold", "resume", "retention"])
+    parser.add_argument("command", choices=["check", "run", "publish", "backup", "routes", "schedule", "status", "rollback", "hold", "resume"])
     parser.add_argument("--force", action="store_true", help="Create a backup even when its interval has not elapsed")
     args = parser.parse_args()
     if args.force and args.command != "backup":
