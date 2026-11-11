@@ -47,7 +47,9 @@ SPACES_KEY, SPACES_SECRET = "DO_SPACES_KEY", "DO_SPACES_SECRET"
 RETIRED = {"archive": {"env_file", "max_uploads_per_run", "max_upload_bytes_per_run", "max_object_bytes",
                        "max_manifest_bytes", "shard_prefix_chars", "sync_budget_seconds", "cache_ttl_seconds",
                        "immutable_cache_ttl_seconds", "worker_timeout_ms", "worker_retry_attempts",
-                       "worker_backoff_ms", "worker_backoff_cap_ms"}}
+                       "worker_backoff_ms", "worker_backoff_cap_ms"},
+           "retention": {"interval_seconds", "hot_days", "receipt_hot_days", "batch_size", "max_bundle_bytes",
+                         "run_budget_seconds"}}
 
 
 def public_files():
@@ -188,6 +190,8 @@ class Publisher:
         for section in ("archive", "retention"):
             if type(self.cfg.get(section, {}).get("enabled", False)) is not bool:
                 raise ValueError(section + ".enabled must be a boolean")
+        if unknown := set(self.cfg.get("retention", {})) - {"enabled"}:
+            raise ValueError("Unknown retention settings: " + ", ".join(sorted(unknown)))
         if self.cfg.get("retention", {}).get("enabled") and not self.cfg.get("archive", {}).get("enabled"):
             raise ValueError("Private retention requires configured permanent storage")
         self.state = self.path(self.cfg.get("state_dir", "state"))
@@ -779,26 +783,16 @@ class Publisher:
             result["report"] = None
 
     def retain_private_history(self):
-        if not self.cfg.get("retention", {}).get("enabled"):
-            return
-        from retention import RetentionStore
-        seconds = self.cfg["retention"].get("run_budget_seconds", 60)
-        if type(seconds) is not int or not 1 <= seconds <= 3600:
-            raise ValueError("Invalid retention run budget")
-        engine = RetentionStore(self, s3_client=self.archive.client)
-        destination = {key: self.archive.cfg[key] for key in ("endpoint_url", "region", "bucket", "private_prefix")}
-        policy = hashlib.sha256(json.dumps(engine.cfg, sort_keys=True).encode()).hexdigest()
+        """One scheduled sweep: a new destination or a limited batch does not wait for the interval."""
+        import retention
         previous = read_json(self.state / "retention.json", {})
         age = time.time() - previous.get("timestamp", 0)
-        if (previous.get("batch_complete") and previous.get("destination") == destination
-                and previous.get("policy_hash") == policy and 0 <= age < engine.cfg["interval_seconds"]):
+        if (previous.get("batch_complete") and previous.get("destination") == retention.destination(self.archive)
+                and 0 <= age < retention.INTERVAL_SECONDS):
             return
-        with engine.archive.budget(seconds):
-            result = engine.run()
-        result.update(timestamp=time.time(), destination=destination, policy_hash=policy,
-                      batch_complete=(result["evidence"]["records_archived"] < engine.cfg["batch_size"]
-                                      and result["receipts"]["receipts_archived"] < engine.cfg["batch_size"]))
-        atomic_json(self.state / "retention.json", result)
+        with self.archive.budget(retention.RUN_BUDGET_SECONDS):
+            result = retention.archive_evidence(self.archive)
+        atomic_json(self.state / "retention.json", {**result, "timestamp": time.time()})
 
 
     def run_cycle(self):
@@ -858,8 +852,6 @@ class Publisher:
             if not self.cfg.get("spaces", {}).get("enabled"):
                 raise ValueError("Spaces backups are disabled; set spaces.enabled = true or copy the database yourself")
             self.backup(force=force)
-        elif command == "retention":
-            self.retain_private_history()
         elif command == "hold":
             atomic_json(self.state / "publication-hold.json", {"reason": "manual hold", "timestamp": time.time()})
         elif command == "resume":
@@ -875,7 +867,7 @@ def main():
     os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default=str(ROOT / "deployment.toml"))
-    parser.add_argument("command", choices=["check", "run", "publish", "backup", "routes", "schedule", "status", "rollback", "hold", "resume", "retention"])
+    parser.add_argument("command", choices=["check", "run", "publish", "backup", "routes", "schedule", "status", "rollback", "hold", "resume"])
     parser.add_argument("--force", action="store_true", help="Create a backup even when its interval has not elapsed")
     args = parser.parse_args()
     if args.force and args.command != "backup":

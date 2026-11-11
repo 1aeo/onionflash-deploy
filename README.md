@@ -208,7 +208,7 @@ before resuming; the first publication after resuming uploads again.
 `state/publication.json` records the live version, its predecessor and the exact
 file hashes. `state/receipts/` keeps that record for the live and previous
 versions, which rollback restores; with permanent storage it keeps one for every
-version, including its root, for retention.
+version, including its root.
 
 A run that fails with "Active Worker version differs from the publication receipt"
 names the live and recorded versions. A failed restore, a run interrupted after

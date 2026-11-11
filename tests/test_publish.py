@@ -3,40 +3,19 @@ from contextlib import closing, redirect_stdout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
-from pathlib import Path
 import sqlite3
-import tempfile
 import threading
 import unittest
 from unittest.mock import patch
 from urllib.error import HTTPError, URLError
 
 import publish
+from tests.fakes import make_publisher
 
 
 class DeploymentTests(unittest.TestCase):
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temporary.cleanup)
-        self.directory = Path(self.temporary.name)
-        environment = patch.dict(os.environ, {"CLOUDFLARE_ACCOUNT_ID": "a" * 32,
-                                               "CLOUDFLARE_API_TOKEN": "unit-test-not-a-real-secret",
-                                               "CLOUDFLARE_ZONE_TOKEN": "zone-test-not-a-real-secret",
-                                               "CLOUDFLARE_ZONE_ID": "b" * 32})
-        environment.start()
-        self.addCleanup(environment.stop)
-        config = (publish.ROOT / "deployment.example.toml").read_text()
-        (self.directory / "deployment.toml").write_text(config)
-        (self.directory / "onionflash.toml").write_text('''[site]
-base_url = "https://example.com/onionflash/"
-[storage]
-database = "state/news.sqlite3"
-output_dir = "build/public"
-[[sources]]
-id = "test"
-url = "https://example.org/feed.xml"
-''')
-        self.publisher = publish.Publisher(self.directory / "deployment.toml")
+        self.directory, self.publisher = make_publisher(self)
 
     def serve(self, handle):
         """A local HTTP server whose every request is passed to handle(handler)."""
@@ -117,14 +96,24 @@ url = "https://example.org/feed.xml"
         path.write_text(path.read_text().replace("[cloudflare]\n", '[network]\nattempts = 99\n\n'
                                                  '[cloudflare]\napi_token_env = "OTHER_NAME"\nverify_paths = ["x"]\n')
                         .replace("[archive]\n", '[archive]\nenv_file = "archive-secrets.env"\nshard_prefix_chars = 3\n'
-                                 'worker_timeout_ms = 100\n'))
+                                 'worker_timeout_ms = 100\n')
+                        # Every [retention] key that earlier examples set.
+                        .replace("[retention]\n", "[retention]\ninterval_seconds = 86400\nhot_days = 90\nreceipt_hot_days = 30\n"
+                                 "batch_size = 100\nmax_bundle_bytes = 16777216\nrun_budget_seconds = 60\n"))
         with self.assertLogs(publish.LOG, "WARNING") as logs:
             p = publish.Publisher(path)
         self.assertEqual(p.net, publish.NETWORK)
         self.assertEqual(p.token, os.environ["CLOUDFLARE_API_TOKEN"])
         self.assertEqual([record.args for record in logs.records],
-                         [("archive", "env_file"), ("archive", "shard_prefix_chars"), ("archive", "worker_timeout_ms")])
+                         [("archive", "env_file"), ("archive", "shard_prefix_chars"), ("archive", "worker_timeout_ms")]
+                         + [("retention", key) for key in ("batch_size", "hot_days", "interval_seconds", "max_bundle_bytes",
+                                                           "receipt_hot_days", "run_budget_seconds")])
         self.assertFalse(publish.RETIRED["archive"] & set(p.cfg["archive"]))
+        self.assertEqual(p.cfg["retention"], {"enabled": False})
+        # Any other key is a mistake that check, like every command, reports at load.
+        path.write_text((publish.ROOT / "deployment.example.toml").read_text().replace("[retention]\n", "[retention]\nenable = true\n"))
+        with self.assertRaisesRegex(ValueError, "Unknown retention settings: enable"):
+            publish.Publisher(path)
 
     def test_virtualenv_executable_path_preserves_symlink(self):
         binary = self.directory / ".venv/bin/python"

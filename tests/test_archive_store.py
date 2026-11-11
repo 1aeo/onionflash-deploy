@@ -1,6 +1,4 @@
-import base64
 import hashlib
-import io
 import json
 from pathlib import Path
 import shutil
@@ -12,13 +10,11 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from botocore.exceptions import ClientError, EndpointConnectionError
-
 import archive_store
 from archive_store import ArchiveStore
 from publish import public_files
+from tests.fakes import FakeS3
 
-ALL_USERS = "http://acs.amazonaws.com/groups/global/AllUsers"
 # Serves stored objects to the real Worker as Spaces would, and prints what it answers.
 WORKER = """
 import { readFileSync } from "node:fs";
@@ -39,44 +35,6 @@ for (const path of state.paths) for (const method of ["GET", "HEAD"]) {
 }
 console.log(JSON.stringify(served));
 """
-
-
-class FakeS3:
-    def __init__(self):
-        self.objects, self.puts, self.heads = {}, [], []
-        self.fail_puts = 0
-        self.on_put = None  # called with each key once its object is stored
-
-    def head_object(self, Bucket, Key):
-        self.heads.append(Key)
-        if Key not in self.objects:
-            raise ClientError({"Error": {"Code": "404"}}, "HeadObject")
-        obj = self.objects[Key]
-        return {"ContentLength": len(obj["body"]), "Metadata": obj["metadata"], "ETag": '"' + hashlib.md5(obj["body"]).hexdigest() + '"'}
-
-    def put_object(self, Bucket, Key, Body, ContentLength, ContentMD5, ContentType, ACL, CacheControl, Metadata):
-        if self.fail_puts:
-            self.fail_puts -= 1
-            raise EndpointConnectionError(endpoint_url="https://storage.example")
-        body = Body.read()
-        assert len(body) == ContentLength
-        assert base64.b64encode(hashlib.md5(body).digest()).decode() == ContentMD5
-        self.objects[Key] = {"body": body, "metadata": Metadata, "acl": ACL, "type": ContentType, "cache": CacheControl}
-        self.puts.append(Key)
-        if self.on_put:
-            self.on_put(Key)
-
-    def get_object(self, Bucket, Key):
-        return {"Body": io.BytesIO(self.objects[Key]["body"])}
-
-    def delete_object(self, Bucket, Key):
-        del self.objects[Key]
-
-    def get_object_acl(self, Bucket, Key):
-        grants = [{"Grantee": {"Type": "CanonicalUser", "ID": "owner"}, "Permission": "FULL_CONTROL"}]
-        if self.objects[Key]["acl"] == "public-read":
-            grants.append({"Grantee": {"Type": "Group", "URI": ALL_USERS}, "Permission": "READ"})
-        return {"Owner": {"ID": "owner"}, "Grants": grants}
 
 
 class ArchiveTests(unittest.TestCase):

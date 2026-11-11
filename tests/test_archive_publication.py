@@ -2,11 +2,8 @@
 import copy
 from contextlib import closing
 import json
-import os
-from pathlib import Path
 import shutil
 import sqlite3
-import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -15,22 +12,12 @@ from archive_store import ArchiveStore
 from onionflash.cli import build
 from onionflash.config import DEFAULTS
 from onionflash.store import Store, backup_database
-from test_archive_store import FakeS3
-from test_recovery import OLD, NEW
+from tests.fakes import FakeS3, NEW, OLD, make_publisher
 
 
 class PermanentPublicationTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name).resolve()
-        env = patch.dict(os.environ, {"CLOUDFLARE_ACCOUNT_ID": "a" * 32,
-            "CLOUDFLARE_API_TOKEN": "fake-cloudflare-credential", "CLOUDFLARE_ZONE_TOKEN": "fake-zone-credential",
-            "CLOUDFLARE_ZONE_ID": "b" * 32, "DO_SPACES_KEY": "fake-storage-key", "DO_SPACES_SECRET": "fake-storage-secret"})
-        env.start(); self.addCleanup(env.stop)
-        (self.root / "deployment.toml").write_text((publish.ROOT / "deployment.example.toml").read_text())
-        (self.root / "onionflash.toml").write_text('[site]\nbase_url="https://example.com/onionflash/"\n[storage]\ndatabase="state/news.sqlite3"\noutput_dir="public"\n[[sources]]\nid="test"\nurl="https://example.org/feed.xml"\n')
-        self.p = publish.Publisher(self.root / "deployment.toml")
+        self.root, self.p = make_publisher(self, output_dir="public")
         self.p.cfg["archive"]["enabled"] = True
         self.s3 = FakeS3()
         self.p._archive = ArchiveStore(self.p, client=self.s3)

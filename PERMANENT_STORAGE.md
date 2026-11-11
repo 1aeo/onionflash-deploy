@@ -36,8 +36,8 @@ bytes match the manifest's hash. Browser URLs such as
    above, and set `enabled = true`.
 
 Only verified published objects and routing manifests receive a public-read
-object ACL. Raw source bodies, model evidence, database backups and operational
-receipts remain private: an unsigned request for any such object must be refused
+object ACL. Raw source bodies, model evidence and database backups remain
+private: an unsigned request for any such object must be refused
 (see [backups](README.md#digitalocean-spaces)). Storage checks every
 upload against its Content-MD5, and an object that already exists must match its
 size, sha256 metadata and ETag; unknown or corrupt objects stop publication
@@ -62,9 +62,10 @@ without Spaces backups, back up the database yourself.
 ./deploy.sh status
 ```
 
-`check` validates application settings, the installed toolchain, and enabled
-archive settings/credential presence. It does not create a bucket or prove that
-the credential has access to remote storage; the publication checks do that.
+`check` validates application settings, the `[retention]` keys, the installed
+toolchain, and enabled archive settings/credential presence. It does not create
+a bucket or prove that the credential has access to remote storage; the
+publication checks do that.
 
 For a large initial migration, repeat runs while `articles_pending` or archive
 pending counts remain. Existing article routes are not switched until previously
@@ -81,22 +82,18 @@ through the Worker, so a wrong origin or root fails them.
 Publication, rollback and recovery work as described in the
 [README](README.md#publication).
 
-## Private evidence and receipt retention
+## Private evidence retention
 
-Optional `[retention]` defaults keep 90 days of analysis cache and of the source
-bodies of published or ignored items, and 30 days of publication receipts,
-locally; other items keep their source bodies. Completed sweeps run daily; full
-batches continue on subsequent scheduled runs until the backlog drains.
-Enable it only after `[archive]` is
-working. The job first writes a compressed private bundle, reads it back and
-checks its privacy as above. It then compacts only rows and files that have not
-changed meanwhile, so concurrent edits are preserved. Source items and historical
-analysis snapshots referenced by unfinished final-review jobs are pinned in hot
-storage, including jobs awaiting operator action. Pins are checked again under
-the compaction transaction after remote storage I/O, so a new review cannot lose
-its supporting evidence during upload. Completed review audits travel with their
-analysis rows into private evidence bundles. Full SQLite backups also preserve
-the unfinished jobs and exact approval cache.
+Optional `[retention]` moves two kinds of private data to private storage after
+90 days: analysis cache rows, and the source bodies of ignored items, other than
+GitLab issues, that no story uses. Every other item, including published ones,
+keeps its source body. Enable it only after `[archive]` is working. Scheduled runs
+sweep once a day; a batch cut short by its row or byte limit continues on the
+next run until the backlog drains. A sweep first writes a compressed private
+bundle, reads it back and checks its privacy as above. It then compacts only
+rows that have not changed meanwhile, so concurrent edits are preserved. A final
+review whose source survives only as an analysis snapshot older than 90 days
+holds its update as missing source material.
 
 Item IDs, source URLs, content hashes, timestamps, story mappings, retry state,
 published stories, last-good public article JSON and incident deduplication state
@@ -105,14 +102,8 @@ endpoint, region, object key and hash so archived material remains findable
 after storage settings change. Future analysis rows preserve the collected source snapshot;
 legacy rows are archived as they exist, without fabricating missing inputs.
 
-Current/previous publication receipts and receipts referenced by holds or
-rollback state are pinned. Legacy transition records from older installations
-are also honored when deciding what to retain. Remote private evidence, immutable public
-objects and article history have no automatic expiry.
-
-```sh
-./deploy.sh retention   # Run one bounded private-retention batch explicitly.
-```
+Publication receipts stay in `state/receipts/`. Remote private evidence,
+immutable public objects and article history have no automatic expiry.
 
 Routine private backups contain only a gzip-compressed SQLite snapshot, including
 the permanent publication catalog and last-good public story JSON. They do not

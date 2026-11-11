@@ -3,10 +3,8 @@ from datetime import datetime, timezone
 import gzip
 import io
 import json
-import os
 from pathlib import Path
 import sqlite3
-import tempfile
 import unittest
 from contextlib import closing, redirect_stdout
 from concurrent.futures import ThreadPoolExecutor
@@ -14,10 +12,8 @@ from unittest.mock import ANY, MagicMock, patch
 from urllib.error import HTTPError, URLError
 
 import publish
+from tests.fakes import NEW, OLD, make_publisher
 
-
-OLD = "11111111-1111-4111-8111-111111111111"
-NEW = "22222222-2222-4222-8222-222222222222"
 OTHER = "33333333-3333-4333-8333-333333333333"
 
 
@@ -54,31 +50,7 @@ class FakeSpaces:
 
 class RecoveryTests(unittest.TestCase):
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temporary.cleanup)
-        self.directory = Path(self.temporary.name).resolve()
-        environment = patch.dict(os.environ, {
-            "CLOUDFLARE_ACCOUNT_ID": "a" * 32,
-            "CLOUDFLARE_API_TOKEN": "test-cloudflare-secret",
-            "CLOUDFLARE_ZONE_TOKEN": "test-zone-secret",
-            "CLOUDFLARE_ZONE_ID": "b" * 32,
-            "DO_SPACES_KEY": "test-spaces-key",
-            "DO_SPACES_SECRET": "test-spaces-secret",
-        })
-        environment.start()
-        self.addCleanup(environment.stop)
-        (self.directory / "deployment.toml").write_text(
-            (publish.ROOT / "deployment.example.toml").read_text())
-        (self.directory / "onionflash.toml").write_text('''[site]
-base_url = "https://example.com/onionflash/"
-[storage]
-database = "state/news.sqlite3"
-output_dir = "build/public"
-[[sources]]
-id = "test"
-url = "https://example.org/feed.xml"
-''')
-        self.p = publish.Publisher(self.directory / "deployment.toml")
+        self.directory, self.p = make_publisher(self)
 
     def seed_public(self):
         """Generated output and the core's ledger of it."""
