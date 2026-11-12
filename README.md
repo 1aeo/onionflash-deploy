@@ -30,6 +30,10 @@ cd onionflash-deploy
 ./install.sh ../onionflash
 ```
 
+The installer builds the application from its checked-out commit only, so
+untracked files and build caches in the checkout are never installed. It refuses
+a checkout with uncommitted changes to tracked files.
+
 Edit the three generated files (all ignored by Git):
 
 1. **`onionflash.toml`**: website URL, sources, LLM endpoint/model and timeout,
