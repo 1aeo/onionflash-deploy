@@ -35,6 +35,9 @@ API_BASE = "https://api.cloudflare.com/client/v4"
 MAX_FILES, MAX_FILE_BYTES, MAX_TOTAL_BYTES = 10000, 10 * 1024 * 1024, 100 * 1024 * 1024
 COMMAND_TIMEOUT_SECONDS = 240
 VERIFY_PATHS = ("index.html", "feed.xml", "feed.json")
+# A new version can take longer than 15 seconds to reach the edge, so checks retry each
+# path for about two minutes (backoff 2, 4, 8, 16, then 30 seconds).
+VERIFY_ATTEMPTS = 8
 ARTICLE = re.compile(r"news/[A-Za-z0-9_-]{1,64}/index\.html")
 # The publisher's own requests and storage clients. Responses may be as large as
 # any validated file, so verification can always read a file back.
@@ -426,8 +429,7 @@ class Publisher:
         if archive:  # One article also proves the Worker's route to permanent storage.
             paths += sorted(path for path in manifest if ARTICLE.fullmatch(path))[:1]
         for relative in paths:
-            # Newly activated assets may take a short time to reach the edge.
-            for attempt in range(self.net["attempts"]):
+            for attempt in range(VERIFY_ATTEMPTS):
                 try:
                     actual = hashlib.sha256(self.request(base_url.rstrip("/") + "/" + relative)).hexdigest()
                     if actual != manifest[relative]:
@@ -436,7 +438,7 @@ class Publisher:
                 except (ValueError, OSError) as exc:
                     if isinstance(exc, HTTPError) and exc.code != 404 and exc.code < 500:
                         raise
-                    if attempt + 1 == self.net["attempts"]:
+                    if attempt + 1 == VERIFY_ATTEMPTS:
                         raise
                     self.delay(attempt)
 
@@ -548,13 +550,24 @@ class Publisher:
                     ledger = self.publication_readiness(manifest)
                 # The database's ledger decides, so a page left behind by a newer database does not count.
                 articles = {path for path in ledger if ARTICLE.fullmatch(path)}
-            # Never drop a permalink the live publication serves, as a restored older database
-            # would. Receipts list articles in their manifest; earlier permanent-storage ones
-            # listed them apart.
-            published = [*previous.get("manifest", {}), *previous.get("articles", [])]
-            if {path for path in published if ARTICLE.fullmatch(path)} - articles:
-                raise ValueError("A previously published article is missing from this publication; "
-                                 "restore a database that contains it")
+            # Never drop a permalink this deployment has published, not after a rollback, a reset
+            # receipt or a restored older database: permalinks.json only grows. A missing one
+            # starts from the live receipt alone, even when nothing changed. Receipts list
+            # articles in their manifest; earlier permanent-storage ones listed them apart.
+            permalinks = self.state / "permalinks.json"
+            try:
+                recorded = read_json(permalinks, [])
+            except ValueError:  # not JSON
+                recorded = None
+            if not isinstance(recorded, list) or not all(isinstance(path, str) and ARTICLE.fullmatch(path) for path in recorded):
+                raise ValueError(f"{permalinks} is damaged; restore it from a copy")
+            published = set(recorded) | {path for path in [*previous.get("manifest", {}), *previous.get("articles", [])]
+                                         if ARTICLE.fullmatch(path)}
+            if published - articles:
+                raise ValueError("A previously published article is missing from this publication: restore a "
+                                 "database that contains it; to withdraw a story, retract it")
+            if not permalinks.exists() or set(recorded) != published:
+                atomic_json(permalinks, sorted(published))
             identity = self.publication_identity(manifest, archive_info)
             before = self.current_version()
             if before != previous.get("version_id"):
@@ -618,6 +631,8 @@ class Publisher:
                     except Exception as restore:
                         raise RuntimeError(f"Live check failed ({failure}) and restoring {before} failed: {restore}") from failure
                 raise
+            # Before the receipts: once they record this content, unchanged runs skip this step.
+            atomic_json(permalinks, sorted(articles))
             receipt = {"version_id": version, "previous_version_id": before,
                        "content_hash": identity, "manifest": manifest,
                        "published_at": datetime.now(timezone.utc).isoformat(), **provenance}
@@ -765,13 +780,13 @@ class Publisher:
         LOG.info("Installed a %s-minute cron job", interval)
 
 
-    def application(self, command):
+    def application(self, *arguments):
         """Run one app command and return its output; failures carry the app's error."""
         budget = self.app["collection"]["run_budget_seconds"]
         # The application never needs the Cloudflare or Spaces credentials.
         private = self.private_names() - {self.app["llm"]["api_key_env"]}
         env = {k: v for k, v in os.environ.items() if k not in private}
-        result = subprocess.run([str(self.path(self.cfg["app_python"])), "-m", "onionflash", command,
+        result = subprocess.run([str(self.path(self.cfg["app_python"])), "-m", "onionflash", *arguments,
                                  "--config", str(self.app_config)], capture_output=True, text=True,
                                 timeout=budget + 300, env=env)
         if result.returncode:
@@ -799,6 +814,17 @@ class Publisher:
             result = retention.archive_evidence(self.archive)
         atomic_json(self.state / "retention.json", {**result, "timestamp": time.time()})
 
+    def weekly_summary(self):
+        """Once per ISO week, keep the application's decision summary here for the operator; nothing
+        is sent. The week's file is written last, so after any failure a later run tries again."""
+        year, week, _ = datetime.now(timezone.utc).isocalendar()
+        target = self.state / "weekly" / f"{year}-W{week:02d}.md"
+        if not target.exists():
+            # One line of JSON from the command becomes an indented file; non-ASCII text stays escaped.
+            summary = json.loads(self.application("decisions", "summary", "--since", "7d"))
+            atomic_json(target.with_name("latest.md"), summary)
+            atomic_json(target, summary)
+
 
     def run_cycle(self):
         result = {"phases": {}, "errors": [], "warnings": []}
@@ -811,7 +837,7 @@ class Publisher:
                 message = phase + ": " + self.clean_error(exc)
                 result["phases"][phase] = "failed"
                 result["errors" if required else "warnings"].append(message)
-                LOG.error("%s", message)
+                (LOG.error if required else LOG.warning)("%s", message)
                 return False
         if attempt("collection", lambda: self.collect(result)):
             if (self.state / "publication-hold.json").exists():
@@ -824,6 +850,7 @@ class Publisher:
         attempt("backup", self.backup, required=self.cfg.get("spaces", {}).get("required", False))
         if self.cfg.get("retention", {}).get("enabled"):
             attempt("retention", self.retain_private_history, required=False)
+        attempt("weekly_summary", self.weekly_summary, required=False)
         result.update(ok=not result["errors"], degraded=bool(result["warnings"]))
         return result
 

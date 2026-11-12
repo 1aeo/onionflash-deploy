@@ -48,6 +48,8 @@ behind an application interface.
 - Make the smallest change that solves the problem, and delete code that loses
   its last caller.
 - Keep each fact in one document and link to it instead of restating it.
+- Never weaken the permalink check or add a way to drop a published article; a
+  story is corrected or retracted in the application.
 - Tests pin behavior, not implementation details. After `install.sh`, run
   `.venv/bin/python -m unittest discover -s tests` and
   `node_modules/node/bin/node --test tests/*.mjs` before every push.

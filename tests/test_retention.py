@@ -136,6 +136,39 @@ class RetentionTests(unittest.TestCase):
         self.assertEqual(self.rows("analyses")[0]["result"], "new analysis")
         self.assertEqual(self.rows("private_archive_refs"), [])
 
+    def test_a_damaged_item_is_skipped_and_the_rest_of_the_batch_continues(self):
+        # Broken JSON, an Infinity that only SQLite's strict check rejects, a non-object, a BLOB, and
+        # three objects to SQLite that compaction cannot read and write back: a lone surrogate as bytes,
+        # which are not UTF-8, or as a JSON escape, and text after a NUL byte, where SQLite stops reading.
+        for identity, damage in {"broken": "'{'", "infinity": "replace(payload,'\"Source title\"','Infinity')",
+                                 "array": "'[1]'", "blob": "CAST(payload AS BLOB)",
+                                 "bytes": "replace(payload,'Source',x'eda080')",
+                                 "escaped": "replace(payload,'Source','\\ud800')", "extra": "payload||char(0)||'x'"}.items():
+            self.item(identity)
+            with self.db() as db:
+                db.execute("UPDATE items SET payload=" + damage + " WHERE id=?", (identity,))
+
+        def damaged():
+            with self.db() as db:
+                db.text_factory = bytes  # bytes that are not UTF-8 fail a read as text
+                return [tuple(row) for row in db.execute("SELECT *,typeof(payload) FROM items WHERE id!='item'")]
+
+        before = damaged()
+        self.item()
+        with patch.object(retention, "BATCH_SIZE", 1), self.assertLogs("onionflash.deploy", level="WARNING") as logged:
+            # The skipped items sort first and take no place; diagnostics contain no source payload.
+            result = self.sweep()
+        self.assertEqual({record.args[0] for record in logged.records}, {"bytes", "escaped", "extra"})
+        self.assertEqual({record.args[1] for record in logged.records},
+                         {"UnicodeDecodeError", "UnicodeEncodeError", "JSONDecodeError"})
+        self.assertNotIn("private body", "\n".join(logged.output))
+        self.assertNotIn("Source title", "\n".join(logged.output))
+        self.assertEqual((result["records_archived"], result["items_compacted"]), (1, 1))
+        self.assertEqual([row["record_id"] for row in self.rows("private_archive_refs")], ["item"])
+        self.assertEqual(damaged(), before)
+        with self.assertLogs("onionflash.deploy", level="WARNING"):
+            self.assertEqual((self.sweep()["records_archived"], len(self.s3.puts)), (0, 1))
+
     def test_new_item_revision_can_be_archived_without_losing_earlier_proof(self):
         self.item()
         self.sweep()

@@ -11,10 +11,11 @@ import sys
 from publish import BusyLock, Publisher, lock, redact
 
 ACTIONS = {
-    "story": {"show", "history", "correct", "retract", "restore", "unlock"},
-    "rejected": {"list", "show", "retry", "dismiss"},
+    "story": {"show", "history", "correct", "retract", "restore", "unlock", "merge"},
+    "rejected": {"list", "show", "retry", "dismiss", "approve"},
+    "decisions": {"summary", "list"},
 }
-READ_ONLY = {"show", "history", "list"}
+READ_ONLY = {"show", "history", "list", "summary"}
 
 
 @contextmanager

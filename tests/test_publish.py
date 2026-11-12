@@ -162,6 +162,19 @@ class DeploymentTests(unittest.TestCase):
                 p.verify("https://example.com/onionflash", manifest)
         sleep.assert_not_called()
 
+    def test_checks_wait_about_two_minutes_for_a_new_version_to_reach_the_edge(self):
+        p, new = self.publisher, b"new content"
+        manifest = dict.fromkeys(publish.VERIFY_PATHS, publish.hashlib.sha256(new).hexdigest())
+        stale = [b"previous content"] * (publish.VERIFY_ATTEMPTS - 1)
+        with patch.object(p, "request", side_effect=stale + [new] * 3), patch("publish.time.sleep") as sleep:
+            p.verify("https://example.com/onionflash", manifest)
+        waited = sum(call.args[0] for call in sleep.call_args_list)
+        self.assertGreater(waited, 110)  # about two minutes
+        self.assertLess(waited, 130)
+        with patch.object(p, "request", return_value=b"previous content"), patch("publish.time.sleep"):
+            with self.assertRaisesRegex(ValueError, "Published hash mismatch: index.html"):
+                p.verify("https://example.com/onionflash", manifest)
+
     def test_credentials_file_is_literal_and_private(self):
         path = self.directory / "literal.env"
         path.write_text('ONIONFLASH_TEST_LITERAL="$(do-not-execute)"\n')

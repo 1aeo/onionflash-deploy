@@ -30,6 +30,10 @@ cd onionflash-deploy
 ./install.sh ../onionflash
 ```
 
+The installer builds the application from its checked-out commit only, so
+untracked files and build caches in the checkout are never installed. It refuses
+a checkout with uncommitted changes to tracked files.
+
 Edit the three generated files (all ignored by Git):
 
 1. **`onionflash.toml`**: website URL, sources, LLM endpoint/model and timeout,
@@ -162,17 +166,17 @@ decompress it into a new private directory and check it with `PRAGMA quick_check
 Replace the database only with the scheduled job stopped and the application lock
 held, then run `./deploy.sh app build --force`, repeating it while it reports
 `articles_pending` (no LLM calls are needed), before resuming publication.
-Publication refuses a database that lacks an article the live site already
-serves; restore a newer copy instead. Keep the old database until recovery is
-verified. Credentials are never included in backups.
+Publication refuses a database that lacks an article this deployment has
+published (see [Operations](#operations)); restore a newer copy instead. Keep the
+old database until recovery is verified. Credentials are never included in backups.
 
 ## Operations
 
 Use `./deploy.sh app` for offline application operations. It loads the protected
 dotenv file and the application config named in `deployment.toml`, so environment
 references such as `${ONIONFLASH_LLM_BASE_URL}` work without sourcing a shell file.
-Only `story`, `rejected`, `build`, and `status` are available; do not supply an
-application `--config`. Cloudflare, Spaces, and LLM keys are removed from the
+Only `story`, `rejected`, `decisions`, `build`, and `status` are available; do not
+supply an application `--config`. Cloudflare, Spaces, and LLM keys are removed from the
 application environment after configuration is resolved. Inspection remains
 available during scheduled work; mutations take the deployment lock and the
 application's database lock, returning **75** if either is busy.
@@ -180,17 +184,28 @@ application's database lock, returning **75** if either is busy.
 ```sh
 ./deploy.sh app status
 ./deploy.sh app rejected list --limit 20
+./deploy.sh app decisions summary --since 7d
 ./deploy.sh app story show --story STORY_ID
 ./deploy.sh app build      # Render saved stories after an editorial change
 ./deploy.sh publish        # Publish the resulting files, or let the next cron run do it
 ```
 
+`rejected approve` and `story merge` take the run lock;
+`decisions summary|list` are read-only.
 The `story` and `rejected` action flags match the application's
 [editorial](https://github.com/1aeo/onionflash/blob/main/docs/EDITORIAL.md) and
 [rejected-analysis](https://github.com/1aeo/onionflash/blob/main/docs/REJECTED_ANALYSES.md)
 guides. These application commands make no source, model, or publication requests.
 Corrections and retractions require a subsequent build and publication to appear
 on the website; retrying a rejection only queues it for a later scheduled analysis.
+
+After each run, when `state/weekly/<YYYY>-W<WW>.md` for the current ISO week does
+not exist yet, the publisher writes the JSON of the application's
+`decisions summary --since 7d`, indented, there and to `state/weekly/latest.md`,
+both with mode 600. The [summary](https://github.com/1aeo/onionflash/blob/main/docs/DECISIONS.md#commands)
+covers the last seven days and includes the size of `feed.xml`. Nothing is sent;
+read the files on the server. A failure is a degraded warning, never a failed run,
+and the next run tries again.
 
 ```sh
 ./deploy.sh publish    # Publish already generated output; no LLM call
@@ -208,7 +223,10 @@ before resuming; the first publication after resuming uploads again.
 `state/publication.json` records the live version, its predecessor and the exact
 file hashes. `state/receipts/` keeps that record for the live and previous
 versions, which rollback restores; with permanent storage it keeps one for every
-version, including its root.
+version, including its root. `state/permalinks.json` lists every article this
+deployment has published and only grows: rollback leaves it alone, and a
+publication that lacks one of its articles is refused whatever the receipts say.
+To withdraw a story, retract it.
 
 A run that fails with "Active Worker version differs from the publication receipt"
 names the live and recorded versions. A failed restore, a run interrupted after
@@ -219,10 +237,12 @@ Worker's deployments in the Cloudflare dashboard (or with `wrangler versions dep
 To keep it, replace `state/publication.json`: if `state/receipts/` has a record
 for that version, use the record with its `content_hash` field deleted; otherwise
 write `{"version_id": "<live version>"}`. Either way the next run uploads and
-checks a new version. A version-only receipt lists no articles, so that next
-publication cannot refuse to drop a permalink: use it only with a database that
-has every published story, such as the one the live version was built from. If
-`state/routes.json` was lost too, restore it. Otherwise the next publication is
+checks a new version. A version-only receipt lists no articles, and
+`state/permalinks.json` lists only articles whose publication passed its live
+check, so use such a receipt only with a database that has every published story,
+such as the one the live version was built from, and restore
+`state/permalinks.json` if it was lost too. If `state/routes.json` was lost too,
+restore it. Otherwise the next publication is
 checked at the workers.dev origin, and `./deploy.sh routes` restores the check
 against the public hostname once that publication has written a full receipt.
 Then resume.
@@ -243,9 +263,9 @@ rollback. Production installations should use reviewed tags or commit SHAs.
 The publisher's and the Worker's timeouts, retries and size limits are constants
 in the code.
 Publication checks retry transient failures and not-yet-propagated files with
-exponential backoff; other client errors fail promptly. Wrangler retries its own API
-calls. LLM and source fallbacks are configured in the application, not hardcoded in
-deployment scripts.
+exponential backoff for about two minutes per file; other client errors fail
+promptly. Wrangler retries its own API calls. LLM and source fallbacks are
+configured in the application, not hardcoded in deployment scripts.
 
 ## Tests
 

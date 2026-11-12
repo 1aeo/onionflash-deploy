@@ -12,7 +12,9 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 import gzip
 import hashlib
+from itertools import islice
 import json
+import logging
 from pathlib import Path
 import tempfile
 
@@ -22,6 +24,7 @@ import tempfile
 HOT_DAYS, BATCH_SIZE, MAX_BUNDLE_BYTES = 90, 100, 16 * 1024**2
 RUN_BUDGET_SECONDS, INTERVAL_SECONDS = 60, 86400
 FORMAT = "onionflash-private-evidence-v1"
+LOG = logging.getLogger("onionflash.deploy")
 SCHEMA = """
     CREATE TABLE IF NOT EXISTS private_archive_refs (
         kind TEXT NOT NULL, record_id TEXT NOT NULL, record_hash TEXT NOT NULL,
@@ -33,13 +36,17 @@ SCHEMA = """
     CREATE INDEX IF NOT EXISTS retention_analyses_age ON analyses(created_at,cache_key);
 """
 # The partial age index lists only candidate items, oldest first; the hint keeps the planner on it.
+# A damaged item, whose payload is not a JSON object in text, is skipped and stays as it is. CASE
+# tests that first, since SQLite fixes no order for WHERE terms and json_extract raises on bad JSON.
+# _items then skips the damage SQLite cannot see; the query returns the bytes it checks.
 QUERIES = (
-    ("item", """SELECT * FROM items INDEXED BY retention_items_age
+    ("item", """SELECT id,CAST(payload AS BLOB) FROM items INDEXED BY retention_items_age
         WHERE status='ignored' AND story_id IS NULL AND last_seen<?
-        AND json_extract(payload,'$.kind') IS NOT 'gitlab_issue'
+        AND CASE WHEN typeof(payload)='text' AND json_valid(payload) THEN json_type(payload)='object'
+            AND json_extract(payload,'$.kind') IS NOT 'gitlab_issue' END
         AND NOT EXISTS (SELECT 1 FROM private_archive_refs a WHERE a.kind='item'
             AND a.record_id=items.id AND a.record_hash=items.content_hash)
-        ORDER BY last_seen,id LIMIT ?"""),
+        ORDER BY last_seen,id"""),
     ("analysis", "SELECT * FROM analyses WHERE created_at<? ORDER BY created_at,cache_key LIMIT ?"),
 )
 
@@ -57,6 +64,19 @@ def _iso(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
+def _items(db, query, cutoff):
+    """The item query's rows whose payload compaction can read and write back. SQLite accepts bytes
+    that are not UTF-8 in a JSON string, which fail any read of the row, and an escaped lone
+    surrogate, which cannot be stored once parsed; such an item is skipped like other damage."""
+    for key, payload in db.execute(query, (cutoff,)):
+        try:
+            json.dumps(json.loads(str(payload, "utf-8")), ensure_ascii=False).encode()
+        except (ValueError, RecursionError) as error:
+            LOG.warning("Skipping damaged retention item %r (%s)", key, type(error).__name__)
+            continue
+        yield db.execute("SELECT * FROM items WHERE id=?", (key,)).fetchone()
+
+
 def destination(archive) -> dict:
     """Where new evidence goes; each reference keeps the one it was archived to."""
     return {key: archive.cfg[key] for key in ("endpoint_url", "region", "bucket")}
@@ -71,7 +91,9 @@ def archive_evidence(archive, now: datetime | None = None) -> dict:
     with archive._database() as db:
         db.executescript(SCHEMA)
         for kind, query in QUERIES:
-            for row in db.execute(query, (cutoff, BATCH_SIZE - len(records))):
+            limit = BATCH_SIZE - len(records)  # a skipped item takes no place in the batch
+            rows = islice(_items(db, query, cutoff), limit) if kind == "item" else db.execute(query, (cutoff, limit))
+            for row in rows:
                 record = {"kind": kind, "row": dict(row)}
                 amount = len(_json(record)) + 1
                 if size + amount > MAX_BUNDLE_BYTES:

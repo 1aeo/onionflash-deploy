@@ -1,14 +1,18 @@
 """Failure-path checks for owned deployment transitions and private backups."""
 from datetime import datetime, timezone
+import errno
 import gzip
 import io
 import json
+import os
 from pathlib import Path
+import re
 import sqlite3
+import sys
 import unittest
 from contextlib import closing, redirect_stdout
 from concurrent.futures import ThreadPoolExecutor
-from unittest.mock import ANY, MagicMock, patch
+from unittest.mock import ANY, MagicMock, call, patch
 from urllib.error import HTTPError, URLError
 
 import publish
@@ -114,6 +118,7 @@ class RecoveryTests(unittest.TestCase):
         self.seed_public()
         self.fake_cloudflare(OLD)
         gone = "news/gone/index.html"
+        publish.atomic_json(self.p.state / "permalinks.json", [])  # as an older copy restored without it
         for previous in ({**receipt(OLD), "manifest": {gone: "a" * 64}}, {**receipt(OLD), "articles": [gone]}):
             with self.subTest(previous=previous):  # a static or a permanent-storage receipt
                 publish.atomic_json(self.p.state / "publication.json", previous)
@@ -121,8 +126,114 @@ class RecoveryTests(unittest.TestCase):
                     self.p.publish()
                 self.assertEqual(self.calls, [])
 
+    def add_article(self, story_id):
+        body = f"<p>{story_id}</p>".encode()
+        (self.p.public / "news" / story_id).mkdir(parents=True)
+        (self.p.public / "news" / story_id / "index.html").write_bytes(body)
+        with closing(sqlite3.connect(self.p.database)) as db, db:
+            db.execute("INSERT INTO public_artifacts VALUES(?,?)", (f"news/{story_id}/index.html", publish.hashlib.sha256(body).hexdigest()))
+
+    def test_a_published_article_stays_required_after_a_rollback_or_a_reset_receipt(self):
+        self.seed_public()
+        self.add_article("kept")
+        # Only the live receipt starts the record, not the older one rollback would restore.
+        publish.atomic_json(self.p.state / "publication.json", receipt(OLD, OTHER))
+        publish.atomic_json(self.p.state / "receipts" / (OTHER + ".json"), {**receipt(OTHER), "manifest": {"news/earlier/index.html": "a" * 64}})
+        self.fake_cloudflare(OLD)
+        self.p.publish()
+        permalinks = self.p.state / "permalinks.json"
+        self.assertEqual(publish.read_json(permalinks), ["news/kept/index.html"])
+        self.p.rollback()
+        self.p.execute("resume")
+        with closing(sqlite3.connect(self.p.database)) as db, db:
+            db.execute("DELETE FROM public_artifacts WHERE path='news/kept/index.html'")
+        for previous in (None, {"version_id": OLD}, {}):  # the rolled-back receipt, a version-only or a lost one
+            with self.subTest(previous=previous):
+                if previous is not None:
+                    publish.atomic_json(self.p.state / "publication.json", previous)
+                self.calls.clear()
+                with self.assertRaisesRegex(ValueError, "previously published article.*to withdraw a story, retract it"):
+                    self.p.publish()
+                self.assertEqual(self.calls, [])
+        self.assertEqual(publish.read_json(permalinks), ["news/kept/index.html"])
+
+    def test_the_live_receipt_starts_the_record_even_when_nothing_changed(self):
+        self.seed_public()
+        self.add_article("live")
+        self.fake_cloudflare(OLD)
+        published = self.p.publish()
+        (self.p.state / "permalinks.json").unlink()  # as before the record existed
+        # Only the live receipt starts the record, not the rollback target's.
+        publish.atomic_json(self.p.state / "receipts" / (OLD + ".json"), {**receipt(OLD), "manifest": {"news/earlier/index.html": "a" * 64}})
+        self.calls.clear()
+        self.assertEqual(self.p.publish(), published)
+        self.assertEqual(self.calls, [])  # unchanged: nothing uploaded
+        self.assertEqual(publish.read_json(self.p.state / "permalinks.json"), ["news/live/index.html"])
+
+    def test_an_empty_record_learns_live_articles_before_unchanged_and_rollback(self):
+        self.seed_public()
+        self.add_article("live")
+        self.fake_cloudflare(OLD)
+        published = self.p.publish()
+        permalinks = self.p.state / "permalinks.json"
+        publish.atomic_json(permalinks, [])
+        self.calls.clear()
+        self.assertEqual(self.p.publish(), published)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(publish.read_json(permalinks), ["news/live/index.html"])
+
+        self.p.rollback()
+        self.p.execute("resume")
+        with closing(sqlite3.connect(self.p.database)) as db, db:
+            db.execute("DELETE FROM public_artifacts WHERE path='news/live/index.html'")
+        self.calls.clear()
+        with self.assertRaisesRegex(ValueError, "previously published article.*to withdraw a story, retract it"):
+            self.p.publish()
+        self.assertEqual(self.calls, [])
+        self.assertEqual(publish.read_json(permalinks), ["news/live/index.html"])
+
+    def test_an_existing_record_adds_live_receipt_articles_before_unchanged(self):
+        self.seed_public()
+        self.add_article("earlier")
+        self.add_article("live")
+        self.fake_cloudflare(OLD)
+        published = self.p.publish()
+        permalinks = self.p.state / "permalinks.json"
+        publish.atomic_json(permalinks, ["news/earlier/index.html"])
+        self.calls.clear()
+        self.assertEqual(self.p.publish(), published)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(publish.read_json(permalinks), ["news/earlier/index.html", "news/live/index.html"])
+
+    def test_a_run_interrupted_after_its_live_check_has_recorded_its_articles(self):
+        self.seed_public()
+        self.add_article("new")
+        self.fake_cloudflare(OLD)
+        write = publish.atomic_json
+        def interrupted(path, value):
+            if Path(path).name == NEW + ".json":
+                raise KeyboardInterrupt
+            write(path, value)
+        with patch("publish.atomic_json", side_effect=interrupted), self.assertRaises(KeyboardInterrupt):
+            self.p.publish()
+        self.assertEqual(self.calls[-1], "verify live")
+        self.assertEqual(publish.read_json(self.p.state / "permalinks.json"), ["news/new/index.html"])
+
+    def test_a_damaged_record_of_published_articles_refuses_publication(self):
+        self.seed_public()
+        self.fake_cloudflare(OLD)
+        permalinks = self.p.state / "permalinks.json"
+        for text in ("{}", '["news/../x"]', '["news/kept/index.html"'):  # not a list, not an article, not JSON
+            with self.subTest(text=text):
+                permalinks.write_text(text)
+                with self.assertRaisesRegex(ValueError, re.escape(f"{permalinks} is damaged")):
+                    self.p.publish()
+                self.assertEqual(self.calls, [])
+                self.assertEqual(permalinks.read_text(), text)
+
     def test_failed_live_check_rolls_back_and_fails_without_holding(self):
         self.seed_public()
+        self.add_article("new")
         publish.atomic_json(self.p.state / "publication.json", receipt(OLD))
         self.fake_cloudflare(OLD, failing_check="live")
         with self.assertRaisesRegex(ValueError, "check failed"):
@@ -130,6 +241,7 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(self.calls[-2:], ["verify live", "activate " + OLD])
         self.assertEqual(self.live[0], OLD)
         self.assertEqual(publish.read_json(self.p.state / "publication.json")["version_id"], OLD)
+        self.assertEqual(publish.read_json(self.p.state / "permalinks.json"), [])  # never verified live, so not recorded
         self.assertFalse((self.p.state / "publication-hold.json").exists())
 
     def test_a_failed_restore_reports_both_failures_and_stops_the_next_run_for_inspection(self):
@@ -328,14 +440,18 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(result["phases"]["backup"], "ok")
 
     def test_collection_failure_skips_publication_but_preserves_backup_attempt(self):
-        with patch.object(self.p, "application", side_effect=ValueError("collection failed")), \
+        with patch.object(self.p, "application", side_effect=[ValueError("collection failed"), "{}"]) as application, \
                 patch.object(self.p, "publish") as publication, \
-                patch.object(self.p, "backup") as backup:
+                patch.object(self.p, "backup") as backup, self.assertLogs(publish.LOG, "WARNING") as logged:
             result = self.p.run_cycle()
         publication.assert_not_called()
         backup.assert_called_once()
         self.assertFalse(result["ok"])
         self.assertEqual(result["phases"]["publication"], "skipped")
+        self.assertEqual([(r.levelname, r.getMessage()) for r in logged.records], [("ERROR", "collection: collection failed")])
+        # The weekly summary still follows the failed run.
+        self.assertEqual(application.call_args_list, [call("run"), call("decisions", "summary", "--since", "7d")])
+        self.assertEqual((result["phases"]["weekly_summary"], len(list((self.p.state / "weekly").iterdir()))), ("ok", 2))
 
     def test_publication_hold_still_collects_and_backs_up(self):
         publish.atomic_json(self.p.state / "publication-hold.json", {"reason": "operator hold"})
@@ -343,7 +459,7 @@ class RecoveryTests(unittest.TestCase):
                 patch.object(self.p, "publish") as publish_call, \
                 patch.object(self.p, "backup") as backup:
             result = self.p.run_cycle()
-        application.assert_called_once_with("run")
+        self.assertEqual(application.call_args_list, [call("run"), call("decisions", "summary", "--since", "7d")])
         publish_call.assert_not_called()
         backup.assert_called_once()
         self.assertTrue(result["ok"])
@@ -427,6 +543,68 @@ class RecoveryTests(unittest.TestCase):
             result = self.p.run_cycle()
         self.assertEqual(result["report"], {"sources_ok": 15, "sources_failed": 3})
         self.assertGreater(run.call_args.kwargs["timeout"], 0)
+
+    def test_each_iso_week_keeps_one_private_decision_summary(self):
+        self.addCleanup(os.umask, os.umask(0o022))  # private whatever the umask
+        weekly, sizes = self.p.state / "weekly", []
+        def application(*arguments):
+            if arguments == ("run",):
+                return '{"sources_ok": 1}'
+            self.assertEqual(arguments, ("decisions", "summary", "--since", "7d"))
+            sizes.append(len(sizes) + 1)
+            return '{"feed": {"bytes": %d}, "title": "\\u202e"}' % sizes[-1]  # one line, as the application prints it
+        with patch.object(self.p, "application", side_effect=application), patch.object(self.p, "publish"), \
+                patch.object(self.p, "backup"), patch("publish.datetime") as clock:
+            # Two runs in ISO week 53 of 2026 (the second one in 2027), then one in week 1 of 2027.
+            for day in (datetime(2026, 12, 31), datetime(2027, 1, 3), datetime(2027, 1, 4)):
+                clock.now.return_value = day.replace(tzinfo=timezone.utc)
+                result = self.p.run_cycle()
+                self.assertEqual((result["phases"]["weekly_summary"], result["degraded"]), ("ok", False))
+        self.assertEqual(sizes, [1, 2])
+        self.assertEqual(sorted(path.name for path in weekly.iterdir()), ["2026-W53.md", "2027-W01.md", "latest.md"])
+        for name, size in [("2026-W53.md", 1), ("2027-W01.md", 2), ("latest.md", 2)]:
+            # Indented for reading; the escape keeps a control or bidi character inert.
+            self.assertEqual((weekly / name).read_text(), '{\n  "feed": {\n    "bytes": %d\n  },\n  "title": "\\u202e"\n}\n' % size)
+            self.assertEqual((weekly / name).stat().st_mode & 0o777, 0o600)
+
+    def test_a_failed_weekly_summary_is_a_warning_and_a_later_run_writes_it(self):
+        weekly, failures, summary = self.p.state / "weekly", [RuntimeError("summary unavailable")], '{"writer_clears": 0}'
+        def application(*arguments):
+            if arguments == ("run",):
+                return '{"sources_ok": 1}'
+            if failures:
+                raise failures.pop()
+            return summary
+        def failed_run():
+            """One successful run; returns its only warning, the summary's failure, also logged as a warning."""
+            with self.assertLogs(publish.LOG, "WARNING") as logged:
+                result = self.p.run_cycle()
+            (warning,) = result["warnings"]
+            self.assertEqual((result["ok"], result["degraded"], result["phases"]["weekly_summary"]), (True, True, "failed"))
+            self.assertEqual([(r.levelname, r.getMessage()) for r in logged.records], [("WARNING", warning)])
+            return warning
+        with patch.object(self.p, "application", side_effect=application), patch.object(self.p, "publish"), \
+                patch.object(self.p, "backup"), patch("publish.datetime") as clock:
+            clock.now.return_value = datetime(2026, 11, 11, tzinfo=timezone.utc)
+            self.assertEqual(failed_run(), "weekly_summary: summary unavailable")
+            (weekly / "latest.md").mkdir(parents=True)  # writing latest.md fails
+            self.assertIn("Is a directory", failed_run())
+            self.assertEqual([path.name for path in weekly.iterdir()], ["latest.md"])
+            (weekly / "latest.md").rmdir()
+            # The disk fills while the week's file is written, after latest.md and its directory are synced.
+            with patch("publish.os.fsync", side_effect=[None, None, OSError(errno.ENOSPC, "No space left on device")]):
+                self.assertIn("No space left on device", failed_run())
+            self.assertEqual([path.name for path in weekly.iterdir()], ["latest.md"])  # no partial or temporary file
+            result = self.p.run_cycle()
+        self.assertEqual((result["ok"], result["degraded"]), (True, False))
+        for name in ("2026-W46.md", "latest.md"):
+            self.assertEqual(publish.read_json(weekly / name), json.loads(summary))
+
+    def test_the_real_application_prints_the_weekly_summary(self):
+        self.p.cfg["app_python"] = sys.executable  # the interpreter running these tests has the application
+        self.p.weekly_summary()
+        summary = json.loads((self.p.state / "weekly" / "latest.md").read_text())
+        self.assertEqual(summary["feed"]["path"], "feed.xml")
 
     def test_schedule_logs_cron_output_and_wrangler_logs_to_a_directory(self):
         import subprocess
