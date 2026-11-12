@@ -1,15 +1,18 @@
 """Failure-path checks for owned deployment transitions and private backups."""
 from datetime import datetime, timezone
+import errno
 import gzip
 import io
 import json
+import os
 from pathlib import Path
 import re
 import sqlite3
+import sys
 import unittest
 from contextlib import closing, redirect_stdout
 from concurrent.futures import ThreadPoolExecutor
-from unittest.mock import ANY, MagicMock, patch
+from unittest.mock import ANY, MagicMock, call, patch
 from urllib.error import HTTPError, URLError
 
 import publish
@@ -402,14 +405,18 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(result["phases"]["backup"], "ok")
 
     def test_collection_failure_skips_publication_but_preserves_backup_attempt(self):
-        with patch.object(self.p, "application", side_effect=ValueError("collection failed")), \
+        with patch.object(self.p, "application", side_effect=[ValueError("collection failed"), "{}"]) as application, \
                 patch.object(self.p, "publish") as publication, \
-                patch.object(self.p, "backup") as backup:
+                patch.object(self.p, "backup") as backup, self.assertLogs(publish.LOG, "WARNING") as logged:
             result = self.p.run_cycle()
         publication.assert_not_called()
         backup.assert_called_once()
         self.assertFalse(result["ok"])
         self.assertEqual(result["phases"]["publication"], "skipped")
+        self.assertEqual([(r.levelname, r.getMessage()) for r in logged.records], [("ERROR", "collection: collection failed")])
+        # The weekly summary still follows the failed run.
+        self.assertEqual(application.call_args_list, [call("run"), call("decisions", "summary", "--since", "7d")])
+        self.assertEqual((result["phases"]["weekly_summary"], len(list((self.p.state / "weekly").iterdir()))), ("ok", 2))
 
     def test_publication_hold_still_collects_and_backs_up(self):
         publish.atomic_json(self.p.state / "publication-hold.json", {"reason": "operator hold"})
@@ -417,7 +424,7 @@ class RecoveryTests(unittest.TestCase):
                 patch.object(self.p, "publish") as publish_call, \
                 patch.object(self.p, "backup") as backup:
             result = self.p.run_cycle()
-        application.assert_called_once_with("run")
+        self.assertEqual(application.call_args_list, [call("run"), call("decisions", "summary", "--since", "7d")])
         publish_call.assert_not_called()
         backup.assert_called_once()
         self.assertTrue(result["ok"])
@@ -501,6 +508,68 @@ class RecoveryTests(unittest.TestCase):
             result = self.p.run_cycle()
         self.assertEqual(result["report"], {"sources_ok": 15, "sources_failed": 3})
         self.assertGreater(run.call_args.kwargs["timeout"], 0)
+
+    def test_each_iso_week_keeps_one_private_decision_summary(self):
+        self.addCleanup(os.umask, os.umask(0o022))  # private whatever the umask
+        weekly, sizes = self.p.state / "weekly", []
+        def application(*arguments):
+            if arguments == ("run",):
+                return '{"sources_ok": 1}'
+            self.assertEqual(arguments, ("decisions", "summary", "--since", "7d"))
+            sizes.append(len(sizes) + 1)
+            return '{"feed": {"bytes": %d}, "title": "\\u202e"}' % sizes[-1]  # one line, as the application prints it
+        with patch.object(self.p, "application", side_effect=application), patch.object(self.p, "publish"), \
+                patch.object(self.p, "backup"), patch("publish.datetime") as clock:
+            # Two runs in ISO week 53 of 2026 (the second one in 2027), then one in week 1 of 2027.
+            for day in (datetime(2026, 12, 31), datetime(2027, 1, 3), datetime(2027, 1, 4)):
+                clock.now.return_value = day.replace(tzinfo=timezone.utc)
+                result = self.p.run_cycle()
+                self.assertEqual((result["phases"]["weekly_summary"], result["degraded"]), ("ok", False))
+        self.assertEqual(sizes, [1, 2])
+        self.assertEqual(sorted(path.name for path in weekly.iterdir()), ["2026-W53.md", "2027-W01.md", "latest.md"])
+        for name, size in [("2026-W53.md", 1), ("2027-W01.md", 2), ("latest.md", 2)]:
+            # Indented for reading; the escape keeps a control or bidi character inert.
+            self.assertEqual((weekly / name).read_text(), '{\n  "feed": {\n    "bytes": %d\n  },\n  "title": "\\u202e"\n}\n' % size)
+            self.assertEqual((weekly / name).stat().st_mode & 0o777, 0o600)
+
+    def test_a_failed_weekly_summary_is_a_warning_and_a_later_run_writes_it(self):
+        weekly, failures, summary = self.p.state / "weekly", [RuntimeError("summary unavailable")], '{"writer_clears": 0}'
+        def application(*arguments):
+            if arguments == ("run",):
+                return '{"sources_ok": 1}'
+            if failures:
+                raise failures.pop()
+            return summary
+        def failed_run():
+            """One successful run; returns its only warning, the summary's failure, also logged as a warning."""
+            with self.assertLogs(publish.LOG, "WARNING") as logged:
+                result = self.p.run_cycle()
+            (warning,) = result["warnings"]
+            self.assertEqual((result["ok"], result["degraded"], result["phases"]["weekly_summary"]), (True, True, "failed"))
+            self.assertEqual([(r.levelname, r.getMessage()) for r in logged.records], [("WARNING", warning)])
+            return warning
+        with patch.object(self.p, "application", side_effect=application), patch.object(self.p, "publish"), \
+                patch.object(self.p, "backup"), patch("publish.datetime") as clock:
+            clock.now.return_value = datetime(2026, 11, 11, tzinfo=timezone.utc)
+            self.assertEqual(failed_run(), "weekly_summary: summary unavailable")
+            (weekly / "latest.md").mkdir(parents=True)  # writing latest.md fails
+            self.assertIn("Is a directory", failed_run())
+            self.assertEqual([path.name for path in weekly.iterdir()], ["latest.md"])
+            (weekly / "latest.md").rmdir()
+            # The disk fills while the week's file is written, after latest.md and its directory are synced.
+            with patch("publish.os.fsync", side_effect=[None, None, OSError(errno.ENOSPC, "No space left on device")]):
+                self.assertIn("No space left on device", failed_run())
+            self.assertEqual([path.name for path in weekly.iterdir()], ["latest.md"])  # no partial or temporary file
+            result = self.p.run_cycle()
+        self.assertEqual((result["ok"], result["degraded"]), (True, False))
+        for name in ("2026-W46.md", "latest.md"):
+            self.assertEqual(publish.read_json(weekly / name), json.loads(summary))
+
+    def test_the_real_application_prints_the_weekly_summary(self):
+        self.p.cfg["app_python"] = sys.executable  # the interpreter running these tests has the application
+        self.p.weekly_summary()
+        summary = json.loads((self.p.state / "weekly" / "latest.md").read_text())
+        self.assertEqual(summary["feed"]["path"], "feed.xml")
 
     def test_schedule_logs_cron_output_and_wrangler_logs_to_a_directory(self):
         import subprocess

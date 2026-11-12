@@ -780,13 +780,13 @@ class Publisher:
         LOG.info("Installed a %s-minute cron job", interval)
 
 
-    def application(self, command):
+    def application(self, *arguments):
         """Run one app command and return its output; failures carry the app's error."""
         budget = self.app["collection"]["run_budget_seconds"]
         # The application never needs the Cloudflare or Spaces credentials.
         private = self.private_names() - {self.app["llm"]["api_key_env"]}
         env = {k: v for k, v in os.environ.items() if k not in private}
-        result = subprocess.run([str(self.path(self.cfg["app_python"])), "-m", "onionflash", command,
+        result = subprocess.run([str(self.path(self.cfg["app_python"])), "-m", "onionflash", *arguments,
                                  "--config", str(self.app_config)], capture_output=True, text=True,
                                 timeout=budget + 300, env=env)
         if result.returncode:
@@ -814,6 +814,17 @@ class Publisher:
             result = retention.archive_evidence(self.archive)
         atomic_json(self.state / "retention.json", {**result, "timestamp": time.time()})
 
+    def weekly_summary(self):
+        """Once per ISO week, keep the application's decision summary here for the operator; nothing
+        is sent. The week's file is written last, so after any failure a later run tries again."""
+        year, week, _ = datetime.now(timezone.utc).isocalendar()
+        target = self.state / "weekly" / f"{year}-W{week:02d}.md"
+        if not target.exists():
+            # One line of JSON from the command becomes an indented file; non-ASCII text stays escaped.
+            summary = json.loads(self.application("decisions", "summary", "--since", "7d"))
+            atomic_json(target.with_name("latest.md"), summary)
+            atomic_json(target, summary)
+
 
     def run_cycle(self):
         result = {"phases": {}, "errors": [], "warnings": []}
@@ -826,7 +837,7 @@ class Publisher:
                 message = phase + ": " + self.clean_error(exc)
                 result["phases"][phase] = "failed"
                 result["errors" if required else "warnings"].append(message)
-                LOG.error("%s", message)
+                (LOG.error if required else LOG.warning)("%s", message)
                 return False
         if attempt("collection", lambda: self.collect(result)):
             if (self.state / "publication-hold.json").exists():
@@ -839,6 +850,7 @@ class Publisher:
         attempt("backup", self.backup, required=self.cfg.get("spaces", {}).get("required", False))
         if self.cfg.get("retention", {}).get("enabled"):
             attempt("retention", self.retain_private_history, required=False)
+        attempt("weekly_summary", self.weekly_summary, required=False)
         result.update(ok=not result["errors"], degraded=bool(result["warnings"]))
         return result
 

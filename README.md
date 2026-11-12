@@ -196,6 +196,14 @@ guides. These application commands make no source, model, or publication request
 Corrections and retractions require a subsequent build and publication to appear
 on the website; retrying a rejection only queues it for a later scheduled analysis.
 
+After each run, when `state/weekly/<YYYY>-W<WW>.md` for the current ISO week does
+not exist yet, the publisher writes the JSON of the application's
+`decisions summary --since 7d`, indented, there and to `state/weekly/latest.md`,
+both with mode 600. The [summary](https://github.com/1aeo/onionflash/blob/main/docs/DECISIONS.md#commands)
+covers the last seven days and includes the size of `feed.xml`. Nothing is sent;
+read the files on the server. A failure is a degraded warning, never a failed run,
+and the next run tries again.
+
 ```sh
 ./deploy.sh publish    # Publish already generated output; no LLM call
 ./deploy.sh hold       # Pause publication while collection can continue
