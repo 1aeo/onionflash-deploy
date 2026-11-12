@@ -64,7 +64,8 @@ url = "https://example.org/feed.xml"
                                                          str(self.app_config), *arguments[position:]])
 
     def test_invalid_command_action_or_config_override_never_initializes_publisher(self):
-        cases = [("run",), ("check",), ("story",), ("rejected",), ("story", "delete"),
+        cases = [("run",), ("check",), ("story",), ("rejected",), ("decisions",),
+                 ("story", "delete"), ("decisions", "delete"),
                  ("status", "--config", "elsewhere.toml"), ("build", "--config=elsewhere.toml"),
                  ("story", "show", "--conf=elsewhere.toml"), ("rejected", "list", "--c", "elsewhere.toml"),
                  ("--config", "elsewhere.toml", "status")]
@@ -126,10 +127,11 @@ url = "https://example.org/feed.xml"
                 self.assertIn("[redacted]", error.getvalue())
 
     def test_busy_mutations_return_75_without_invocation_but_inspection_remains_available(self):
-        mutations = [("build",), *(('story', action) for action in ("correct", "retract", "restore", "unlock")),
-                     ("rejected", "retry"), ("rejected", "dismiss")]
+        mutations = [("build",), *(('story', action) for action in ("correct", "retract", "restore", "unlock", "merge")),
+                     ("rejected", "retry"), ("rejected", "dismiss"), ("rejected", "approve")]
         inspections = [("status",), ("story", "show"), ("story", "history"),
-                       ("rejected", "list"), ("rejected", "show")]
+                       ("rejected", "list"), ("rejected", "show"),
+                       ("decisions", "summary"), ("decisions", "list")]
         with publish.lock(self.directory / "state/run.lock"):
             for arguments in mutations:
                 error = io.StringIO()
@@ -149,6 +151,7 @@ url = "https://example.org/feed.xml"
                 patch("subprocess.run", side_effect=AssertionError("unexpected subprocess")), redirect_stdout(io.StringIO()):
             self.assertEqual(self.run_app("status"), 0)
             self.assertEqual(self.run_app("rejected", "list", "--limit", "1"), 0)
+            self.assertEqual(self.run_app("decisions", "summary"), 0)
             self.assertEqual(self.run_app("build"), 0)
             self.assertTrue((self.directory / "build/public/feed.xml").is_file())
             with run_lock(str(self.directory / "state/news.sqlite3")) as acquired:

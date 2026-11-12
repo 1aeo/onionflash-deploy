@@ -175,8 +175,8 @@ old database until recovery is verified. Credentials are never included in backu
 Use `./deploy.sh app` for offline application operations. It loads the protected
 dotenv file and the application config named in `deployment.toml`, so environment
 references such as `${ONIONFLASH_LLM_BASE_URL}` work without sourcing a shell file.
-Only `story`, `rejected`, `build`, and `status` are available; do not supply an
-application `--config`. Cloudflare, Spaces, and LLM keys are removed from the
+Only `story`, `rejected`, `decisions`, `build`, and `status` are available; do not
+supply an application `--config`. Cloudflare, Spaces, and LLM keys are removed from the
 application environment after configuration is resolved. Inspection remains
 available during scheduled work; mutations take the deployment lock and the
 application's database lock, returning **75** if either is busy.
@@ -184,11 +184,14 @@ application's database lock, returning **75** if either is busy.
 ```sh
 ./deploy.sh app status
 ./deploy.sh app rejected list --limit 20
+./deploy.sh app decisions summary --since 7d
 ./deploy.sh app story show --story STORY_ID
 ./deploy.sh app build      # Render saved stories after an editorial change
 ./deploy.sh publish        # Publish the resulting files, or let the next cron run do it
 ```
 
+`rejected approve` and `story merge` take the run lock;
+`decisions summary|list` are read-only.
 The `story` and `rejected` action flags match the application's
 [editorial](https://github.com/1aeo/onionflash/blob/main/docs/EDITORIAL.md) and
 [rejected-analysis](https://github.com/1aeo/onionflash/blob/main/docs/REJECTED_ANALYSES.md)
