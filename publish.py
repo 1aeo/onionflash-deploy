@@ -35,6 +35,9 @@ API_BASE = "https://api.cloudflare.com/client/v4"
 MAX_FILES, MAX_FILE_BYTES, MAX_TOTAL_BYTES = 10000, 10 * 1024 * 1024, 100 * 1024 * 1024
 COMMAND_TIMEOUT_SECONDS = 240
 VERIFY_PATHS = ("index.html", "feed.xml", "feed.json")
+# A new version can take longer than 15 seconds to reach the edge, so checks retry each
+# path for about two minutes (backoff 2, 4, 8, 16, then 30 seconds).
+VERIFY_ATTEMPTS = 8
 ARTICLE = re.compile(r"news/[A-Za-z0-9_-]{1,64}/index\.html")
 # The publisher's own requests and storage clients. Responses may be as large as
 # any validated file, so verification can always read a file back.
@@ -426,8 +429,7 @@ class Publisher:
         if archive:  # One article also proves the Worker's route to permanent storage.
             paths += sorted(path for path in manifest if ARTICLE.fullmatch(path))[:1]
         for relative in paths:
-            # Newly activated assets may take a short time to reach the edge.
-            for attempt in range(self.net["attempts"]):
+            for attempt in range(VERIFY_ATTEMPTS):
                 try:
                     actual = hashlib.sha256(self.request(base_url.rstrip("/") + "/" + relative)).hexdigest()
                     if actual != manifest[relative]:
@@ -436,7 +438,7 @@ class Publisher:
                 except (ValueError, OSError) as exc:
                     if isinstance(exc, HTTPError) and exc.code != 404 and exc.code < 500:
                         raise
-                    if attempt + 1 == self.net["attempts"]:
+                    if attempt + 1 == VERIFY_ATTEMPTS:
                         raise
                     self.delay(attempt)
 

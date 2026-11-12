@@ -248,9 +248,9 @@ rollback. Production installations should use reviewed tags or commit SHAs.
 The publisher's and the Worker's timeouts, retries and size limits are constants
 in the code.
 Publication checks retry transient failures and not-yet-propagated files with
-exponential backoff; other client errors fail promptly. Wrangler retries its own API
-calls. LLM and source fallbacks are configured in the application, not hardcoded in
-deployment scripts.
+exponential backoff for about two minutes per file; other client errors fail
+promptly. Wrangler retries its own API calls. LLM and source fallbacks are
+configured in the application, not hardcoded in deployment scripts.
 
 ## Tests
 
