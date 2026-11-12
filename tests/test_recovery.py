@@ -4,6 +4,7 @@ import gzip
 import io
 import json
 from pathlib import Path
+import re
 import sqlite3
 import unittest
 from contextlib import closing, redirect_stdout
@@ -114,6 +115,7 @@ class RecoveryTests(unittest.TestCase):
         self.seed_public()
         self.fake_cloudflare(OLD)
         gone = "news/gone/index.html"
+        publish.atomic_json(self.p.state / "permalinks.json", [])  # as an older copy restored without it
         for previous in ({**receipt(OLD), "manifest": {gone: "a" * 64}}, {**receipt(OLD), "articles": [gone]}):
             with self.subTest(previous=previous):  # a static or a permanent-storage receipt
                 publish.atomic_json(self.p.state / "publication.json", previous)
@@ -121,8 +123,79 @@ class RecoveryTests(unittest.TestCase):
                     self.p.publish()
                 self.assertEqual(self.calls, [])
 
+    def add_article(self, story_id):
+        body = f"<p>{story_id}</p>".encode()
+        (self.p.public / "news" / story_id).mkdir(parents=True)
+        (self.p.public / "news" / story_id / "index.html").write_bytes(body)
+        with closing(sqlite3.connect(self.p.database)) as db, db:
+            db.execute("INSERT INTO public_artifacts VALUES(?,?)", (f"news/{story_id}/index.html", publish.hashlib.sha256(body).hexdigest()))
+
+    def test_a_published_article_stays_required_after_a_rollback_or_a_reset_receipt(self):
+        self.seed_public()
+        self.add_article("kept")
+        # Only the live receipt starts the record, not the older one rollback would restore.
+        publish.atomic_json(self.p.state / "publication.json", receipt(OLD, OTHER))
+        publish.atomic_json(self.p.state / "receipts" / (OTHER + ".json"), {**receipt(OTHER), "manifest": {"news/earlier/index.html": "a" * 64}})
+        self.fake_cloudflare(OLD)
+        self.p.publish()
+        permalinks = self.p.state / "permalinks.json"
+        self.assertEqual(publish.read_json(permalinks), ["news/kept/index.html"])
+        self.p.rollback()
+        self.p.execute("resume")
+        with closing(sqlite3.connect(self.p.database)) as db, db:
+            db.execute("DELETE FROM public_artifacts WHERE path='news/kept/index.html'")
+        for previous in (None, {"version_id": OLD}, {}):  # the rolled-back receipt, a version-only or a lost one
+            with self.subTest(previous=previous):
+                if previous is not None:
+                    publish.atomic_json(self.p.state / "publication.json", previous)
+                self.calls.clear()
+                with self.assertRaisesRegex(ValueError, "previously published article.*to withdraw a story, retract it"):
+                    self.p.publish()
+                self.assertEqual(self.calls, [])
+        self.assertEqual(publish.read_json(permalinks), ["news/kept/index.html"])
+
+    def test_the_live_receipt_starts_the_record_even_when_nothing_changed(self):
+        self.seed_public()
+        self.add_article("live")
+        self.fake_cloudflare(OLD)
+        published = self.p.publish()
+        (self.p.state / "permalinks.json").unlink()  # as before the record existed
+        # Only the live receipt starts the record, not the rollback target's.
+        publish.atomic_json(self.p.state / "receipts" / (OLD + ".json"), {**receipt(OLD), "manifest": {"news/earlier/index.html": "a" * 64}})
+        self.calls.clear()
+        self.assertEqual(self.p.publish(), published)
+        self.assertEqual(self.calls, [])  # unchanged: nothing uploaded
+        self.assertEqual(publish.read_json(self.p.state / "permalinks.json"), ["news/live/index.html"])
+
+    def test_a_run_interrupted_after_its_live_check_has_recorded_its_articles(self):
+        self.seed_public()
+        self.add_article("new")
+        self.fake_cloudflare(OLD)
+        write = publish.atomic_json
+        def interrupted(path, value):
+            if Path(path).name == NEW + ".json":
+                raise KeyboardInterrupt
+            write(path, value)
+        with patch("publish.atomic_json", side_effect=interrupted), self.assertRaises(KeyboardInterrupt):
+            self.p.publish()
+        self.assertEqual(self.calls[-1], "verify live")
+        self.assertEqual(publish.read_json(self.p.state / "permalinks.json"), ["news/new/index.html"])
+
+    def test_a_damaged_record_of_published_articles_refuses_publication(self):
+        self.seed_public()
+        self.fake_cloudflare(OLD)
+        permalinks = self.p.state / "permalinks.json"
+        for text in ("{}", '["news/../x"]', '["news/kept/index.html"'):  # not a list, not an article, not JSON
+            with self.subTest(text=text):
+                permalinks.write_text(text)
+                with self.assertRaisesRegex(ValueError, re.escape(f"{permalinks} is damaged")):
+                    self.p.publish()
+                self.assertEqual(self.calls, [])
+                self.assertEqual(permalinks.read_text(), text)
+
     def test_failed_live_check_rolls_back_and_fails_without_holding(self):
         self.seed_public()
+        self.add_article("new")
         publish.atomic_json(self.p.state / "publication.json", receipt(OLD))
         self.fake_cloudflare(OLD, failing_check="live")
         with self.assertRaisesRegex(ValueError, "check failed"):
@@ -130,6 +203,7 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(self.calls[-2:], ["verify live", "activate " + OLD])
         self.assertEqual(self.live[0], OLD)
         self.assertEqual(publish.read_json(self.p.state / "publication.json")["version_id"], OLD)
+        self.assertEqual(publish.read_json(self.p.state / "permalinks.json"), [])  # never verified live, so not recorded
         self.assertFalse((self.p.state / "publication-hold.json").exists())
 
     def test_a_failed_restore_reports_both_failures_and_stops_the_next_run_for_inspection(self):

@@ -106,10 +106,10 @@ immutable public objects and article history have no automatic expiry.
 Routine private backups contain only a gzip-compressed SQLite snapshot, including
 the permanent publication catalog and last-good public story JSON. They do not
 repeatedly copy generated pages or the public object archive. Keep deployment
-configuration and publication receipts securely alongside the separately managed
-credentials. After a database restore, article files are rebuilt from the
-last-good public snapshots, as the README's [recovery](README.md#digitalocean-spaces)
-steps describe.
+configuration, publication receipts and `state/permalinks.json` securely
+alongside the separately managed credentials. After a database restore, article
+files are rebuilt from the last-good public snapshots, as the README's
+[recovery](README.md#digitalocean-spaces) steps describe.
 
 ## Limits and failures
 

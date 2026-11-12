@@ -162,9 +162,9 @@ decompress it into a new private directory and check it with `PRAGMA quick_check
 Replace the database only with the scheduled job stopped and the application lock
 held, then run `./deploy.sh app build --force`, repeating it while it reports
 `articles_pending` (no LLM calls are needed), before resuming publication.
-Publication refuses a database that lacks an article the live site already
-serves; restore a newer copy instead. Keep the old database until recovery is
-verified. Credentials are never included in backups.
+Publication refuses a database that lacks an article this deployment has
+published (see [Operations](#operations)); restore a newer copy instead. Keep the
+old database until recovery is verified. Credentials are never included in backups.
 
 ## Operations
 
@@ -208,7 +208,10 @@ before resuming; the first publication after resuming uploads again.
 `state/publication.json` records the live version, its predecessor and the exact
 file hashes. `state/receipts/` keeps that record for the live and previous
 versions, which rollback restores; with permanent storage it keeps one for every
-version, including its root.
+version, including its root. `state/permalinks.json` lists every article this
+deployment has published and only grows: rollback leaves it alone, and a
+publication that lacks one of its articles is refused whatever the receipts say.
+To withdraw a story, retract it.
 
 A run that fails with "Active Worker version differs from the publication receipt"
 names the live and recorded versions. A failed restore, a run interrupted after
@@ -219,10 +222,12 @@ Worker's deployments in the Cloudflare dashboard (or with `wrangler versions dep
 To keep it, replace `state/publication.json`: if `state/receipts/` has a record
 for that version, use the record with its `content_hash` field deleted; otherwise
 write `{"version_id": "<live version>"}`. Either way the next run uploads and
-checks a new version. A version-only receipt lists no articles, so that next
-publication cannot refuse to drop a permalink: use it only with a database that
-has every published story, such as the one the live version was built from. If
-`state/routes.json` was lost too, restore it. Otherwise the next publication is
+checks a new version. A version-only receipt lists no articles, and
+`state/permalinks.json` lists only articles whose publication passed its live
+check, so use such a receipt only with a database that has every published story,
+such as the one the live version was built from, and restore
+`state/permalinks.json` if it was lost too. If `state/routes.json` was lost too,
+restore it. Otherwise the next publication is
 checked at the workers.dev origin, and `./deploy.sh routes` restores the check
 against the public hostname once that publication has written a full receipt.
 Then resume.

@@ -548,13 +548,24 @@ class Publisher:
                     ledger = self.publication_readiness(manifest)
                 # The database's ledger decides, so a page left behind by a newer database does not count.
                 articles = {path for path in ledger if ARTICLE.fullmatch(path)}
-            # Never drop a permalink the live publication serves, as a restored older database
-            # would. Receipts list articles in their manifest; earlier permanent-storage ones
-            # listed them apart.
-            published = [*previous.get("manifest", {}), *previous.get("articles", [])]
-            if {path for path in published if ARTICLE.fullmatch(path)} - articles:
-                raise ValueError("A previously published article is missing from this publication; "
-                                 "restore a database that contains it")
+            # Never drop a permalink this deployment has published, not after a rollback, a reset
+            # receipt or a restored older database: permalinks.json only grows. A missing one
+            # starts from the live receipt alone, even when nothing changed. Receipts list
+            # articles in their manifest; earlier permanent-storage ones listed them apart.
+            permalinks = self.state / "permalinks.json"
+            try:
+                recorded = read_json(permalinks, [])
+            except ValueError:  # not JSON
+                recorded = None
+            if not isinstance(recorded, list) or not all(isinstance(path, str) and ARTICLE.fullmatch(path) for path in recorded):
+                raise ValueError(f"{permalinks} is damaged; restore it from a copy")
+            published = set(recorded) | {path for path in [*previous.get("manifest", {}), *previous.get("articles", [])]
+                                         if ARTICLE.fullmatch(path)}
+            if published - articles:
+                raise ValueError("A previously published article is missing from this publication: restore a "
+                                 "database that contains it; to withdraw a story, retract it")
+            if not permalinks.exists():
+                atomic_json(permalinks, sorted(published))
             identity = self.publication_identity(manifest, archive_info)
             before = self.current_version()
             if before != previous.get("version_id"):
@@ -618,6 +629,8 @@ class Publisher:
                     except Exception as restore:
                         raise RuntimeError(f"Live check failed ({failure}) and restoring {before} failed: {restore}") from failure
                 raise
+            # Before the receipts: once they record this content, unchanged runs skip this step.
+            atomic_json(permalinks, sorted(articles))
             receipt = {"version_id": version, "previous_version_id": before,
                        "content_hash": identity, "manifest": manifest,
                        "published_at": datetime.now(timezone.utc).isoformat(), **provenance}
