@@ -17,10 +17,11 @@ def export(app, destination):
     """Extract the checked-out commit alone, so local edits, untracked files and
     build caches in the checkout never reach the installed package."""
     git = ["git", "--no-optional-locks", "-C", str(app)]
+    environment = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
     try:
-        if subprocess.run([*git, "status", "--porcelain", "--untracked-files=no"], capture_output=True, check=True).stdout:
+        if subprocess.run([*git, "status", "--porcelain", "--untracked-files=no"], capture_output=True, check=True, env=environment).stdout:
             raise SystemExit("The application checkout has uncommitted changes; commit or discard them first")
-        archive = subprocess.run([*git, "archive", "--format=tar", "HEAD"], capture_output=True, check=True).stdout
+        archive = subprocess.run([*git, "archive", "--format=tar", "HEAD"], capture_output=True, check=True, env=environment).stdout
     except subprocess.CalledProcessError as error:
         raise SystemExit(f"Git could not read the application checkout {app}: {error.stderr.decode(errors='replace').strip()}") from None
     subprocess.run(["tar", "-x", "-f", "-", "-C", str(destination)], input=archive, check=True)

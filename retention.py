@@ -14,6 +14,7 @@ import gzip
 import hashlib
 from itertools import islice
 import json
+import logging
 from pathlib import Path
 import tempfile
 
@@ -23,6 +24,7 @@ import tempfile
 HOT_DAYS, BATCH_SIZE, MAX_BUNDLE_BYTES = 90, 100, 16 * 1024**2
 RUN_BUDGET_SECONDS, INTERVAL_SECONDS = 60, 86400
 FORMAT = "onionflash-private-evidence-v1"
+LOG = logging.getLogger("onionflash.deploy")
 SCHEMA = """
     CREATE TABLE IF NOT EXISTS private_archive_refs (
         kind TEXT NOT NULL, record_id TEXT NOT NULL, record_hash TEXT NOT NULL,
@@ -69,7 +71,8 @@ def _items(db, query, cutoff):
     for key, payload in db.execute(query, (cutoff,)):
         try:
             json.dumps(json.loads(str(payload, "utf-8")), ensure_ascii=False).encode()
-        except (ValueError, RecursionError):
+        except (ValueError, RecursionError) as error:
+            LOG.warning("Skipping damaged retention item %r (%s)", key, type(error).__name__)
             continue
         yield db.execute("SELECT * FROM items WHERE id=?", (key,)).fetchone()
 

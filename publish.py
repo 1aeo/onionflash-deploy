@@ -566,7 +566,7 @@ class Publisher:
             if published - articles:
                 raise ValueError("A previously published article is missing from this publication: restore a "
                                  "database that contains it; to withdraw a story, retract it")
-            if not permalinks.exists():
+            if not permalinks.exists() or set(recorded) != published:
                 atomic_json(permalinks, sorted(published))
             identity = self.publication_identity(manifest, archive_info)
             before = self.current_version()

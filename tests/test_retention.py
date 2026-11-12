@@ -155,12 +155,19 @@ class RetentionTests(unittest.TestCase):
 
         before = damaged()
         self.item()
-        with patch.object(retention, "BATCH_SIZE", 1):  # the skipped items sort first and take no place
+        with patch.object(retention, "BATCH_SIZE", 1), self.assertLogs("onionflash.deploy", level="WARNING") as logged:
+            # The skipped items sort first and take no place; diagnostics contain no source payload.
             result = self.sweep()
+        self.assertEqual({record.args[0] for record in logged.records}, {"bytes", "escaped", "extra"})
+        self.assertEqual({record.args[1] for record in logged.records},
+                         {"UnicodeDecodeError", "UnicodeEncodeError", "JSONDecodeError"})
+        self.assertNotIn("private body", "\n".join(logged.output))
+        self.assertNotIn("Source title", "\n".join(logged.output))
         self.assertEqual((result["records_archived"], result["items_compacted"]), (1, 1))
         self.assertEqual([row["record_id"] for row in self.rows("private_archive_refs")], ["item"])
         self.assertEqual(damaged(), before)
-        self.assertEqual((self.sweep()["records_archived"], len(self.s3.puts)), (0, 1))
+        with self.assertLogs("onionflash.deploy", level="WARNING"):
+            self.assertEqual((self.sweep()["records_archived"], len(self.s3.puts)), (0, 1))
 
     def test_new_item_revision_can_be_archived_without_losing_earlier_proof(self):
         self.item()

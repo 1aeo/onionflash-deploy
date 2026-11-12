@@ -170,6 +170,41 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(self.calls, [])  # unchanged: nothing uploaded
         self.assertEqual(publish.read_json(self.p.state / "permalinks.json"), ["news/live/index.html"])
 
+    def test_an_empty_record_learns_live_articles_before_unchanged_and_rollback(self):
+        self.seed_public()
+        self.add_article("live")
+        self.fake_cloudflare(OLD)
+        published = self.p.publish()
+        permalinks = self.p.state / "permalinks.json"
+        publish.atomic_json(permalinks, [])
+        self.calls.clear()
+        self.assertEqual(self.p.publish(), published)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(publish.read_json(permalinks), ["news/live/index.html"])
+
+        self.p.rollback()
+        self.p.execute("resume")
+        with closing(sqlite3.connect(self.p.database)) as db, db:
+            db.execute("DELETE FROM public_artifacts WHERE path='news/live/index.html'")
+        self.calls.clear()
+        with self.assertRaisesRegex(ValueError, "previously published article.*to withdraw a story, retract it"):
+            self.p.publish()
+        self.assertEqual(self.calls, [])
+        self.assertEqual(publish.read_json(permalinks), ["news/live/index.html"])
+
+    def test_an_existing_record_adds_live_receipt_articles_before_unchanged(self):
+        self.seed_public()
+        self.add_article("earlier")
+        self.add_article("live")
+        self.fake_cloudflare(OLD)
+        published = self.p.publish()
+        permalinks = self.p.state / "permalinks.json"
+        publish.atomic_json(permalinks, ["news/earlier/index.html"])
+        self.calls.clear()
+        self.assertEqual(self.p.publish(), published)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(publish.read_json(permalinks), ["news/earlier/index.html", "news/live/index.html"])
+
     def test_a_run_interrupted_after_its_live_check_has_recorded_its_articles(self):
         self.seed_public()
         self.add_article("new")
