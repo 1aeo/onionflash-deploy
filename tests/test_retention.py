@@ -249,6 +249,101 @@ class RetentionTests(unittest.TestCase):
         self.assertTrue(self.hot("item"))
         self.assertFalse((self.p.state / "retention.json").exists())
 
+    def test_analyses_referenced_by_active_or_story_items_or_story_payload_stay_hot(self):
+        self.item("ignored-free", status="ignored", story=None)
+        self.item("published-item", status="published", story="story")
+        self.item("ignored-story-source", status="ignored", story="story")
+        self.item("pending-item", status="pending", story=None)
+        self.item("held-item", status="rejected", story=None)
+        with self.db() as db:
+            for key, src in [("evict-ok", "ignored-free"), ("keep-pub", "published-item"),
+                             ("keep-src", "ignored-story-source"), ("keep-pend", "pending-item"),
+                             ("keep-held", "held-item"), ("keep-story-pin", None)]:
+                db.execute("INSERT INTO analyses(cache_key,result,created_at,source_payload,source_item_id) VALUES(?,?,?,?,?)",
+                           (key, '{"evidence":["q"]}', OLD, '{"content":"snap"}', src))
+            db.execute("INSERT INTO stories(id,cluster_key,payload,published_at,updated_at) VALUES(?,?,?,?,?)",
+                       ("pinned", "pinned", '{"editorial_analysis_key":"keep-story-pin"}', OLD, OLD))
+        result = self.sweep()
+        self.assertEqual((result["items_compacted"], result["analyses_evicted"], result["changed_records_preserved"]), (1, 1, 0))
+        self.assertEqual({row["cache_key"] for row in self.rows("analyses")},
+                         {"keep-pub", "keep-src", "keep-pend", "keep-held", "keep-story-pin"})
+
+    def test_analysis_pinned_during_upload_is_preserved(self):
+        self.item("race-item", status="ignored", story=None)
+        with self.db() as db:
+            db.execute("INSERT INTO analyses(cache_key,result,created_at,source_payload,source_item_id) VALUES(?,?,?,?,?)",
+                       ("race-analysis", '{"evidence":["q"]}', OLD, '{"content":"snap"}', "race-item"))
+
+        def link_during_put(key):
+            with self.db() as db:
+                db.execute("UPDATE items SET story_id='story' WHERE id='race-item'")
+
+        self.s3.on_put = link_during_put
+        result = self.sweep()
+        self.assertEqual(result["analyses_evicted"], 0)
+        self.assertGreaterEqual(result["changed_records_preserved"], 1)
+        self.assertEqual([row["cache_key"] for row in self.rows("analyses")], ["race-analysis"])
+
+    def test_damaged_analyses_are_skipped_without_logging_private_payload(self):
+        self.item("clean-item")
+        self.analysis("clean-cache")
+        with self.db() as db:
+            db.execute("INSERT INTO analyses(cache_key,result,created_at,source_payload,source_item_id) VALUES(?,?,?,?,?)",
+                       ("bad-utf8", '{"secret":"sensitive text"}', OLD, '{"content":"private"}', None))
+            db.execute("UPDATE analyses SET result=replace(result,'secret',x'eda080') WHERE cache_key='bad-utf8'")
+            db.execute("INSERT INTO analyses(cache_key,result,created_at,source_payload,source_item_id) VALUES(?,?,?,?,?)",
+                       ("bad-blob", b"raw-blob-secret", OLD, '{"content":"private"}', None))
+            db.execute("INSERT INTO analyses(cache_key,result,created_at,source_payload,source_item_id) VALUES(?,?,?,?,?)",
+                       ("bad-nan", '{"ok":true}', OLD, '{"content":"private"}', None))
+            db.execute("ALTER TABLE analyses ADD COLUMN score REAL")
+            db.execute("UPDATE analyses SET score=1e999 WHERE cache_key='bad-nan'")
+        with patch.object(retention, "BATCH_SIZE", 2), self.assertLogs("onionflash.deploy", level="WARNING") as logged:
+            result = self.sweep()
+        self.assertEqual((result["items_compacted"], result["analyses_evicted"], result["changed_records_preserved"]), (1, 1, 0))
+        self.assertEqual({r.args[0] for r in logged.records}, {"bad-utf8", "bad-blob", "bad-nan"})
+        joined = "\n".join(logged.output)
+        self.assertNotIn("sensitive text", joined)
+        self.assertNotIn("raw-blob-secret", joined)
+        self.assertNotIn("private", joined)
+
+    def test_item_corrupted_to_invalid_utf8_during_upload_is_preserved_without_operational_error(self):
+        self.item("corrupted-during-put", content="confidential item body")
+        self.item("healthy-item", content="healthy item body")
+
+        def corrupt_during_put(key):
+            with self.db() as db:
+                db.execute(
+                    "UPDATE items SET payload=replace(payload,'confidential',CAST(x'eda080' AS TEXT)) "
+                    "WHERE id='corrupted-during-put'"
+                )
+
+        self.s3.on_put = corrupt_during_put
+        result = self.sweep()
+        self.assertEqual(
+            (result["records_archived"], result["items_compacted"], result["changed_records_preserved"]),
+            (1, 1, 1),
+        )
+        self.assertEqual([row["record_id"] for row in self.rows("private_archive_refs")], ["healthy-item"])
+        with self.db() as db:
+            healthy_payload = json.loads(db.execute("SELECT payload FROM items WHERE id='healthy-item'").fetchone()[0])
+        self.assertNotIn("content", healthy_payload)
+
+        # Pinned analyses skip _decode_row entirely before reading full analysis rows:
+        self.analysis("pinned-key")
+        self.analysis("unpinned-key")
+        decode_calls = []
+        real_decode = retention._decode_row
+
+        def spy_decode(db, table, columns, where, param, *, key_col):
+            if table == "analyses":
+                decode_calls.append(param)
+            return real_decode(db, table, columns, where, param, key_col=key_col)
+
+        with patch.object(retention, "_decode_row", side_effect=spy_decode), self.db() as db:
+            yielded = list(retention._analyses(db, retention.QUERIES[1][1], "9999-12-31T23:59:59Z", {"pinned-key"}))
+        self.assertEqual([r["cache_key"] for r in yielded], ["unpinned-key"])
+        self.assertEqual(len(decode_calls), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

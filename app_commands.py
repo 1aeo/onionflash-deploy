@@ -38,9 +38,11 @@ def main(argv=None):
     parser.add_argument("arguments", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     for argument in args.arguments:
+        if argument == "--":
+            break
         option = argument.split("=", 1)[0]
         # Core argparse accepts option abbreviations; reject those too.
-        if option.startswith("--") and "--config".startswith(option):
+        if len(option) > 2 and option.startswith("--") and "--config".startswith(option):
             parser.error("Application configuration comes from deployment.toml; do not pass --config")
     prefix, rest = [args.command], args.arguments
     mutating = args.command == "build"
@@ -52,7 +54,7 @@ def main(argv=None):
         rest = rest[1:]
     publisher = None
     try:
-        publisher = Publisher(args.deployment_config)
+        publisher = Publisher(args.deployment_config, offline=True)
         arguments = [*prefix, "--config", str(publisher.app_config), *rest]
         guard = lock(publisher.state / "run.lock", nonblocking=True) if mutating else nullcontext()
         with guard, without_credentials(publisher.private_names()):

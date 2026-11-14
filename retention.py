@@ -18,6 +18,8 @@ import logging
 from pathlib import Path
 import tempfile
 
+from onionflash.store import retained_analysis_keys
+
 
 # A sweep bundles at most BATCH_SIZE rows and MAX_BUNDLE_BYTES within RUN_BUDGET_SECONDS
 # of storage work. Complete sweeps run once per INTERVAL_SECONDS; a limited one continues.
@@ -40,14 +42,18 @@ SCHEMA = """
 # tests that first, since SQLite fixes no order for WHERE terms and json_extract raises on bad JSON.
 # _items then skips the damage SQLite cannot see; the query returns the bytes it checks.
 QUERIES = (
-    ("item", """SELECT id,CAST(payload AS BLOB) FROM items INDEXED BY retention_items_age
+    ("item", """SELECT rowid,CAST(id AS BLOB),CAST(payload AS BLOB) FROM items INDEXED BY retention_items_age
         WHERE status='ignored' AND story_id IS NULL AND last_seen<?
         AND CASE WHEN typeof(payload)='text' AND json_valid(payload) THEN json_type(payload)='object'
             AND json_extract(payload,'$.kind') IS NOT 'gitlab_issue' END
         AND NOT EXISTS (SELECT 1 FROM private_archive_refs a WHERE a.kind='item'
             AND a.record_id=items.id AND a.record_hash=items.content_hash)
         ORDER BY last_seen,id"""),
-    ("analysis", "SELECT * FROM analyses WHERE created_at<? ORDER BY created_at,cache_key LIMIT ?"),
+    ("analysis", """SELECT rowid,CAST(cache_key AS BLOB) FROM analyses INDEXED BY retention_analyses_age
+        WHERE created_at<?
+        AND NOT EXISTS (SELECT 1 FROM items i WHERE i.id=analyses.source_item_id
+            AND (i.status!='ignored' OR i.story_id IS NOT NULL))
+        ORDER BY created_at,cache_key"""),
 )
 
 
@@ -64,17 +70,60 @@ def _iso(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
+def _decode_row(db, table: str, columns: list[str], where: str, param, *, key_col: str) -> dict | None:
+    expr = ",".join(f'typeof("{c}"),CAST("{c}" AS BLOB),CASE WHEN typeof("{c}") IN (\'integer\',\'real\') THEN "{c}" END'
+                    for c in columns)
+    raw = db.execute(f'SELECT {expr} FROM "{table}" WHERE {where}', (param,)).fetchone()
+    if raw is None:
+        return None
+    decoded = {}
+    for index, name in enumerate(columns):
+        kind, blob, number = raw[index * 3 : index * 3 + 3]
+        if kind == "null":
+            decoded[name] = None
+        elif kind in ("integer", "real"):
+            decoded[name] = number
+        elif kind == "text":
+            decoded[name] = str(blob, "utf-8")
+        else:
+            raise ValueError(f"Unexpected {kind} column {name}")
+    if not isinstance(decoded.get(key_col), str):
+        raise ValueError(f"Missing string {key_col}")
+    _json(decoded)
+    return decoded
+
+
+def _analyses(db, query, cutoff, pinned_keys: set[str]):
+    columns = [info[1] for info in db.execute("PRAGMA table_info(analyses)")]
+    for rowid, raw_key in db.execute(query, (cutoff,)):
+        label = raw_key.decode("utf-8", errors="replace") if isinstance(raw_key, bytes) else raw_key
+        try:
+            key = raw_key.decode("utf-8") if isinstance(raw_key, bytes) else raw_key
+            if key in pinned_keys:
+                continue
+            row = _decode_row(db, "analyses", columns, "rowid=?", rowid, key_col="cache_key")
+        except (UnicodeError, ValueError, RecursionError) as error:
+            LOG.warning("Skipping damaged retention analysis %r (%s)", label, type(error).__name__)
+            continue
+        if row is not None and row["cache_key"] not in pinned_keys:
+            yield row
+
+
 def _items(db, query, cutoff):
     """The item query's rows whose payload compaction can read and write back. SQLite accepts bytes
     that are not UTF-8 in a JSON string, which fail any read of the row, and an escaped lone
     surrogate, which cannot be stored once parsed; such an item is skipped like other damage."""
-    for key, payload in db.execute(query, (cutoff,)):
+    columns = [info[1] for info in db.execute("PRAGMA table_info(items)")]
+    for rowid, raw_id, payload in db.execute(query, (cutoff,)):
+        label = raw_id.decode("utf-8", errors="replace") if isinstance(raw_id, bytes) else raw_id
         try:
             json.dumps(json.loads(str(payload, "utf-8")), ensure_ascii=False).encode()
-        except (ValueError, RecursionError) as error:
-            LOG.warning("Skipping damaged retention item %r (%s)", key, type(error).__name__)
+            row = _decode_row(db, "items", columns, "rowid=?", rowid, key_col="id")
+        except (UnicodeError, ValueError, RecursionError) as error:
+            LOG.warning("Skipping damaged retention item %r (%s)", label, type(error).__name__)
             continue
-        yield db.execute("SELECT * FROM items WHERE id=?", (key,)).fetchone()
+        if row is not None:
+            yield row
 
 
 def destination(archive) -> dict:
@@ -90,10 +139,11 @@ def archive_evidence(archive, now: datetime | None = None) -> dict:
     size = len(_json({"format": FORMAT, "records": []}))
     with archive._database() as db:
         db.executescript(SCHEMA)
+        pinned_keys = retained_analysis_keys(db)
         for kind, query in QUERIES:
             limit = BATCH_SIZE - len(records)  # a skipped item takes no place in the batch
-            rows = islice(_items(db, query, cutoff), limit) if kind == "item" else db.execute(query, (cutoff, limit))
-            for row in rows:
+            source = _items(db, query, cutoff) if kind == "item" else _analyses(db, query, cutoff, pinned_keys)
+            for row in islice(source, limit):
                 record = {"kind": kind, "row": dict(row)}
                 amount = len(_json(record)) + 1
                 if size + amount > MAX_BUNDLE_BYTES:
@@ -114,11 +164,31 @@ def archive_evidence(archive, now: datetime | None = None) -> dict:
         path.write_bytes(body)
         uploaded = archive.put_private(path, archive.private_prefix + "evidence/" + checksum + ".json.gz", checksum)
     with archive._database() as db, db:
+        pinned_keys = retained_analysis_keys(db)
+        item_cols = [info[1] for info in db.execute("PRAGMA table_info(items)")]
+        analysis_cols = [info[1] for info in db.execute("PRAGMA table_info(analyses)")]
         for record in records:
             kind, row = record["kind"], record["row"]
-            table, key = ("items", "id") if kind == "item" else ("analyses", "cache_key")
-            current = db.execute("SELECT * FROM " + table + " WHERE " + key + "=?", (row[key],)).fetchone()
-            if current is None or dict(current) != row:  # Changed during the upload: keep it.
+            key = "id" if kind == "item" else "cache_key"
+            try:
+                if kind == "item":
+                    current = _decode_row(db, "items", item_cols, "id=?", row["id"], key_col="id")
+                    if current is not None:
+                        json.dumps(json.loads(current["payload"]), ensure_ascii=False).encode()
+                else:
+                    current = _decode_row(db, "analyses", analysis_cols, "cache_key=?", row["cache_key"], key_col="cache_key")
+            except (UnicodeError, ValueError, RecursionError):
+                current = None
+            if current is None or current != row:  # Changed during the upload: keep it.
+                result["changed_records_preserved"] += 1
+                continue
+            if kind == "analysis" and (
+                row["cache_key"] in pinned_keys
+                or (row.get("source_item_id") and db.execute(
+                    "SELECT 1 FROM items WHERE id=? AND (status!='ignored' OR story_id IS NOT NULL)",
+                    (row["source_item_id"],),
+                ).fetchone())
+            ):
                 result["changed_records_preserved"] += 1
                 continue
             # Never replace the locator a record was first archived under.

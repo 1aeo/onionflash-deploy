@@ -749,6 +749,32 @@ class RecoveryTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "retention"):
                 self.p.backup(force=True)
 
+    def test_static_publish_prunes_untracked_leftover_pages_and_preserves_archive_receipts(self):
+        self.seed_public()
+        self.add_article("live")
+        # Simulate an article and pagination file left behind on disk after restoring an older DB.
+        stale_dir = self.p.public / "news" / "leftover"
+        stale_dir.mkdir(parents=True)
+        (stale_dir / "index.html").write_bytes(b"<p>leftover</p>")
+        page_dir = self.p.public / "page" / "9"
+        page_dir.mkdir(parents=True)
+        (page_dir / "index.html").write_bytes(b"<p>page 9</p>")
+        archive_receipt_id = "44444444-4444-4444-8444-444444444444"
+        publish.atomic_json(self.p.state / "receipts" / (archive_receipt_id + ".json"),
+                            {**receipt(archive_receipt_id), "archive": {"generation": "1", "manifest_sha256": "a" * 64, "origin": "https://example.org/public/"}})
+        self.fake_cloudflare(OLD)
+        first = self.p.publish()
+        self.assertNotIn("news/leftover/index.html", first["manifest"])
+        self.assertNotIn("page/9/index.html", first["manifest"])
+        self.assertEqual(publish.read_json(self.p.state / "permalinks.json"), ["news/live/index.html"])
+        self.assertTrue((self.p.state / "receipts" / (archive_receipt_id + ".json")).is_file())
+        # A subsequent run succeeds cleanly instead of failing on a ghost permalink.
+        self.live[0] = NEW
+        self.calls.clear()
+        self.assertEqual(self.p.publish()["version_id"], NEW)
+        with self.assertRaisesRegex(ValueError, "untracked file"):
+            self.p.publication_readiness({**first["manifest"], "news/leftover/index.html": "b" * 64})
+
 
 if __name__ == "__main__":
     unittest.main()

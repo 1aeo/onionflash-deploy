@@ -32,8 +32,9 @@ This repository uses the application only through its public interfaces:
 
 - `onionflash.config.load_config`, `onionflash.cli.main` and the commands' JSON
   output;
-- `onionflash.store.backup_database`, and the layout constants
-  `onionflash.render.ASSET_FILES` and `onionflash.schema.CATEGORIES`;
+- `onionflash.store.backup_database`, `onionflash.store.retained_analysis_keys`,
+  and the layout constants `onionflash.render.ASSET_FILES` and
+  `onionflash.schema.CATEGORIES`;
 - the rendered output, and the publication tables and metadata documented for
   publishers: `public_artifacts`, `public_catalog`, `public_render_queue` and the
   `publication_*` metadata keys.
