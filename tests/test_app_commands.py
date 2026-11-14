@@ -178,6 +178,45 @@ url = "https://example.org/feed.xml"
                                         env={"ONIONFLASH_DEPLOY_CONFIG": custom_config}, capture_output=True, text=True, check=True)
                 self.assertEqual(json.loads(result.stdout), [str(self.directory / script), *expected])
 
+    def test_double_dash_terminator_and_offline_missing_cloudflare_credentials_work(self):
+        env_file = self.directory / "secrets.env"
+        env_file.write_text("\n".join(f"{k}={v}" for k, v in self.secrets.items() if not k.startswith("CLOUDFLARE_")))
+        env_file.chmod(0o600)
+        for arguments in (["story", "retract", "--reason=--", "--", "--config"],
+                          ["story", "show", "--", "--conf"]):
+            with self.subTest(arguments=arguments), patch("onionflash.cli.main", return_value=0) as invoke:
+                self.assertEqual(self.run_app(*arguments), 0)
+                invoke.assert_called_once()
+
+    def test_install_validates_arguments_custom_config_directory_and_symlinks(self):
+        import install
+        with self.assertRaisesRegex(SystemExit, "Usage"):
+            install.main([])
+        app_repo = self.directory / "app-repo"
+        app_repo.mkdir()
+        (app_repo / "pyproject.toml").write_text("[project]\nname = 'onionflash'\nversion = '0.0.0'\n")
+        (app_repo / "config.example.toml").write_text("[site]\n")
+        custom_dir = self.directory / "etc" / "onionflash"
+        custom_cfg = custom_dir / "deployment.toml"
+        with patch.dict(os.environ, {"ONIONFLASH_DEPLOY_CONFIG": str(custom_cfg)}), \
+                patch("install.export"), patch("install.shutil.which", return_value="/usr/bin/npm"), \
+                patch("install.subprocess.run"), redirect_stdout(io.StringIO()):
+            install.main([str(app_repo)])
+        self.assertTrue(custom_cfg.is_file())
+        self.assertTrue((custom_dir / "onionflash.toml").is_file())
+        self.assertTrue((custom_dir / "secrets.env").is_file())
+        self.assertEqual((custom_dir / "secrets.env").stat().st_mode & 0o777, 0o600)
+        target = self.directory / "victim.txt"
+        target.write_text("keep")
+        target.chmod(0o644)
+        (custom_dir / "secrets.env").unlink()
+        (custom_dir / "secrets.env").symlink_to(target)
+        with patch.dict(os.environ, {"ONIONFLASH_DEPLOY_CONFIG": str(custom_cfg)}), \
+                patch("install.export"), patch("install.shutil.which", return_value="/usr/bin/npm"), \
+                patch("install.subprocess.run"), self.assertRaisesRegex(SystemExit, "symlink"):
+            install.main([str(app_repo)])
+        self.assertEqual(target.stat().st_mode & 0o777, 0o644)
+
 
 if __name__ == "__main__":
     unittest.main()

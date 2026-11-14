@@ -47,7 +47,11 @@ QUERIES = (
         AND NOT EXISTS (SELECT 1 FROM private_archive_refs a WHERE a.kind='item'
             AND a.record_id=items.id AND a.record_hash=items.content_hash)
         ORDER BY last_seen,id"""),
-    ("analysis", "SELECT * FROM analyses WHERE created_at<? ORDER BY created_at,cache_key LIMIT ?"),
+    ("analysis", """SELECT rowid,CAST(cache_key AS BLOB) FROM analyses INDEXED BY retention_analyses_age
+        WHERE created_at<?
+        AND NOT EXISTS (SELECT 1 FROM items i WHERE i.id=analyses.source_item_id
+            AND (i.status!='ignored' OR i.story_id IS NOT NULL))
+        ORDER BY created_at,cache_key"""),
 )
 
 
@@ -62,6 +66,57 @@ def _sha(value: bytes) -> str:
 
 def _iso(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _story_analysis_keys(db) -> set[str]:
+    """Keep any analysis explicitly pinned by a live story even if source_item_id was absent."""
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='stories'").fetchone():
+        return set()
+    pinned: set[str] = set()
+    for (raw,) in db.execute("SELECT CAST(payload AS BLOB) FROM stories WHERE typeof(payload)='text'"):
+        try:
+            payload = json.loads(str(raw, "utf-8"))
+        except (UnicodeError, ValueError, RecursionError):
+            continue
+        if isinstance(payload, dict) and isinstance(payload.get("editorial_analysis_key"), str):
+            pinned.add(payload["editorial_analysis_key"])
+    return pinned
+
+
+def _decode_analysis(db, columns: list[str], where: str, param) -> dict | None:
+    expr = ",".join(f'typeof("{c}"),CAST("{c}" AS BLOB),CASE WHEN typeof("{c}") IN (\'integer\',\'real\') THEN "{c}" END'
+                    for c in columns)
+    raw = db.execute(f"SELECT {expr} FROM analyses WHERE {where}", (param,)).fetchone()
+    if raw is None:
+        return None
+    decoded = {}
+    for index, name in enumerate(columns):
+        kind, blob, number = raw[index * 3 : index * 3 + 3]
+        if kind == "null":
+            decoded[name] = None
+        elif kind in ("integer", "real"):
+            decoded[name] = number
+        elif kind == "text":
+            decoded[name] = str(blob, "utf-8")
+        else:
+            raise ValueError(f"Unexpected {kind} column {name}")
+    if not isinstance(decoded.get("cache_key"), str):
+        raise ValueError("Missing string cache_key")
+    _json(decoded)
+    return decoded
+
+
+def _analyses(db, query, cutoff, pinned_keys: set[str]):
+    columns = [info[1] for info in db.execute("PRAGMA table_info(analyses)")]
+    for rowid, raw_key in db.execute(query, (cutoff,)):
+        label = raw_key.decode("utf-8", errors="replace") if isinstance(raw_key, bytes) else raw_key
+        try:
+            row = _decode_analysis(db, columns, "rowid=?", rowid)
+        except (UnicodeError, ValueError, RecursionError) as error:
+            LOG.warning("Skipping damaged retention analysis %r (%s)", label, type(error).__name__)
+            continue
+        if row is not None and row["cache_key"] not in pinned_keys:
+            yield row
 
 
 def _items(db, query, cutoff):
@@ -90,10 +145,11 @@ def archive_evidence(archive, now: datetime | None = None) -> dict:
     size = len(_json({"format": FORMAT, "records": []}))
     with archive._database() as db:
         db.executescript(SCHEMA)
+        pinned_keys = _story_analysis_keys(db)
         for kind, query in QUERIES:
             limit = BATCH_SIZE - len(records)  # a skipped item takes no place in the batch
-            rows = islice(_items(db, query, cutoff), limit) if kind == "item" else db.execute(query, (cutoff, limit))
-            for row in rows:
+            source = _items(db, query, cutoff) if kind == "item" else _analyses(db, query, cutoff, pinned_keys)
+            for row in islice(source, limit):
                 record = {"kind": kind, "row": dict(row)}
                 amount = len(_json(record)) + 1
                 if size + amount > MAX_BUNDLE_BYTES:
@@ -114,11 +170,29 @@ def archive_evidence(archive, now: datetime | None = None) -> dict:
         path.write_bytes(body)
         uploaded = archive.put_private(path, archive.private_prefix + "evidence/" + checksum + ".json.gz", checksum)
     with archive._database() as db, db:
+        pinned_keys = _story_analysis_keys(db)
+        analysis_cols = [info[1] for info in db.execute("PRAGMA table_info(analyses)")]
         for record in records:
             kind, row = record["kind"], record["row"]
-            table, key = ("items", "id") if kind == "item" else ("analyses", "cache_key")
-            current = db.execute("SELECT * FROM " + table + " WHERE " + key + "=?", (row[key],)).fetchone()
-            if current is None or dict(current) != row:  # Changed during the upload: keep it.
+            key = "id" if kind == "item" else "cache_key"
+            try:
+                if kind == "item":
+                    current_row = db.execute("SELECT * FROM items WHERE id=?", (row["id"],)).fetchone()
+                    current = dict(current_row) if current_row is not None else None
+                else:
+                    current = _decode_analysis(db, analysis_cols, "cache_key=?", row["cache_key"])
+            except (UnicodeError, ValueError, RecursionError):
+                current = None
+            if current is None or current != row:  # Changed during the upload: keep it.
+                result["changed_records_preserved"] += 1
+                continue
+            if kind == "analysis" and (
+                row["cache_key"] in pinned_keys
+                or (row.get("source_item_id") and db.execute(
+                    "SELECT 1 FROM items WHERE id=? AND (status!='ignored' OR story_id IS NOT NULL)",
+                    (row["source_item_id"],),
+                ).fetchone())
+            ):
                 result["changed_records_preserved"] += 1
                 continue
             # Never replace the locator a record was first archived under.

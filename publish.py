@@ -181,7 +181,7 @@ def job_log(path):
 
 
 class Publisher:
-    def __init__(self, config_path):
+    def __init__(self, config_path, *, offline=False):
         self.config_path = Path(config_path).resolve()
         self.cfg = tomllib.loads(self.config_path.read_text())
         for section, names in RETIRED.items():
@@ -194,9 +194,11 @@ class Publisher:
                 del self.cfg[section][key]
         self.directory = self.config_path.parent
         load_env(self.path(self.cfg.get("env_file", "secrets.env")))
-        for section in ("archive", "retention"):
+        for section in ("archive", "retention", "spaces"):
             if type(self.cfg.get(section, {}).get("enabled", False)) is not bool:
                 raise ValueError(section + ".enabled must be a boolean")
+        if type(self.cfg.get("spaces", {}).get("required", False)) is not bool:
+            raise ValueError("spaces.required must be a boolean")
         if unknown := set(self.cfg.get("retention", {})) - {"enabled"}:
             raise ValueError("Unknown retention settings: " + ", ".join(sorted(unknown)))
         if self.cfg.get("retention", {}).get("enabled") and not self.cfg.get("archive", {}).get("enabled"):
@@ -221,14 +223,19 @@ class Publisher:
         if not SAFE_ID.fullmatch(self.cf["worker_name"]):
             raise ValueError("Invalid Worker name")
         self.net = dict(NETWORK)
-        self.account = self.secret(ACCOUNT_ID)
-        if not re.fullmatch(r"[0-9a-f]{32}", self.account):
-            raise ValueError("Invalid Cloudflare account ID")
-        self.token = self.secret(API_TOKEN)
+        self.account = self.token = ""
+        if not offline:
+            self._load_cloudflare()
         self.api_base = API_BASE
         self._archive = None
         self.node = ROOT / "node_modules/node/bin/node"
         self.wrangler = ROOT / "node_modules/wrangler/bin/wrangler.js"
+
+    def _load_cloudflare(self):
+        self.account = self.secret(ACCOUNT_ID)
+        if not re.fullmatch(r"[0-9a-f]{32}", self.account):
+            raise ValueError("Invalid Cloudflare account ID")
+        self.token = self.secret(API_TOKEN)
 
     def path(self, value):
         # Preserve the final executable symlink: resolving .venv/bin/python to
@@ -313,6 +320,8 @@ class Publisher:
                 close()
 
     def api(self, suffix, method="GET", data=None, zone=False):
+        if not zone and (not self.account or not self.token):
+            self._load_cloudflare()
         token = self.secret(ZONE_TOKEN) if zone else self.token
         response = json.loads(self.request(self.api_base + suffix, method, data, token))
         if not response.get("success"):
@@ -326,6 +335,8 @@ class Publisher:
         return version
 
     def current_version(self):
+        if not self.account or not self.token:
+            self._load_cloudflare()
         try:
             result = self.api(f"/accounts/{self.account}/workers/scripts/{self.cf['worker_name']}/deployments")
         except HTTPError as exc:
@@ -344,6 +355,8 @@ class Publisher:
         return version
 
     def command(self, arguments, metadata=None):
+        if not self.account or not self.token:
+            self._load_cloudflare()
         # Wrangler only needs its own credentials, not the LLM or Spaces keys.
         private = self.private_names()
         env = {k: v for k, v in os.environ.items() if k not in private}
@@ -369,6 +382,8 @@ class Publisher:
 
 
     def make_config(self, directory, archive=None):
+        if not self.account:
+            self._load_cloudflare()
         config = {"name": self.cf["worker_name"], "account_id": self.account,
                   "compatibility_date": self.cf["compatibility_date"], "workers_dev": True,
                   "preview_urls": True, "main": str(ROOT / "worker.mjs"),
@@ -452,12 +467,16 @@ class Publisher:
                 raise
 
     def control_config(self):
+        if not self.account:
+            self._load_cloudflare()
         target = self.state / "wrangler-control.json"
         atomic_json(target, {"name": self.cf["worker_name"], "account_id": self.account,
                              "compatibility_date": self.cf["compatibility_date"]})
         return target
 
     def origin_url(self):
+        if not self.account or not self.token:
+            self._load_cloudflare()
         subdomain = self.api(f"/accounts/{self.account}/workers/subdomain")["subdomain"]
         return f"https://{self.cf['worker_name']}.{subdomain}.workers.dev" + self.base_path
 
@@ -510,10 +529,32 @@ class Publisher:
             if initial_archive and db.execute("SELECT 1 FROM public_render_queue WHERE last_error IS NULL LIMIT 1").fetchone():
                 raise ValueError("Initial permanent-storage migration still has articles pending")
             ledger = dict(db.execute("SELECT path,sha256 FROM public_artifacts"))
-        for path, sha in ledger.items():
-            if manifest is not None and manifest.get(path) != sha:
-                raise ValueError("Local publication snapshot is incomplete: " + path)
+        if manifest is not None:
+            for path, sha in ledger.items():
+                if manifest.get(path) != sha:
+                    raise ValueError("Local publication snapshot is incomplete: " + path)
+            extra = sorted(set(manifest) - set(ledger))
+            if extra:
+                raise ValueError("Local publication snapshot has untracked file: " + extra[0])
         return ledger
+
+    @staticmethod
+    def _prune_untracked(stage, ledger):
+        """Drop allowed public files left behind on disk that are absent from the database ledger."""
+        if not stage.is_dir():
+            return
+        for path in sorted(stage.rglob("*"), reverse=True):
+            if path.is_symlink():
+                continue
+            if path.is_file():
+                relative = path.relative_to(stage).as_posix()
+                if relative not in ledger and public_path_allowed(relative):
+                    path.unlink()
+            elif path.is_dir():
+                try:
+                    path.rmdir()
+                except OSError:
+                    pass
 
 
     def publish(self):
@@ -545,7 +586,9 @@ class Publisher:
                 # Copy and validate unless the recorded publication was validated from this ledger and Worker.
                 if previous.get("content_hash") != self.publication_identity(ledger):
                     with lock(str(self.database) + ".lock", shared=True):
+                        ledger = self.publication_readiness()
                         shutil.copytree(self.public, stage, symlinks=True)
+                    self._prune_untracked(stage, ledger)
                     manifest = self.validate(stage)
                     ledger = self.publication_readiness(manifest)
                 # The database's ledger decides, so a page left behind by a newer database does not count.
@@ -643,7 +686,12 @@ class Publisher:
             if not archive_info:  # Static receipts list every file; rollback needs only the previous one.
                 for old in (self.state / "receipts").glob("*.json"):
                     if old.stem not in {version, before}:
-                        old.unlink()
+                        try:
+                            saved = read_json(old, {})
+                        except ValueError:
+                            saved = {}
+                        if not isinstance(saved, dict) or "archive" not in saved:
+                            old.unlink()
             LOG.info("Published version %s (%s files) at %s", version, len(manifest), live)
             return receipt
 
@@ -691,20 +739,33 @@ class Publisher:
         atomic_json(self.state / "routes.json", {"patterns": patterns, "verified_at": datetime.now(timezone.utc).isoformat()})
         LOG.info("Verified public website and RSS at %s", self.base_url)
 
+    def validate_spaces(self):
+        cfg = self.cfg.get("spaces", {})
+        for key in ["retention_days", "backup_interval_seconds"]:
+            if type(cfg.get(key)) is not int or cfg[key] < 1:
+                raise ValueError("Spaces " + key + " must be a positive integer")
+        bucket = cfg.get("bucket")
+        if not isinstance(bucket, str) or not re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", bucket):
+            raise ValueError("Invalid Spaces bucket")
+        prefix = cfg.get("prefix")
+        if not isinstance(prefix, str) or not re.fullmatch(r"[a-zA-Z0-9_-]+/backups/", prefix):
+            raise ValueError("Backup prefix must be a project-specific name/backups/")
+        endpoint = cfg.get("endpoint_url")
+        parsed = urlsplit(endpoint) if isinstance(endpoint, str) else None
+        if not parsed or parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+            raise ValueError("Spaces endpoint must use HTTPS")
+        if not isinstance(cfg.get("region"), str) or not cfg["region"].strip():
+            raise ValueError("Spaces region must be a non-empty string")
+        self.secret(SPACES_KEY)
+        self.secret(SPACES_SECRET)
+        return cfg
+
     def backup(self, force=False):
         cfg = self.cfg.get("spaces", {})
         if not cfg.get("enabled"):
             return
-        for key in ["retention_days", "backup_interval_seconds"]:
-            if type(cfg.get(key)) is not int or cfg[key] < 1:
-                raise ValueError("Spaces " + key + " must be a positive integer")
-        if not re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", cfg["bucket"]):
-            raise ValueError("Invalid Spaces bucket")
+        self.validate_spaces()
         prefix = cfg["prefix"]
-        if not re.fullmatch(r"[a-zA-Z0-9_-]+/backups/", prefix):
-            raise ValueError("Backup prefix must be a project-specific name/backups/")
-        if urlsplit(cfg["endpoint_url"]).scheme != "https":
-            raise ValueError("Spaces endpoint must use HTTPS")
         # A new destination gets a backup right away instead of after the interval.
         destination = {key: cfg[key] for key in ("endpoint_url", "bucket", "prefix")}
         marker = self.state / "backup.json"
@@ -774,8 +835,11 @@ class Publisher:
             raise ValueError("Ambiguous existing Onion Flash schedule")
         current = re.sub(re.escape(begin) + r".*?" + re.escape(end) + r"\n?", "", current, flags=re.S)
         command = " ".join(shlex.quote(str(x)) for x in [self.path(self.cfg["app_python"]), ROOT / "publish.py", "--config", self.config_path, "run"])
+        if "\n" in command or "\r" in command:
+            raise ValueError("Scheduled command paths must not contain newlines")
+        cron_command = command.replace("%", r"\%")
         # The application logs bounded summaries, never credential-bearing command lines.
-        block = f"{begin}\n*/{interval} * * * * {command} 2>&1 | logger -t onionflash\n{end}\n"
+        block = f"{begin}\n*/{interval} * * * * {cron_command} 2>&1 | logger -t onionflash\n{end}\n"
         subprocess.run(["crontab", "-"], input=current.rstrip() + "\n" + block, text=True, check=True)
         LOG.info("Installed a %s-minute cron job", interval)
 
@@ -791,7 +855,7 @@ class Publisher:
                                 timeout=budget + 300, env=env)
         if result.returncode:
             detail = result.stderr.strip() or f"exited with status {result.returncode}"
-            raise RuntimeError(self.clean_error(detail[-1000:]))
+            raise RuntimeError(self.clean_error(detail)[-1000:])
         return result.stdout.strip()
 
     def collect(self, result):
@@ -876,6 +940,8 @@ class Publisher:
             print(self.application(command))
             if not self.node.is_file() or not self.wrangler.is_file():
                 raise ValueError("Run install.sh to install the publishing toolchain")
+            if self.cfg.get("spaces", {}).get("enabled"):
+                self.validate_spaces()
             if self.cfg.get("archive", {}).get("enabled"):
                 self.archive  # Validate storage settings and credential presence without network calls.
             print("Application and deployment configuration valid")
@@ -909,7 +975,7 @@ def main():
     LOG.setLevel(logging.INFO)
     LOG.addHandler(console)
     try:
-        publisher = Publisher(args.config)
+        publisher = Publisher(args.config, offline=True) if args.command in {"status", "hold", "resume"} else Publisher(args.config)
         if args.command == "status":
             publisher.status()
             return 0

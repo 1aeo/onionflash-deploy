@@ -39,15 +39,23 @@ class ArchiveBudgetReached(TimeoutError):
 
 def validate_config(cfg):
     for key in ("endpoint_url", "public_origin"):
-        parsed = urlsplit(cfg[key])
-        if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+        value = cfg.get(key)
+        parsed = urlsplit(value) if isinstance(value, str) else None
+        if not parsed or parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
             raise ValueError("Archive URLs must be clean HTTPS URLs")
     if not cfg["public_origin"].endswith("/"):
         raise ValueError("Archive public_origin must end with a slash")
-    if not re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", cfg["bucket"]):
+    bucket = cfg.get("bucket")
+    if not isinstance(bucket, str) or not re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", bucket):
         raise ValueError("Invalid archive bucket")
+    if not isinstance(cfg.get("region"), str) or not cfg["region"].strip():
+        raise ValueError("Archive region must be a non-empty string")
+    for key in ("access_key_env", "secret_key_env"):
+        if not isinstance(cfg.get(key), str) or not re.fullmatch(r"[A-Z_][A-Z0-9_]*", cfg[key]):
+            raise ValueError("Invalid archive credential variable name: " + key)
     for key, suffix in (("public_prefix", "public"), ("private_prefix", "private")):
-        if not re.fullmatch(r"[A-Za-z0-9_-]+/" + suffix + "/", cfg[key]):
+        prefix = cfg.get(key)
+        if not isinstance(prefix, str) or not re.fullmatch(r"[A-Za-z0-9_-]+/" + suffix + "/", prefix):
             raise ValueError("Archive prefixes must be project-specific public/private prefixes")
     if urlsplit(cfg["public_origin"]).path != "/" + cfg["public_prefix"]:
         raise ValueError("Archive public_origin must point to the public prefix")

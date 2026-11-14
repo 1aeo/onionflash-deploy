@@ -346,6 +346,17 @@ class ArchiveTests(unittest.TestCase):
         with patch.object(archive_store, "MAX_OBJECT_BYTES", 1024), self.assertRaisesRegex(ValueError, "size"):
             self.archive.sync()
 
+    def test_validate_config_rejects_missing_or_non_string_region_and_credential_names(self):
+        base = dict(self.archive.cfg)
+        for key, bad, pattern in [
+            ("region", "", "region"),
+            ("region", None, "region"),
+            ("access_key_env", "bad-var", "credential variable"),
+            ("secret_key_env", 123, "credential variable"),
+        ]:
+            with self.subTest(key=key, bad=bad), self.assertRaisesRegex(ValueError, pattern):
+                archive_store.validate_config({**base, key: bad})
+
     @unittest.skipUnless(shutil.which("node"), "the Worker contract needs node")
     def test_the_worker_serves_the_archive_this_store_writes(self):
         bodies = {"news/a/index.html": b"<p>Story</p>", "news/a/story.json": b'{"id":"a"}'}

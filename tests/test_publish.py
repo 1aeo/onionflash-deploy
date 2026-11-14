@@ -358,6 +358,64 @@ class DeploymentTests(unittest.TestCase):
         self.assertIn("observed-version", output.getvalue())
         self.assertNotIn('"manifest"', output.getvalue())
 
+    def test_application_error_redacts_secret_straddling_truncation_boundary(self):
+        import subprocess
+        token = "secret-llm-boundary-credential"
+        stderr = "x" * 50 + token + "y" * 985
+        self.assertLess(len(stderr[-1000:]), len(stderr))
+        self.assertNotIn(token, stderr[-1000:])
+        self.assertIn(token[-15:], stderr[-1000:])
+        failed = subprocess.CompletedProcess([], 1, stdout="", stderr=stderr)
+        with patch.dict(os.environ, {"ONIONFLASH_LLM_API_KEY": token}), patch("publish.subprocess.run", return_value=failed):
+            with self.assertRaises(RuntimeError) as caught:
+                self.publisher.application("run")
+        self.assertNotIn(token[-15:], str(caught.exception))
+        self.assertIn("[redacted]", str(caught.exception))
+
+    def test_boolean_flags_and_enabled_spaces_settings_are_validated_early_and_by_check(self):
+        path = self.directory / "deployment.toml"
+        base = path.read_text()
+        for target, replacement, expected in [
+            ('[spaces]\nenabled = false', '[spaces]\nenabled = "false"', "spaces.enabled must be a boolean"),
+            ('required = false', 'required = 1', "spaces.required must be a boolean"),
+        ]:
+            path.write_text(base.replace(target, replacement))
+            with self.assertRaisesRegex(ValueError, expected):
+                publish.Publisher(path)
+        path.write_text(base)
+        self.publisher.cfg["spaces"].update(enabled=True, region="")
+        with patch.object(self.publisher, "application", return_value="ok"), \
+                patch.object(self.publisher, "node", publish.Path(__file__)), \
+                patch.object(self.publisher, "wrangler", publish.Path(__file__)):
+            with self.assertRaisesRegex(ValueError, "Spaces region"):
+                self.publisher.execute("check")
+
+    def test_offline_commands_do_not_require_cloudflare_credentials(self):
+        with patch.dict(os.environ, {"CLOUDFLARE_ACCOUNT_ID": "", "CLOUDFLARE_API_TOKEN": ""}):
+            for cmd in ("status", "hold", "resume"):
+                with patch("sys.argv", ["publish.py", "--config", str(self.directory / "deployment.toml"), cmd]), \
+                        redirect_stdout(io.StringIO()):
+                    self.assertEqual(publish.main(), 0)
+            p = publish.Publisher(self.directory / "deployment.toml", offline=True)
+            with self.assertRaisesRegex(ValueError, "CLOUDFLARE_ACCOUNT_ID"):
+                p.current_version()
+
+    def test_schedule_escapes_percent_signs_and_rejects_newlines(self):
+        import subprocess
+        percent_dir = self.directory / "dir%name"
+        percent_dir.mkdir()
+        self.publisher.cfg["app_python"] = str(percent_dir / "python")
+        captured = []
+        def fake(arguments, **kwargs):
+            captured.append((arguments, kwargs))
+            return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
+        with patch("publish.subprocess.run", side_effect=fake):
+            self.publisher.schedule()
+        self.assertIn(r"dir\%name", captured[1][1]["input"])
+        self.publisher.cfg["app_python"] = "bad\npython"
+        with patch("publish.subprocess.run", side_effect=fake), self.assertRaisesRegex(ValueError, "newlines"):
+            self.publisher.schedule()
+
 
 if __name__ == "__main__":
     unittest.main()
