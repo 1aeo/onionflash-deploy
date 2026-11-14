@@ -8,14 +8,8 @@ import os
 from pathlib import Path
 import sys
 
+from onionflash import cli
 from publish import BusyLock, Publisher, lock, redact
-
-ACTIONS = {
-    "story": {"show", "history", "correct", "retract", "restore", "unlock", "merge"},
-    "rejected": {"list", "show", "retry", "dismiss", "approve"},
-    "decisions": {"summary", "list"},
-}
-READ_ONLY = {"show", "history", "list", "summary"}
 
 
 @contextmanager
@@ -32,25 +26,23 @@ def without_credentials(names):
 def main(argv=None):
     os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
-    # deploy.sh supplies this positional path before any forwarded arguments.
     parser.add_argument("deployment_config", type=Path)
-    parser.add_argument("command", choices=(*ACTIONS, "build", "status"))
+    parser.add_argument("command", choices=(*cli.OPERATOR_ACTIONS, "build", "status"))
     parser.add_argument("arguments", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     for argument in args.arguments:
         if argument == "--":
             break
         option = argument.split("=", 1)[0]
-        # Core argparse accepts option abbreviations; reject those too.
         if len(option) > 2 and option.startswith("--") and "--config".startswith(option):
             parser.error("Application configuration comes from deployment.toml; do not pass --config")
     prefix, rest = [args.command], args.arguments
     mutating = args.command == "build"
-    if args.command in ACTIONS:
-        if not rest or rest[0] not in ACTIONS[args.command]:
-            parser.error(args.command + " requires an action: " + ", ".join(sorted(ACTIONS[args.command])))
+    if args.command in cli.OPERATOR_ACTIONS:
+        if not rest or rest[0] not in cli.OPERATOR_ACTIONS[args.command]:
+            parser.error(args.command + " requires an action: " + ", ".join(sorted(cli.OPERATOR_ACTIONS[args.command])))
         prefix.append(rest[0])
-        mutating = rest[0] not in READ_ONLY
+        mutating = rest[0] not in cli.READ_ONLY_ACTIONS
         rest = rest[1:]
     publisher = None
     try:
@@ -58,13 +50,11 @@ def main(argv=None):
         arguments = [*prefix, "--config", str(publisher.app_config), *rest]
         guard = lock(publisher.state / "run.lock", nonblocking=True) if mutating else nullcontext()
         with guard, without_credentials(publisher.private_names()):
-            from onionflash.cli import main as app_main
-            return app_main(arguments)
+            return cli.main(arguments)
     except BusyLock:
         print("onionflash app: another deployment is running; command not performed; retry after completion", file=sys.stderr)
         return 75
     except Exception as exc:
-        # Setup errors name files, settings and variables, never their values.
         message = publisher.clean_error(exc) if publisher else redact(f"{type(exc).__name__}: {exc}")
         print("onionflash app: " + message, file=sys.stderr)
         return 1

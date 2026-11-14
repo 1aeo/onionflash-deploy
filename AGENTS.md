@@ -22,27 +22,26 @@ go to the operator, not into PR text.
 
 `deployment.toml` holds only operator choices: paths, the schedule, the Worker
 name and compatibility date, and storage destinations. Budgets, limits, timeouts
-and retries are constants in the module that uses them. A removed setting stays
-listed in `publish.RETIRED` so older files still load. Credentials use the
+and retries are constants in the module that uses them. Credentials use the
 standard environment variable names listed in the README.
 
 ## The application boundary
 
 This repository uses the application only through its public interfaces:
 
-- `onionflash.config.load_config`, `onionflash.cli.main` and the commands' JSON
-  output;
-- `onionflash.store.backup_database`, `onionflash.store.retained_analysis_keys`,
-  and the layout constants `onionflash.render.ASSET_FILES` and
-  `onionflash.schema.CATEGORIES`;
+- `onionflash.config.load_config`, `onionflash.cli.main`,
+  `onionflash.cli.OPERATOR_ACTIONS`, `onionflash.cli.READ_ONLY_ACTIONS`, and
+  the commands' JSON output;
+- `onionflash.store.backup_database`, `onionflash.store.get_meta`,
+  `onionflash.store.set_meta`, `onionflash.store.select_retention_candidates`,
+  `onionflash.store.compact_retained_rows`, `onionflash.publication.public_files`,
+  `onionflash.publication.public_path_allowed`, and `onionflash.util.canonical_json`;
 - the rendered output, and the publication tables and metadata documented for
   publishers: `public_artifacts`, `public_catalog`, `public_render_queue` and the
   `publication_*` metadata keys.
 
 Do not read other application tables or parse its private JSON; ask the
-application to expose what is needed instead. The current exception is
-`retention.py`, which compacts old `items` and `analyses` rows; it is to move
-behind an application interface.
+application to expose what is needed instead.
 
 ## Code
 

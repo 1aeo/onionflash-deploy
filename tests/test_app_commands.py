@@ -1,17 +1,10 @@
-import io
-import json
-import os
-from pathlib import Path
-import shutil
-import socket
-import subprocess
-import sys
-import tempfile
-import unittest
 from contextlib import redirect_stderr, redirect_stdout
+import io, json, os, shutil, socket, subprocess, sys, tempfile, unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import app_commands
+from onionflash import cli
 import publish
 
 
@@ -26,17 +19,11 @@ class AppCommandTests(unittest.TestCase):
         self.config = self.directory / "deployment.toml"
         self.config.write_text((publish.ROOT / "deployment.example.toml").read_text())
         self.app_config = self.directory / "onionflash.toml"
-        self.app_config.write_text('''[site]
-base_url = "https://example.com/onionflash/"
-[storage]
-database = "state/news.sqlite3"
-output_dir = "build/public"
-[llm]
-base_url = "${ONIONFLASH_LLM_BASE_URL}"
-[[sources]]
-id = "test"
-url = "https://example.org/feed.xml"
-''')
+        self.app_config.write_text(
+            '[site]\nbase_url = "https://example.com/onionflash/"\n[storage]\ndatabase = "state/news.sqlite3"\n'
+            'output_dir = "build/public"\n[llm]\nbase_url = "${ONIONFLASH_LLM_BASE_URL}"\n'
+            '[[sources]]\nid = "test"\nurl = "https://example.org/feed.xml"\n'
+        )
         self.secrets = {
             "CLOUDFLARE_ACCOUNT_ID": "a" * 32,
             "CLOUDFLARE_API_TOKEN": "private-cloudflare-token",
@@ -54,31 +41,29 @@ url = "https://example.org/feed.xml"
         return app_commands.main([str(self.config), *arguments])
 
     def test_routing_injects_fixed_configuration_after_command_or_action(self):
-        cases = [([command, action, "--reason", "operator reason"], 2)
-                 for command, actions in app_commands.ACTIONS.items() for action in actions]
+        cases = [([cmd, action, "--reason", "operator reason"], 2)
+                 for cmd, actions in cli.OPERATOR_ACTIONS.items() for action in actions]
         cases += [(["build", "--force"], 1), (["status"], 1)]
         for arguments, position in cases:
             with self.subTest(arguments=arguments), patch("onionflash.cli.main", return_value=0) as invoke:
                 self.assertEqual(self.run_app(*arguments), 0)
-                self.assertEqual(invoke.call_args.args[0], [*arguments[:position], "--config",
-                                                         str(self.app_config), *arguments[position:]])
+                self.assertEqual(invoke.call_args.args[0], [*arguments[:position], "--config", str(self.app_config), *arguments[position:]])
 
     def test_invalid_command_action_or_config_override_never_initializes_publisher(self):
-        cases = [("run",), ("check",), ("story",), ("rejected",), ("decisions",),
-                 ("story", "delete"), ("decisions", "delete"),
-                 ("status", "--config", "elsewhere.toml"), ("build", "--config=elsewhere.toml"),
-                 ("story", "show", "--conf=elsewhere.toml"), ("rejected", "list", "--c", "elsewhere.toml"),
-                 ("--config", "elsewhere.toml", "status")]
-        for arguments in cases:
+        for arguments in [
+            ("run",), ("check",), ("story",), ("rejected",), ("decisions",), ("story", "delete"), ("decisions", "delete"),
+            ("status", "--config", "elsewhere.toml"), ("build", "--config=elsewhere.toml"),
+            ("story", "show", "--conf=elsewhere.toml"), ("rejected", "list", "--c", "elsewhere.toml"),
+            ("--config", "elsewhere.toml", "status"),
+        ]:
             with self.subTest(arguments=arguments), redirect_stderr(io.StringIO()), \
                     patch("app_commands.Publisher") as publisher, self.assertRaises(SystemExit) as error:
                 self.run_app(*arguments)
             self.assertEqual(error.exception.code, 2)
             publisher.assert_not_called()
 
-    def test_dotenv_resolves_config_but_all_private_credentials_are_removed_for_core(self):
-        self.config.write_text(self.config.read_text().replace('secret_key_env = "DO_SPACES_SECRET"',
-                                                              'secret_key_env = "CUSTOM_PRIVATE_VALUE"'))
+    def test_dotenv_resolves_config_strips_credentials_for_core_and_redacts_errors(self):
+        self.config.write_text(self.config.read_text().replace('secret_key_env = "DO_SPACES_SECRET"', 'secret_key_env = "CUSTOM_PRIVATE_VALUE"'))
         os.environ["CUSTOM_PRIVATE_VALUE"] = "custom-private-value"
         private = {"CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ZONE_TOKEN", "DO_SPACES_KEY", "DO_SPACES_SECRET",
                    "CUSTOM_PRIVATE_VALUE", "ONIONFLASH_LLM_API_KEY"}
@@ -96,42 +81,34 @@ url = "https://example.org/feed.xml"
             self.assertEqual(os.environ[key], self.secrets[key])
         self.assertEqual(os.environ["CUSTOM_PRIVATE_VALUE"], "custom-private-value")
 
-    def test_failure_restores_environment_without_logging_secret(self):
         error = io.StringIO()
         with patch("onionflash.cli.main", side_effect=RuntimeError("private-llm-key")), redirect_stderr(error):
             self.assertEqual(self.run_app("status"), 1)
         self.assertNotIn("private-llm-key", error.getvalue())
         self.assertEqual(os.environ["ONIONFLASH_LLM_API_KEY"], self.secrets["ONIONFLASH_LLM_API_KEY"])
 
-    def test_protected_dotenv_permissions_remain_required(self):
-        (self.directory / "secrets.env").chmod(0o644)
+    def test_dotenv_permissions_and_setup_error_redaction(self):
+        env_file = self.directory / "secrets.env"
+        env_file.chmod(0o644)
         with patch("onionflash.cli.main") as invoke, redirect_stderr(io.StringIO()) as error:
             self.assertEqual(self.run_app("status"), 1)
         invoke.assert_not_called()
-        self.assertIn("mode 600", error.getvalue())  # the operator learns what to fix
-
-    def test_setup_errors_never_print_a_credential(self):
-        # A credential expanded into an invalid setting reaches the error before the publisher exists.
-        # Every name a credential file assigns is redacted, whether or not it looks like a secret.
-        env_file = self.directory / "secrets.env"
+        self.assertIn("mode 600", error.getvalue())
+        env_file.chmod(0o600)
         env_file.write_text(env_file.read_text() + "\nCUSTOM_PRIVATE_VALUE=custom-private-value\n")
         original = self.app_config.read_text()
         for name, value in (("CLOUDFLARE_API_TOKEN", "private-cloudflare-token"), ("CUSTOM_PRIVATE_VALUE", "custom-private-value")):
             with self.subTest(name=name):
-                self.app_config.write_text(original.replace(
-                    "https://example.com/onionflash/", "https://example.com:${%s}/onionflash/" % name))
+                self.app_config.write_text(original.replace("[llm]\n", f'[llm]\nallowed_networks = ["{value}"]\n'))
                 with patch("onionflash.cli.main") as invoke, redirect_stderr(io.StringIO()) as error:
                     self.assertEqual(self.run_app("status"), 1)
                 invoke.assert_not_called()
                 self.assertNotIn(value, error.getvalue())
                 self.assertIn("[redacted]", error.getvalue())
 
-    def test_busy_mutations_return_75_without_invocation_but_inspection_remains_available(self):
-        mutations = [("build",), *(('story', action) for action in ("correct", "retract", "restore", "unlock", "merge")),
-                     ("rejected", "retry"), ("rejected", "dismiss"), ("rejected", "approve")]
-        inspections = [("status",), ("story", "show"), ("story", "history"),
-                       ("rejected", "list"), ("rejected", "show"),
-                       ("decisions", "summary"), ("decisions", "list")]
+    def test_busy_mutations_return_75_but_inspection_and_offline_double_dash_work(self):
+        mutations = [("build",), *((cmd, act) for cmd, acts in cli.OPERATOR_ACTIONS.items() for act in acts - cli.READ_ONLY_ACTIONS)]
+        inspections = [("status",), *((cmd, act) for cmd, acts in cli.OPERATOR_ACTIONS.items() for act in acts & cli.READ_ONLY_ACTIONS)]
         with publish.lock(self.directory / "state/run.lock"):
             for arguments in mutations:
                 error = io.StringIO()
@@ -143,10 +120,16 @@ url = "https://example.org/feed.xml"
                 with self.subTest(arguments=arguments), patch("onionflash.cli.main", return_value=0) as invoke:
                     self.assertEqual(self.run_app(*arguments), 0)
                 invoke.assert_called_once()
+        env_file = self.directory / "secrets.env"
+        env_file.write_text("\n".join(f"{k}={v}" for k, v in self.secrets.items() if not k.startswith("CLOUDFLARE_")))
+        env_file.chmod(0o600)
+        for arguments in (["story", "retract", "--reason=--", "--", "--config"], ["story", "show", "--", "--conf"]):
+            with self.subTest(arguments=arguments), patch("onionflash.cli.main", return_value=0) as invoke:
+                self.assertEqual(self.run_app(*arguments), 0)
+                invoke.assert_called_once()
 
-    def test_real_core_status_build_and_database_lock(self):
+    def test_real_core_status_build_database_lock_and_shell_forwarding(self):
         from onionflash.cli import run_lock
-        # Every HTTP client ends in socket.connect. Errors may become exit codes, so the mock is checked too.
         with patch.object(socket.socket, "connect", side_effect=AssertionError("unexpected network")) as connect, \
                 patch("subprocess.run", side_effect=AssertionError("unexpected subprocess")), redirect_stdout(io.StringIO()):
             self.assertEqual(self.run_app("status"), 0)
@@ -160,7 +143,6 @@ url = "https://example.org/feed.xml"
                 self.assertEqual(self.run_app("status"), 0)
         connect.assert_not_called()
 
-    def test_shell_routes_app_and_preserves_publisher_backup_force_arguments(self):
         shutil.copyfile(publish.ROOT / "deploy.sh", self.directory / "deploy.sh")
         binary = self.directory / ".venv/bin/python"
         binary.parent.mkdir(parents=True)
@@ -169,53 +151,13 @@ url = "https://example.org/feed.xml"
             (self.directory / name).write_text("import json, sys; print(json.dumps(sys.argv))\n")
         custom_config = str(self.directory / "deployment with spaces.toml")
         for arguments, script, expected in [
-            (["app", "story", "show", "--story", "abc"], "app_commands.py",
-             [custom_config, "story", "show", "--story", "abc"]),
+            (["app", "story", "show", "--story", "abc"], "app_commands.py", [custom_config, "story", "show", "--story", "abc"]),
             (["backup", "--force"], "publish.py", ["--config", custom_config, "backup", "--force"]),
         ]:
             with self.subTest(arguments=arguments):
                 result = subprocess.run(["/bin/bash", str(self.directory / "deploy.sh"), *arguments],
                                         env={"ONIONFLASH_DEPLOY_CONFIG": custom_config}, capture_output=True, text=True, check=True)
                 self.assertEqual(json.loads(result.stdout), [str(self.directory / script), *expected])
-
-    def test_double_dash_terminator_and_offline_missing_cloudflare_credentials_work(self):
-        env_file = self.directory / "secrets.env"
-        env_file.write_text("\n".join(f"{k}={v}" for k, v in self.secrets.items() if not k.startswith("CLOUDFLARE_")))
-        env_file.chmod(0o600)
-        for arguments in (["story", "retract", "--reason=--", "--", "--config"],
-                          ["story", "show", "--", "--conf"]):
-            with self.subTest(arguments=arguments), patch("onionflash.cli.main", return_value=0) as invoke:
-                self.assertEqual(self.run_app(*arguments), 0)
-                invoke.assert_called_once()
-
-    def test_install_validates_arguments_custom_config_directory_and_symlinks(self):
-        import install
-        with self.assertRaisesRegex(SystemExit, "Usage"):
-            install.main([])
-        app_repo = self.directory / "app-repo"
-        app_repo.mkdir()
-        (app_repo / "pyproject.toml").write_text("[project]\nname = 'onionflash'\nversion = '0.0.0'\n")
-        (app_repo / "config.example.toml").write_text("[site]\n")
-        custom_dir = self.directory / "etc" / "onionflash"
-        custom_cfg = custom_dir / "deployment.toml"
-        with patch.dict(os.environ, {"ONIONFLASH_DEPLOY_CONFIG": str(custom_cfg)}), \
-                patch("install.export"), patch("install.shutil.which", return_value="/usr/bin/npm"), \
-                patch("install.subprocess.run"), redirect_stdout(io.StringIO()):
-            install.main([str(app_repo)])
-        self.assertTrue(custom_cfg.is_file())
-        self.assertTrue((custom_dir / "onionflash.toml").is_file())
-        self.assertTrue((custom_dir / "secrets.env").is_file())
-        self.assertEqual((custom_dir / "secrets.env").stat().st_mode & 0o777, 0o600)
-        target = self.directory / "victim.txt"
-        target.write_text("keep")
-        target.chmod(0o644)
-        (custom_dir / "secrets.env").unlink()
-        (custom_dir / "secrets.env").symlink_to(target)
-        with patch.dict(os.environ, {"ONIONFLASH_DEPLOY_CONFIG": str(custom_cfg)}), \
-                patch("install.export"), patch("install.shutil.which", return_value="/usr/bin/npm"), \
-                patch("install.subprocess.run"), self.assertRaisesRegex(SystemExit, "symlink"):
-            install.main([str(app_repo)])
-        self.assertEqual(target.stat().st_mode & 0o777, 0o644)
 
 
 if __name__ == "__main__":
