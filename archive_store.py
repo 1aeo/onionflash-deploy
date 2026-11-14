@@ -1,35 +1,33 @@
 """Immutable article objects and private evidence in Spaces.
 
 Article permalinks (news/<id>/index.html and story.json) are uploaded once as
-content-addressed public objects, routed by a sharded manifest built from the
-core's ledger. Every other public file ships in the Worker's own bundle. The
-caller holds the publisher's job lock. Database locks protect bounded local
-snapshots; network operations never hold that lock. The public prefix has one
-writer. Readers (including the Worker) never receive storage credentials.
+content-addressed public objects, routed by one compressed manifest built from
+the core's ledger. Every other public file ships in the Worker's own bundle.
 """
 
 from __future__ import annotations
 
 import base64
 from contextlib import closing, contextmanager
+import gzip
 import hashlib
-import itertools
-import json
+from pathlib import Path
 import re
-import sqlite3
 import tempfile
 import time
-from pathlib import Path
-from urllib.parse import quote, urlsplit
 
-from publish import ARTICLE, lock, public_files, public_path_allowed
+from onionflash.store import get_meta, set_meta
+from onionflash.util import canonical_json
+from publish import (
+    ARCHIVE_KEYS, ARTICLE, clean_https_url, open_db, public_files, public_path_allowed,
+    require_env_name, s3_client, validate_s3_location, verify_private_object,
+)
 
 SHA = re.compile(r"[a-f0-9]{64}\Z")
 CHUNK = 65536
-# Bounds of one synchronization. worker.mjs reads manifests of up to MAX_MANIFEST_BYTES.
 MAX_UPLOADS_PER_RUN, MAX_UPLOAD_BYTES_PER_RUN, SYNC_BUDGET_SECONDS = 500, 512 * 1024**2, 180
-MAX_OBJECT_BYTES, MAX_MANIFEST_BYTES, SHARD_CHARS = 256 * 1024**2, 8 * 1024**2, 2
-# Article rows whose bytes are not in storage yet.
+MAX_OBJECT_BYTES, MAX_MANIFEST_BYTES = 256 * 1024**2, 8 * 1024**2
+MANIFEST_FORMAT = "onionflash-archive-manifest-v1"
 PENDING = "path GLOB 'news/*' AND (uploaded_sha256 IS NULL OR uploaded_sha256 != sha256)"
 
 
@@ -38,26 +36,19 @@ class ArchiveBudgetReached(TimeoutError):
 
 
 def validate_config(cfg):
-    for key in ("endpoint_url", "public_origin"):
-        value = cfg.get(key)
-        parsed = urlsplit(value) if isinstance(value, str) else None
-        if not parsed or parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
-            raise ValueError("Archive URLs must be clean HTTPS URLs")
+    if unknown := set(cfg) - ARCHIVE_KEYS:
+        raise ValueError("Unknown archive settings: " + ", ".join(sorted(unknown)))
+    validate_s3_location(cfg, "Archive")
+    origin = clean_https_url(cfg.get("public_origin"), "Archive public_origin")
     if not cfg["public_origin"].endswith("/"):
         raise ValueError("Archive public_origin must end with a slash")
-    bucket = cfg.get("bucket")
-    if not isinstance(bucket, str) or not re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", bucket):
-        raise ValueError("Invalid archive bucket")
-    if not isinstance(cfg.get("region"), str) or not cfg["region"].strip():
-        raise ValueError("Archive region must be a non-empty string")
     for key in ("access_key_env", "secret_key_env"):
-        if not isinstance(cfg.get(key), str) or not re.fullmatch(r"[A-Z_][A-Z0-9_]*", cfg[key]):
-            raise ValueError("Invalid archive credential variable name: " + key)
+        require_env_name(cfg.get(key), "Invalid archive credential variable name: " + key)
     for key, suffix in (("public_prefix", "public"), ("private_prefix", "private")):
         prefix = cfg.get(key)
         if not isinstance(prefix, str) or not re.fullmatch(r"[A-Za-z0-9_-]+/" + suffix + "/", prefix):
             raise ValueError("Archive prefixes must be project-specific public/private prefixes")
-    if urlsplit(cfg["public_origin"]).path != "/" + cfg["public_prefix"]:
+    if origin.path != "/" + cfg["public_prefix"]:
         raise ValueError("Archive public_origin must point to the public prefix")
     if cfg["public_prefix"].split("/")[0] != cfg["private_prefix"].split("/")[0]:
         raise ValueError("Archive public/private prefixes must belong to the same project")
@@ -73,20 +64,13 @@ class ArchiveStore:
         self.public = Path(publisher.public)
         self.database = Path(publisher.database)
         self._deadline = None
-        if client is None:
-            import boto3
-            from botocore.config import Config
-            client = boto3.client(
-                "s3", endpoint_url=self.cfg["endpoint_url"], region_name=self.cfg["region"],
-                aws_access_key_id=publisher.secret(self.cfg["access_key_env"]),
-                aws_secret_access_key=publisher.secret(self.cfg["secret_key_env"]),
-                config=Config(connect_timeout=publisher.net["timeout_seconds"],
-                              read_timeout=publisher.net["timeout_seconds"],
-                              retries={"mode": "standard", "total_max_attempts": 1},
-                              request_checksum_calculation="when_required",
-                              response_checksum_validation="when_required"),
-            )
-        self.client = client
+        self.client = client or s3_client(
+            publisher, self.cfg, self.cfg["access_key_env"], self.cfg["secret_key_env"], checksums=True
+        )
+
+    @property
+    def prefix(self) -> str:
+        return self.cfg["public_prefix"]
 
     def worker_vars(self, manifest_sha):
         if not SHA.fullmatch(str(manifest_sha)):
@@ -99,24 +83,20 @@ class ArchiveStore:
 
     @contextmanager
     def budget(self, seconds):
-        """A cooperative deadline for this store's storage work."""
         self._deadline = time.monotonic() + seconds
         try:
             yield
         finally:
             self._deadline = None
 
-    @contextmanager
     def _database(self, shared=False):
-        uri = self.database.resolve(strict=True).as_uri() + ("?mode=ro" if shared else "?mode=rw")
-        with lock(str(self.database) + ".lock", shared=shared), closing(sqlite3.connect(uri, uri=True)) as db:
-            db.row_factory = sqlite3.Row
-            yield db
+        return open_db(self.database, shared=shared)
 
     def _retry(self, action):
-        from botocore.exceptions import (ClientError, ConnectTimeoutError, ConnectionClosedError,
-                                        EndpointConnectionError, IncompleteReadError,
-                                        ReadTimeoutError, ResponseStreamingError)
+        from botocore.exceptions import (
+            ClientError, ConnectTimeoutError, ConnectionClosedError, EndpointConnectionError,
+            IncompleteReadError, ReadTimeoutError, ResponseStreamingError,
+        )
         for attempt in range(self.publisher.net["attempts"]):
             self._budget()
             try:
@@ -148,48 +128,36 @@ class ArchiveStore:
 
     @staticmethod
     def _generation(db):
-        pending = db.execute("SELECT value FROM metadata WHERE key='publication_build_pending'").fetchone()
-        if pending and pending[0] == "1":
+        if get_meta(db, "publication_build_pending") == "1":
             raise ValueError("Public build has not completed")
-        row = db.execute("SELECT value FROM metadata WHERE key='publication_generation'").fetchone()
-        if row is None:
+        generation = get_meta(db, "publication_generation")
+        if generation is None:
             raise ValueError("Build the incremental public catalog before publishing")
-        return str(row[0])
-
-    @staticmethod
-    def _meta(db, key):
-        row = db.execute("SELECT value FROM metadata WHERE key=?", (key,)).fetchone()
-        return row[0] if row else None
-
-    @staticmethod
-    def _set_meta(db, **values):
-        db.executemany("INSERT INTO metadata(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", values.items())
+        return str(generation)
 
     def _initialize(self):
-        destination = hashlib.sha256(str((self.cfg["endpoint_url"], self.bucket, self.cfg["public_prefix"])).encode()).hexdigest()
+        destination = hashlib.sha256(str((self.cfg["endpoint_url"], self.cfg["bucket"], self.prefix)).encode()).hexdigest()
         with self._database() as db:
             self._generation(db)
-            db.executescript("""
-                CREATE TABLE IF NOT EXISTS archive_shards (shard TEXT PRIMARY KEY, sha256 TEXT NOT NULL);
-                CREATE INDEX IF NOT EXISTS public_artifacts_pending ON public_artifacts(path)
-                    WHERE uploaded_sha256 IS NULL OR uploaded_sha256 != sha256;
-            """)
-            if self._meta(db, "archive_destination") != destination:
-                with db:  # A new destination starts empty: every object, shard and root uploads again.
-                    db.execute("DELETE FROM archive_shards")
+            db.executescript(
+                "DROP TABLE IF EXISTS archive_shards; DROP TABLE IF EXISTS archive_manifest_shards;"
+                "CREATE INDEX IF NOT EXISTS public_artifacts_pending ON public_artifacts(path) "
+                "WHERE uploaded_sha256 IS NULL OR uploaded_sha256 != sha256;"
+            )
+            if get_meta(db, "archive_destination") != destination:
+                with db:
                     db.execute("UPDATE public_artifacts SET uploaded_sha256=NULL")
-                    self._set_meta(db, archive_destination=destination, archive_manifest_sha256="", archive_manifest_generation="")
+                    set_meta(db, archive_destination=destination, archive_manifest_sha256="", archive_manifest_generation="")
 
     @staticmethod
     def _pending(db):
         return db.execute("SELECT COUNT(*) FROM public_artifacts WHERE " + PENDING).fetchone()[0]
 
     def _same_generation(self, db, generation):
-        """The core still publishes this generation, and every article of it is uploaded."""
         return self._generation(db) == generation and not self._pending(db)
 
     def _ready(self, db, generation):
-        return self._same_generation(db, generation) and self._meta(db, "archive_manifest_generation") == generation
+        return self._same_generation(db, generation) and get_meta(db, "archive_manifest_generation") == generation
 
     def _file(self, relative):
         if not public_path_allowed(relative):
@@ -295,74 +263,51 @@ class ArchiveStore:
         elif old.get("Metadata", {}).get("sha256") != sha256 or old.get("ContentLength") != size:
             raise ValueError("Refusing to overwrite immutable private archive object")
         self.verify_object(key, sha256, size)
-        # A bucket policy can expose an object whose ACL is private.
-        problem = self.publisher.unsigned_read_problem(self.cfg["endpoint_url"].rstrip("/") + "/" + self.bucket + "/" + quote(key))
-        if problem:
-            if old is None:  # An existing object may back earlier archive references.
-                try:
-                    self._call("delete_object", Key=key)
-                except Exception as cleanup:  # the publisher redacts the message when it reports it
-                    raise ValueError(f"Private archive object {key} {problem}, and deleting it failed: "
-                                     f"{type(cleanup).__name__}: {cleanup}") from cleanup
-            raise ValueError(f"Private archive object {key} {problem}")
+        verify_private_object(
+            self.publisher, self.cfg["endpoint_url"], self.bucket, key, "Private archive object",
+            delete=(lambda: self._call("delete_object", Key=key)) if old is None else None,
+        )
         return {"key": key, "sha256": sha256, "size": size}
 
     def _public_immutable(self, path, key, sha256, mime="application/octet-stream"):
-        # Storage checks each upload's Content-MD5, so a new object needs no read-back. An
-        # existing one must match in size, sha256 metadata and ETag (its MD5). Either way,
-        # anonymous readers must reach it: a bucket policy or a later change can deny them.
         size, old = path.stat().st_size, self._head(key)
         if old is None:
             self._put(path, key, sha256, size, public=True, mime=mime)
-        # This publisher's single-part uploads have a plain MD5 ETag. An object another tool
-        # uploaded in parts has a composite one and fails closed here, as changed.
         elif (old.get("Metadata", {}).get("sha256") != sha256 or old.get("ContentLength") != size
                 or old.get("ETag", "").strip('"') != self._md5(path).hexdigest()):
             raise ValueError("Immutable public archive object changed outside this publisher")
-        # Probe the URL the Worker reads, which validate_config ties to the public prefix.
-        problem = self.publisher.unsigned_read_problem(self.cfg["public_origin"] + key.removeprefix(self.cfg["public_prefix"]), True)
+        problem = self.publisher.unsigned_read_problem(self.cfg["public_origin"] + key.removeprefix(self.prefix), True)
         if problem:
             raise ValueError(f"Public archive object {key} {problem}")
 
     def _prepare_manifest(self, generation, directory):
-        """Upload the changed shards and the root that route this generation's
-        articles, built from the core's ledger. None if the generation changed."""
-        def document(name, value):  # Its content address, and its file when not uploaded yet.
-            body = json.dumps(value, separators=(",", ":"), sort_keys=True).encode()
-            if len(body) > MAX_MANIFEST_BYTES:
-                raise ValueError("Archive manifest exceeds its size limit")
-            sha = hashlib.sha256(body).hexdigest()
-            if uploaded.get(name) != sha:
-                (directory / name).write_bytes(body)
-            return sha
-        def upload(name, sha):
-            self._public_immutable(directory / name, self.cfg["public_prefix"] + "manifests/" + sha + ".json", sha, "application/json")
-        shards = {}
+        """Upload one gzipped manifest for this generation's articles, or return None if generation changed."""
         with self._database(shared=True) as db:
             if not self._same_generation(db, generation):
                 return None
-            uploaded = dict(db.execute("SELECT shard,sha256 FROM archive_shards"))
-            uploaded["root"] = self._meta(db, "archive_manifest_sha256")
-            db.create_function("shard", 1, lambda path: hashlib.sha256(path.encode()).hexdigest()[:SHARD_CHARS])
-            rows = db.execute("SELECT shard(path),path,sha256,size FROM public_artifacts WHERE path GLOB 'news/*' ORDER BY 1")
-            for shard, group in itertools.groupby(rows, key=lambda row: row[0]):
+            uploaded_sha = get_meta(db, "archive_manifest_sha256")
+            entries = {}
+            for path, sha, size, ctype in db.execute(
+                "SELECT path,sha256,size,content_type FROM public_artifacts WHERE path GLOB 'news/*' ORDER BY path"
+            ):
                 self._budget()
-                shards[shard] = document(shard, {"schema": 1, "entries": {
-                    path: {"sha256": sha, "size": size} for _, path, sha, size in group}})
-        for shard, sha in shards.items():
-            if uploaded.get(shard) != sha:
-                upload(shard, sha)
-                with self._database() as db, db:  # Kept per shard, so a run cut off by its budget keeps its progress.
-                    db.execute("INSERT INTO archive_shards(shard,sha256) VALUES(?,?) "
-                               "ON CONFLICT(shard) DO UPDATE SET sha256=excluded.sha256", (shard, sha))
-        root = document("root", {"schema": 1, "shard_chars": SHARD_CHARS, "shards": shards})
-        if uploaded["root"] != root:
-            upload("root", root)
+                entries[path] = {
+                    "key": f"objects/{sha}", "sha256": sha, "size": size,
+                    "content_type": ctype or ("text/html; charset=utf-8" if path.endswith(".html") else "application/json; charset=utf-8"),
+                }
+        body = gzip.compress(canonical_json({"format": MANIFEST_FORMAT, "entries": entries}).encode("utf-8"), mtime=0)
+        if len(body) > MAX_MANIFEST_BYTES:
+            raise ValueError("Archive manifest exceeds its size limit")
+        manifest_sha = hashlib.sha256(body).hexdigest()
+        if uploaded_sha != manifest_sha:
+            manifest_path = directory / "manifest.json.gz"
+            manifest_path.write_bytes(body)
+            self._public_immutable(manifest_path, f"{self.prefix}manifests/{manifest_sha}.json.gz", manifest_sha, "application/gzip")
         with self._database() as db, db:
             if not self._same_generation(db, generation):
                 return None
-            self._set_meta(db, archive_manifest_sha256=root, archive_manifest_generation=generation)
-        return root
+            set_meta(db, archive_manifest_sha256=manifest_sha, archive_manifest_generation=generation)
+        return manifest_sha
 
     def _sync(self):
         self._initialize()
@@ -372,7 +317,7 @@ class ArchiveStore:
                 generation = self._generation(db)
                 if self._ready(db, generation):
                     return {"generation": generation, "uploaded": 0, "pending": 0, "ready": True,
-                            "manifest_sha256": self._meta(db, "archive_manifest_sha256")}
+                            "manifest_sha256": get_meta(db, "archive_manifest_sha256")}
                 rows = db.execute("SELECT path,sha256,size FROM public_artifacts WHERE " + PENDING + " ORDER BY path LIMIT ?",
                                   (MAX_UPLOADS_PER_RUN,)).fetchall()
                 selected, total = [], 0
@@ -385,9 +330,8 @@ class ArchiveStore:
                     total += row["size"]
                     selected.append(row)
             for row in selected:
-                self._public_immutable(snapshot / row["path"], self.cfg["public_prefix"] + "objects/" + row["sha256"], row["sha256"])
+                self._public_immutable(snapshot / row["path"], self.prefix + "objects/" + row["sha256"], row["sha256"])
                 with self._database() as db, db:
-                    # Record the uploaded bytes: a direct core build may have rendered the article again meanwhile.
                     db.execute("UPDATE public_artifacts SET uploaded_sha256=? WHERE path=? AND sha256=?",
                                (row["sha256"], row["path"], row["sha256"]))
                 self._uploaded += 1
@@ -409,9 +353,7 @@ class ArchiveStore:
                         "ready": False, "manifest_sha256": None, "budget_reached": True}
 
     def snapshot(self, destination, generation):
-        """Copy this generation's hot files into a new directory, checking each one's
-        path, ledger hash and absence of credentials. Return the publication manifest:
-        those files and the article permalinks its root routes, with their hashes."""
+        """Copy this generation's hot files into destination and return the full publication manifest."""
         destination.mkdir(parents=True)
         manifest = {}
         with self._database(shared=True) as db:
@@ -423,7 +365,6 @@ class ArchiveStore:
                 elif not ARTICLE.fullmatch(row["path"]):
                     continue
                 manifest[row["path"]] = row["sha256"]
-        missing = public_files() - manifest.keys()
-        if missing:
+        if missing := public_files() - manifest.keys():
             raise ValueError("Missing required public file: " + min(missing))
         return manifest

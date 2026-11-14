@@ -5,11 +5,11 @@ Published articles have no age or count expiry; the application's
 guide describes its pages and feeds.
 
 Each article page and its public JSON (`news/<id>/` and `news/<id>/story.json`)
-is uploaded once to an immutable object in Spaces, and a small sharded manifest
+is uploaded once to an immutable object in Spaces, and a compressed manifest
 maps those paths to content hashes. Every other public file, from the front page,
 numbered history and topic pages to the feeds and shared assets, ships in the
 Worker's own deployment bundle. A Worker version binds its bundle and one
-immutable root manifest, so rollback restores the same listings and selects the
+immutable manifest, so rollback restores the same listings and selects the
 same historical articles rather than reading files overwritten by a later run.
 
 The Worker routes only article paths to storage. It never receives Spaces
@@ -70,12 +70,12 @@ pending counts remain. Existing article routes are not switched until previously
 published pages have verified permanent copies. A partial build, generation
 change, failed upload or exhausted work budget retains the existing publication.
 
-Each run uploads only new or changed article files and the manifest shards that
-list them, so permanent storage grows with the articles themselves. Listings and
+Each run uploads only new or changed article files and the manifest that
+lists them, so permanent storage grows with the articles themselves. Listings and
 feeds change with every story; they travel in the Worker bundle, which keeps no
 permanent copies. Asset, Worker-code and runtime binding changes all participate
 in deployment identity. The preview and live checks also fetch one article
-through the Worker, so a wrong origin or root fails them.
+through the Worker, so a wrong origin or manifest fails them.
 
 Publication, rollback and recovery work as described in the
 [README](README.md#publication).

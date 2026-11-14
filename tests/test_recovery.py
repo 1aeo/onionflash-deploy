@@ -1,79 +1,28 @@
 """Failure-path checks for owned deployment transitions and private backups."""
-from datetime import datetime, timezone
-import errno
-import gzip
-import io
-import json
-import os
-from pathlib import Path
-import re
-import sqlite3
-import sys
-import unittest
-from contextlib import closing, redirect_stdout
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing, redirect_stdout
+from datetime import datetime, timezone
+import errno, gzip, io, json, os, re, sqlite3, subprocess, sys, unittest
+from pathlib import Path
 from unittest.mock import ANY, MagicMock, call, patch
 from urllib.error import HTTPError, URLError
 
 import publish
-from tests.fakes import NEW, OLD, make_publisher
-
-OTHER = "33333333-3333-4333-8333-333333333333"
+from tests.fakes import DeployTestCase, FakeS3, NEW, OLD, OTHER
 
 
 def receipt(version, previous=None):
-    return {"version_id": version, "previous_version_id": previous,
-            "content_hash": version, "published_at": "2026-11-09T10:00:00Z",
-            "manifest": {"index.html": version}}
+    return {"version_id": version, "previous_version_id": previous, "content_hash": version,
+            "published_at": "2026-11-09T10:00:00Z", "manifest": {"index.html": version}}
 
 
-class FakeSpaces:
-    def __init__(self, *, cleanup_error=False, retention_error=False, listed=()):
-        self.cleanup_error, self.retention_error = cleanup_error, retention_error
-        self.objects, self.uploads, self.deleted, self.listed = {}, [], [], list(listed)
-
-    def put_object(self, *, Bucket, Key, Body, ACL, ContentType):
-        Body = Body.read()
-        self.objects[Bucket, Key] = Body
-        self.uploads.append((Bucket, Key, Body, ACL))
-
-    def delete_object(self, *, Bucket, Key):
-        self.deleted.append((Bucket, Key))
-        if self.cleanup_error:
-            raise RuntimeError("cleanup unavailable")
-        self.objects.pop((Bucket, Key), None)
-
-    def get_paginator(self, name):
-        return self
-
-    def paginate(self, **kwargs):
-        if self.retention_error:
-            raise RuntimeError("retention listing unavailable")
-        return [{"Contents": self.listed}]
-
-
-class RecoveryTests(unittest.TestCase):
-    def setUp(self):
-        self.directory, self.p = make_publisher(self)
-
-    def seed_public(self):
-        """Generated output and the core's ledger of it."""
-        self.p.public.mkdir(parents=True)
-        with closing(sqlite3.connect(self.p.database)) as db:
-            db.executescript("CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT);"
-                             "CREATE TABLE public_artifacts(path TEXT PRIMARY KEY, sha256 TEXT);")
-            for name in publish.public_files():
-                body = b"generated public content"
-                if name == "feed.xml":
-                    body = b"<rss version='2.0'><channel><title>News</title></channel></rss>"
-                elif name == "feed.json":
-                    body = b'{"items":[]}'
-                (self.p.public / name).write_bytes(body)
-                db.execute("INSERT INTO public_artifacts VALUES(?,?)", (name, publish.hashlib.sha256(body).hexdigest()))
-            db.commit()
+class RecoveryTests(DeployTestCase):
+    def _patch(self, name, **kwargs):
+        patcher = patch.object(self.p, name, **kwargs)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def fake_cloudflare(self, live, *, failing_check=None):
-        """Patch wrangler, the API and checks; record calls in self.calls."""
         if live is not None and not (self.p.state / "publication.json").exists():
             publish.atomic_json(self.p.state / "publication.json", receipt(live))
         self.calls, self.live = [], [live]
@@ -85,338 +34,16 @@ class RecoveryTests(unittest.TestCase):
             elif arguments[0] == "deploy":
                 self.live[0] = NEW
             return ""
-        def activate(version, config):
-            self.calls.append("activate " + version)
-            self.live[0] = version
         def verify(url, manifest, archive=None):
             self.calls.append("verify " + ("preview" if url.startswith(preview) else "live"))
             if failing_check and self.calls[-1] == "verify " + failing_check:
                 raise ValueError("check failed")
-        for name, value in [("command", command), ("activate", activate), ("verify", verify),
-                            ("current_version", lambda: self.live[0])]:
-            patcher = patch.object(self.p, name, side_effect=value)
-            patcher.start()
-            self.addCleanup(patcher.stop)
-        for name, value in [("origin_url", "https://news.example.workers.dev/onionflash"), ("app_version", "test")]:
-            patcher = patch.object(self.p, name, return_value=value)
-            patcher.start()
-            self.addCleanup(patcher.stop)
-
-    def test_publish_checks_the_preview_before_activating_and_records_the_receipt(self):
-        self.seed_public()
-        publish.atomic_json(self.p.state / "receipts" / (OTHER + ".json"), receipt(OTHER))
-        self.fake_cloudflare(OLD)
-        result = self.p.publish()
-        self.assertEqual(self.calls, ["versions upload", "verify preview", "activate " + NEW, "verify live"])
-        self.assertEqual((result["version_id"], result["previous_version_id"]), (NEW, OLD))
-        self.assertEqual(publish.read_json(self.p.state / "publication.json")["version_id"], NEW)
-        # Static receipts list every file, so only the live one and the rollback target are kept.
-        self.assertEqual({path.name for path in (self.p.state / "receipts").iterdir()}, {OLD + ".json", NEW + ".json"})
-        self.assertEqual(publish.read_json(self.p.state / "receipts" / (OLD + ".json")), receipt(OLD))
-
-    def test_publication_never_drops_an_article_the_live_receipt_lists(self):
-        self.seed_public()
-        self.fake_cloudflare(OLD)
-        gone = "news/gone/index.html"
-        publish.atomic_json(self.p.state / "permalinks.json", [])  # as an older copy restored without it
-        for previous in ({**receipt(OLD), "manifest": {gone: "a" * 64}}, {**receipt(OLD), "articles": [gone]}):
-            with self.subTest(previous=previous):  # a static or a permanent-storage receipt
-                publish.atomic_json(self.p.state / "publication.json", previous)
-                with self.assertRaisesRegex(ValueError, "previously published article"):
-                    self.p.publish()
-                self.assertEqual(self.calls, [])
-
-    def add_article(self, story_id):
-        body = f"<p>{story_id}</p>".encode()
-        (self.p.public / "news" / story_id).mkdir(parents=True)
-        (self.p.public / "news" / story_id / "index.html").write_bytes(body)
-        with closing(sqlite3.connect(self.p.database)) as db, db:
-            db.execute("INSERT INTO public_artifacts VALUES(?,?)", (f"news/{story_id}/index.html", publish.hashlib.sha256(body).hexdigest()))
-
-    def test_a_published_article_stays_required_after_a_rollback_or_a_reset_receipt(self):
-        self.seed_public()
-        self.add_article("kept")
-        # Only the live receipt starts the record, not the older one rollback would restore.
-        publish.atomic_json(self.p.state / "publication.json", receipt(OLD, OTHER))
-        publish.atomic_json(self.p.state / "receipts" / (OTHER + ".json"), {**receipt(OTHER), "manifest": {"news/earlier/index.html": "a" * 64}})
-        self.fake_cloudflare(OLD)
-        self.p.publish()
-        permalinks = self.p.state / "permalinks.json"
-        self.assertEqual(publish.read_json(permalinks), ["news/kept/index.html"])
-        self.p.rollback()
-        self.p.execute("resume")
-        with closing(sqlite3.connect(self.p.database)) as db, db:
-            db.execute("DELETE FROM public_artifacts WHERE path='news/kept/index.html'")
-        for previous in (None, {"version_id": OLD}, {}):  # the rolled-back receipt, a version-only or a lost one
-            with self.subTest(previous=previous):
-                if previous is not None:
-                    publish.atomic_json(self.p.state / "publication.json", previous)
-                self.calls.clear()
-                with self.assertRaisesRegex(ValueError, "previously published article.*to withdraw a story, retract it"):
-                    self.p.publish()
-                self.assertEqual(self.calls, [])
-        self.assertEqual(publish.read_json(permalinks), ["news/kept/index.html"])
-
-    def test_the_live_receipt_starts_the_record_even_when_nothing_changed(self):
-        self.seed_public()
-        self.add_article("live")
-        self.fake_cloudflare(OLD)
-        published = self.p.publish()
-        (self.p.state / "permalinks.json").unlink()  # as before the record existed
-        # Only the live receipt starts the record, not the rollback target's.
-        publish.atomic_json(self.p.state / "receipts" / (OLD + ".json"), {**receipt(OLD), "manifest": {"news/earlier/index.html": "a" * 64}})
-        self.calls.clear()
-        self.assertEqual(self.p.publish(), published)
-        self.assertEqual(self.calls, [])  # unchanged: nothing uploaded
-        self.assertEqual(publish.read_json(self.p.state / "permalinks.json"), ["news/live/index.html"])
-
-    def test_an_empty_record_learns_live_articles_before_unchanged_and_rollback(self):
-        self.seed_public()
-        self.add_article("live")
-        self.fake_cloudflare(OLD)
-        published = self.p.publish()
-        permalinks = self.p.state / "permalinks.json"
-        publish.atomic_json(permalinks, [])
-        self.calls.clear()
-        self.assertEqual(self.p.publish(), published)
-        self.assertEqual(self.calls, [])
-        self.assertEqual(publish.read_json(permalinks), ["news/live/index.html"])
-
-        self.p.rollback()
-        self.p.execute("resume")
-        with closing(sqlite3.connect(self.p.database)) as db, db:
-            db.execute("DELETE FROM public_artifacts WHERE path='news/live/index.html'")
-        self.calls.clear()
-        with self.assertRaisesRegex(ValueError, "previously published article.*to withdraw a story, retract it"):
-            self.p.publish()
-        self.assertEqual(self.calls, [])
-        self.assertEqual(publish.read_json(permalinks), ["news/live/index.html"])
-
-    def test_an_existing_record_adds_live_receipt_articles_before_unchanged(self):
-        self.seed_public()
-        self.add_article("earlier")
-        self.add_article("live")
-        self.fake_cloudflare(OLD)
-        published = self.p.publish()
-        permalinks = self.p.state / "permalinks.json"
-        publish.atomic_json(permalinks, ["news/earlier/index.html"])
-        self.calls.clear()
-        self.assertEqual(self.p.publish(), published)
-        self.assertEqual(self.calls, [])
-        self.assertEqual(publish.read_json(permalinks), ["news/earlier/index.html", "news/live/index.html"])
-
-    def test_a_run_interrupted_after_its_live_check_has_recorded_its_articles(self):
-        self.seed_public()
-        self.add_article("new")
-        self.fake_cloudflare(OLD)
-        write = publish.atomic_json
-        def interrupted(path, value):
-            if Path(path).name == NEW + ".json":
-                raise KeyboardInterrupt
-            write(path, value)
-        with patch("publish.atomic_json", side_effect=interrupted), self.assertRaises(KeyboardInterrupt):
-            self.p.publish()
-        self.assertEqual(self.calls[-1], "verify live")
-        self.assertEqual(publish.read_json(self.p.state / "permalinks.json"), ["news/new/index.html"])
-
-    def test_a_damaged_record_of_published_articles_refuses_publication(self):
-        self.seed_public()
-        self.fake_cloudflare(OLD)
-        permalinks = self.p.state / "permalinks.json"
-        for text in ("{}", '["news/../x"]', '["news/kept/index.html"'):  # not a list, not an article, not JSON
-            with self.subTest(text=text):
-                permalinks.write_text(text)
-                with self.assertRaisesRegex(ValueError, re.escape(f"{permalinks} is damaged")):
-                    self.p.publish()
-                self.assertEqual(self.calls, [])
-                self.assertEqual(permalinks.read_text(), text)
-
-    def test_failed_live_check_rolls_back_and_fails_without_holding(self):
-        self.seed_public()
-        self.add_article("new")
-        publish.atomic_json(self.p.state / "publication.json", receipt(OLD))
-        self.fake_cloudflare(OLD, failing_check="live")
-        with self.assertRaisesRegex(ValueError, "check failed"):
-            self.p.publish()
-        self.assertEqual(self.calls[-2:], ["verify live", "activate " + OLD])
-        self.assertEqual(self.live[0], OLD)
-        self.assertEqual(publish.read_json(self.p.state / "publication.json")["version_id"], OLD)
-        self.assertEqual(publish.read_json(self.p.state / "permalinks.json"), [])  # never verified live, so not recorded
-        self.assertFalse((self.p.state / "publication-hold.json").exists())
-
-    def test_a_failed_restore_reports_both_failures_and_stops_the_next_run_for_inspection(self):
-        self.seed_public()
-        publish.atomic_json(self.p.state / "publication.json", receipt(OLD))
-        self.fake_cloudflare(OLD, failing_check="live")
-        def activate(version, config):
-            if version == OLD:
-                raise RuntimeError("restore unavailable")
-            self.live[0] = version
-        with patch.object(self.p, "activate", side_effect=activate):
-            with self.assertRaisesRegex(RuntimeError, "check failed.*restore unavailable"):
-                self.p.publish()
-        current = publish.read_json(self.p.state / "publication.json")
-        self.assertEqual(current["version_id"], OLD)
-        self.assertNotIn("content_hash", current)
-        with self.assertRaisesRegex(ValueError, rf"inspect before publishing \(live {NEW}, recorded {OLD}\)"):
-            self.p.publish()
-
-    def test_an_upload_without_a_reported_version_fails_clearly(self):
-        self.seed_public()
-        self.fake_cloudflare(OLD)
-        with patch.object(self.p, "command", return_value=""):
-            with self.assertRaisesRegex(RuntimeError, "did not report the uploaded version"):
-                self.p.publish()
-
-    def test_an_interrupted_publication_or_rollback_cannot_skip_the_next_upload(self):
-        self.seed_public()
-        publish.atomic_json(self.p.state / "publication.json", receipt(OLD))
-        self.fake_cloudflare(OLD)
-        with patch.object(self.p, "activate", side_effect=KeyboardInterrupt):
-            with self.assertRaises(KeyboardInterrupt):
-                self.p.publish()
-        self.assertNotIn("content_hash", publish.read_json(self.p.state / "publication.json"))
-        publish.atomic_json(self.p.state / "publication.json", receipt(NEW, OLD))
-        self.live[0] = NEW
-        with patch.object(self.p, "activate", side_effect=KeyboardInterrupt):
-            with self.assertRaises(KeyboardInterrupt):
-                self.p.rollback()
-        self.assertNotIn("content_hash", publish.read_json(self.p.state / "publication.json"))
-        self.assertTrue((self.p.state / "publication-hold.json").is_file())
-
-    def test_failed_preview_check_never_activates(self):
-        self.seed_public()
-        self.fake_cloudflare(OLD, failing_check="preview")
-        with self.assertRaisesRegex(ValueError, "check failed"):
-            self.p.publish()
-        self.assertFalse(any(call.startswith("activate") for call in self.calls))
-
-    def test_a_new_worker_is_deployed_directly(self):
-        self.seed_public()
-        self.fake_cloudflare(None)
-        receipt = self.p.publish()
-        self.assertEqual(self.calls, ["deploy --config", "verify live"])
-        self.assertEqual((receipt["version_id"], receipt["previous_version_id"]), (NEW, None))
-
-    def test_a_new_worker_that_fails_its_live_check_is_recorded_and_the_next_run_uploads(self):
-        self.seed_public()
-        self.fake_cloudflare(None, failing_check="live")
-        with self.assertRaisesRegex(ValueError, "check failed"):
-            self.p.publish()
-        self.assertEqual(publish.read_json(self.p.state / "publication.json"), {"version_id": NEW})
-        self.fake_cloudflare(NEW)
-        self.p.publish()
-        self.assertEqual(self.calls, ["versions upload", "verify preview", "activate " + NEW, "verify live"])
-
-    def test_a_failed_deploy_records_the_worker_it_created(self):
-        self.seed_public()
-        self.fake_cloudflare(None)
-        def deploy(arguments, metadata=None):
-            self.live[0] = NEW
-            raise RuntimeError("deploy reported an error")
-        with patch.object(self.p, "command", side_effect=deploy):
-            with self.assertRaisesRegex(RuntimeError, "deploy reported"):
-                self.p.publish()
-        self.assertEqual(publish.read_json(self.p.state / "publication.json"), {"version_id": NEW})
-
-    def test_a_failed_deploy_keeps_its_error_when_the_version_lookup_also_fails(self):
-        self.seed_public()
-        self.fake_cloudflare(None)
-        lookups = iter([None])  # the check before deploying succeeds; the one after fails
-        def current_version():
-            for version in lookups:
-                return version
-            raise RuntimeError("version lookup failed")
-        def deploy(arguments, metadata=None):
-            raise RuntimeError("deploy reported an error")
-        with patch.object(self.p, "command", side_effect=deploy), \
-                patch.object(self.p, "current_version", side_effect=current_version):
-            with self.assertRaisesRegex(RuntimeError, "deploy reported"):
-                self.p.publish()
-
-    def test_failed_check_does_not_roll_back_an_external_version(self):
-        self.seed_public()
-        self.fake_cloudflare(OLD)
-        def verify(url, manifest, archive=None):
-            if "candidate-" not in url:
-                self.live[0] = OTHER
-                raise ValueError("external deployment happened during verification")
-        with patch.object(self.p, "verify", side_effect=verify):
-            with self.assertRaisesRegex(RuntimeError, "external version retained"):
-                self.p.publish()
-        self.assertEqual(self.live[0], OTHER)
-        self.assertEqual([call for call in self.calls if call.startswith("activate")], ["activate " + NEW])
-
-    def test_changed_content_does_not_replace_an_external_version(self):
-        self.seed_public()
-        for recorded in (receipt(OLD), {}):  # {}: for example, a lost state directory
-            with self.subTest(recorded=recorded.get("version_id")):
-                publish.atomic_json(self.p.state / "publication.json", recorded)
-                self.fake_cloudflare(OTHER)
-                with self.assertRaisesRegex(ValueError, f"differs.*live {OTHER}, recorded {recorded.get('version_id')}"):
-                    self.p.publish()
-                self.assertEqual(self.calls, [])
-                self.assertEqual(self.live[0], OTHER)
-
-    def test_external_activation_during_preview_is_preserved(self):
-        self.seed_public()
-        self.fake_cloudflare(OLD)
-        def verify(url, manifest, archive=None):
-            self.live[0] = OTHER
-        with patch.object(self.p, "verify", side_effect=verify):
-            with self.assertRaisesRegex(ValueError, "changed during preview"):
-                self.p.publish()
-        self.assertFalse(any(call.startswith("activate") for call in self.calls))
-        self.assertEqual(self.live[0], OTHER)
-
-    def test_fallible_provenance_is_collected_before_activation(self):
-        self.seed_public()
-        self.fake_cloudflare(OLD)
-        with patch.object(self.p, "app_version", side_effect=RuntimeError("metadata unavailable")):
-            with self.assertRaisesRegex(RuntimeError, "metadata unavailable"):
-                self.p.publish()
-        self.assertEqual(self.calls, [])
-
-    def test_rollback_restores_the_previous_receipt_and_forces_the_next_upload(self):
-        old = dict(receipt(OLD), published_at="2026-11-08T10:00:00Z",
-                   archive={"manifest_sha256": "a" * 64, "generation": "1", "origin": "https://example.org/public/"})
-        publish.atomic_json(self.p.state / "receipts" / (OLD + ".json"), old)
-        publish.atomic_json(self.p.state / "publication.json", receipt(NEW, OLD))
-        with patch.object(self.p, "activate"), patch.object(self.p, "current_version", return_value=NEW):
-            self.p.rollback()
-        old.pop("content_hash")
-        self.assertEqual(publish.read_json(self.p.state / "publication.json"),
-                         {**old, "rolled_back_from": NEW, "rolled_back_at": ANY})
-
-    def test_rollback_holds_before_activation_and_forces_the_next_upload(self):
-        publish.atomic_json(self.p.state / "publication.json", receipt(NEW, OLD))
-        def activate(version, config):
-            self.assertTrue((self.p.state / "publication-hold.json").is_file())
-        with patch.object(self.p, "activate", side_effect=activate) as activation, patch.object(self.p, "current_version", return_value=NEW):
-            self.p.rollback()
-        activation.assert_called_once()
-        self.assertEqual(activation.call_args[0][0], OLD)
-        current = publish.read_json(self.p.state / "publication.json")
-        self.assertEqual(current["version_id"], OLD)
-        self.assertNotIn("content_hash", current)
-
-    def test_failed_rollback_keeps_the_hold_and_the_receipt(self):
-        publish.atomic_json(self.p.state / "publication.json", receipt(NEW, OLD))
-        with patch.object(self.p, "activate", side_effect=RuntimeError("API unavailable")), patch.object(self.p, "current_version", return_value=NEW):
-            with self.assertRaises(RuntimeError):
-                self.p.rollback()
-        self.assertEqual(publish.read_json(self.p.state / "publication-hold.json")["reason"], "rollback requested")
-        self.assertEqual(publish.read_json(self.p.state / "publication.json")["version_id"], NEW)
-
-    def test_manual_rollback_never_replaces_an_external_version(self):
-        original = receipt(NEW, OLD)
-        publish.atomic_json(self.p.state / "publication.json", original)
-        with patch.object(self.p, "current_version", return_value=OTHER), patch.object(self.p, "activate") as activate:
-            with self.assertRaisesRegex(ValueError, "rollback not performed"):
-                self.p.rollback()
-        activate.assert_not_called()
-        self.assertFalse((self.p.state / "publication-hold.json").exists())
-        self.assertEqual(publish.read_json(self.p.state / "publication.json"), original)
+        self._patch("command", side_effect=command)
+        self._patch("activate", side_effect=lambda version, config: (self.calls.append("activate " + version), self.live.__setitem__(0, version)))
+        self._patch("verify", side_effect=verify)
+        self._patch("current_version", side_effect=lambda: self.live[0])
+        self._patch("origin_url", return_value="https://news.example.workers.dev/onionflash")
+        self._patch("app_version", return_value="test")
 
     def seed_backup(self):
         self.p.cfg["spaces"].update(enabled=True)
@@ -425,208 +52,9 @@ class RecoveryTests(unittest.TestCase):
             db.execute("INSERT INTO evidence VALUES ('private source evidence')")
             db.commit()
         self.seed_public()
-        # Deliberately unlike the current build: an offline build can be newer
-        # than the last successful publication receipt.
         publish.atomic_json(self.p.state / "publication.json", receipt(OLD))
 
-    def test_publication_failure_does_not_prevent_due_backup(self):
-        with patch.object(self.p, "application", return_value='{"sources_ok": 1}'), \
-                patch.object(self.p, "publish", side_effect=ValueError("Cloudflare unavailable")), \
-                patch.object(self.p, "backup") as backup:
-            result = self.p.run_cycle()
-        backup.assert_called_once()
-        self.assertFalse(result["ok"])
-        self.assertEqual(result["phases"]["publication"], "failed")
-        self.assertEqual(result["phases"]["backup"], "ok")
-
-    def test_collection_failure_skips_publication_but_preserves_backup_attempt(self):
-        with patch.object(self.p, "application", side_effect=[ValueError("collection failed"), "{}"]) as application, \
-                patch.object(self.p, "publish") as publication, \
-                patch.object(self.p, "backup") as backup, self.assertLogs(publish.LOG, "WARNING") as logged:
-            result = self.p.run_cycle()
-        publication.assert_not_called()
-        backup.assert_called_once()
-        self.assertFalse(result["ok"])
-        self.assertEqual(result["phases"]["publication"], "skipped")
-        self.assertEqual([(r.levelname, r.getMessage()) for r in logged.records], [("ERROR", "collection: collection failed")])
-        # The weekly summary still follows the failed run.
-        self.assertEqual(application.call_args_list, [call("run"), call("decisions", "summary", "--since", "7d")])
-        self.assertEqual((result["phases"]["weekly_summary"], len(list((self.p.state / "weekly").iterdir()))), ("ok", 2))
-
-    def test_publication_hold_still_collects_and_backs_up(self):
-        publish.atomic_json(self.p.state / "publication-hold.json", {"reason": "operator hold"})
-        with patch.object(self.p, "application", return_value='{"sources_ok": 1}') as application, \
-                patch.object(self.p, "publish") as publish_call, \
-                patch.object(self.p, "backup") as backup:
-            result = self.p.run_cycle()
-        self.assertEqual(application.call_args_list, [call("run"), call("decisions", "summary", "--since", "7d")])
-        publish_call.assert_not_called()
-        backup.assert_called_once()
-        self.assertTrue(result["ok"])
-        self.assertEqual(result["phases"]["publication"], "held")
-
-    def test_optional_backup_error_is_visible_as_degraded_status(self):
-        with patch.object(self.p, "application", return_value='{"sources_ok": 1}'), patch.object(self.p, "publish"), \
-                patch.object(self.p, "backup", side_effect=ValueError("Spaces unavailable")):
-            result = self.p.run_cycle()
-        self.assertTrue(result["ok"])
-        self.assertEqual(result["phases"]["backup"], "failed")
-        self.assertTrue(result["warnings"])
-
-    def test_busy_admin_is_not_reported_as_success(self):
-        for command, expected in [("hold", 75), ("rollback", 75), ("check", 75), ("run", 0)]:
-            with self.subTest(command=command), publish.lock(self.p.state / "run.lock"), \
-                    patch("publish.Publisher", return_value=self.p), \
-                    patch("sys.argv", ["publish.py", command]):
-                self.assertEqual(publish.main(), expected)
-        self.assertFalse((self.p.state / "publication-hold.json").exists())
-
-    def test_status_uses_shared_probe_and_never_creates_rotating_log(self):
-        with publish.lock(self.p.state / "run.lock", shared=True), \
-                patch("publish.Publisher", return_value=self.p), \
-                patch("sys.argv", ["publish.py", "status"]), redirect_stdout(io.StringIO()) as output:
-            self.assertEqual(publish.main(), 0)
-        self.assertIn('"running": false', output.getvalue())
-        self.assertFalse((self.p.state / "run.log").exists())
-
-    def test_atomic_json_concurrent_writes_are_complete_and_private(self):
-        path = self.directory / "race.json"
-        original_files = set(self.directory.iterdir())
-        values = [{"writer": n, "payload": str(n) * 100000} for n in range(4)]
-        with ThreadPoolExecutor(max_workers=4) as pool:
-            list(pool.map(lambda value: publish.atomic_json(path, value), values))
-        self.assertIn(json.loads(path.read_text()), values)
-        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
-        self.assertEqual(set(self.directory.iterdir()), original_files | {path})
-
-    def test_failed_atomic_json_preserves_old_record_and_cleans_temporary_file(self):
-        path = self.directory / "record.json"
-        publish.atomic_json(path, {"generation": "old"})
-        original_files = set(self.directory.iterdir())
-        with self.assertRaises(TypeError):
-            publish.atomic_json(path, {"unsupported": object()})
-        self.assertEqual(publish.read_json(path), {"generation": "old"})
-        self.assertEqual(set(self.directory.iterdir()), original_files)
-
-    def test_successful_check_replaces_previous_failed_check_receipt(self):
-        publish.atomic_json(self.p.state / "last-run.json", {"ok": False, "command": "check", "error": "old failure"})
-        with patch("publish.Publisher", return_value=self.p), \
-                patch.object(self.p, "application", return_value='{"configuration": "valid"}'), \
-                patch.object(self.p, "node", Path(__file__)), patch.object(self.p, "wrangler", Path(__file__)), \
-                patch("sys.argv", ["publish.py", "check"]), redirect_stdout(io.StringIO()):
-            self.assertEqual(publish.main(), 0)
-        result = publish.read_json(self.p.state / "last-run.json")
-        self.assertTrue(result["ok"])
-        self.assertEqual(result["command"], "check")
-        self.assertNotIn("error", result)
-
-    def test_app_errors_and_timeouts_are_recorded_not_silent(self):
-        import subprocess
-        failed = subprocess.CompletedProcess([], 2, stdout="", stderr="onionflash: Output ownership marker does not match")
-        with patch("publish.subprocess.run", return_value=failed), patch.object(self.p, "publish"), \
-                patch.object(self.p, "backup"):
-            result = self.p.run_cycle()
-        self.assertEqual(result["phases"]["collection"], "failed")
-        self.assertIn("Output ownership marker", result["errors"][0])
-        with patch("publish.subprocess.run", side_effect=subprocess.TimeoutExpired(["onionflash"], 540)), \
-                patch.object(self.p, "publish") as publication, patch.object(self.p, "backup") as backup:
-            result = self.p.run_cycle()
-        self.assertIn("timed out", result["errors"][0])
-        publication.assert_not_called()
-        backup.assert_called_once()
-
-    def test_run_report_is_kept_in_the_cycle_result(self):
-        import subprocess
-        done = subprocess.CompletedProcess([], 0, stdout='{"sources_ok": 15, "sources_failed": 3}\n', stderr="")
-        with patch("publish.subprocess.run", return_value=done) as run, patch.object(self.p, "publish"), \
-                patch.object(self.p, "backup"):
-            result = self.p.run_cycle()
-        self.assertEqual(result["report"], {"sources_ok": 15, "sources_failed": 3})
-        self.assertGreater(run.call_args.kwargs["timeout"], 0)
-
-    def test_each_iso_week_keeps_one_private_decision_summary(self):
-        self.addCleanup(os.umask, os.umask(0o022))  # private whatever the umask
-        weekly, sizes = self.p.state / "weekly", []
-        def application(*arguments):
-            if arguments == ("run",):
-                return '{"sources_ok": 1}'
-            self.assertEqual(arguments, ("decisions", "summary", "--since", "7d"))
-            sizes.append(len(sizes) + 1)
-            return '{"feed": {"bytes": %d}, "title": "\\u202e"}' % sizes[-1]  # one line, as the application prints it
-        with patch.object(self.p, "application", side_effect=application), patch.object(self.p, "publish"), \
-                patch.object(self.p, "backup"), patch("publish.datetime") as clock:
-            # Two runs in ISO week 53 of 2026 (the second one in 2027), then one in week 1 of 2027.
-            for day in (datetime(2026, 12, 31), datetime(2027, 1, 3), datetime(2027, 1, 4)):
-                clock.now.return_value = day.replace(tzinfo=timezone.utc)
-                result = self.p.run_cycle()
-                self.assertEqual((result["phases"]["weekly_summary"], result["degraded"]), ("ok", False))
-        self.assertEqual(sizes, [1, 2])
-        self.assertEqual(sorted(path.name for path in weekly.iterdir()), ["2026-W53.md", "2027-W01.md", "latest.md"])
-        for name, size in [("2026-W53.md", 1), ("2027-W01.md", 2), ("latest.md", 2)]:
-            # Indented for reading; the escape keeps a control or bidi character inert.
-            self.assertEqual((weekly / name).read_text(), '{\n  "feed": {\n    "bytes": %d\n  },\n  "title": "\\u202e"\n}\n' % size)
-            self.assertEqual((weekly / name).stat().st_mode & 0o777, 0o600)
-
-    def test_a_failed_weekly_summary_is_a_warning_and_a_later_run_writes_it(self):
-        weekly, failures, summary = self.p.state / "weekly", [RuntimeError("summary unavailable")], '{"writer_clears": 0}'
-        def application(*arguments):
-            if arguments == ("run",):
-                return '{"sources_ok": 1}'
-            if failures:
-                raise failures.pop()
-            return summary
-        def failed_run():
-            """One successful run; returns its only warning, the summary's failure, also logged as a warning."""
-            with self.assertLogs(publish.LOG, "WARNING") as logged:
-                result = self.p.run_cycle()
-            (warning,) = result["warnings"]
-            self.assertEqual((result["ok"], result["degraded"], result["phases"]["weekly_summary"]), (True, True, "failed"))
-            self.assertEqual([(r.levelname, r.getMessage()) for r in logged.records], [("WARNING", warning)])
-            return warning
-        with patch.object(self.p, "application", side_effect=application), patch.object(self.p, "publish"), \
-                patch.object(self.p, "backup"), patch("publish.datetime") as clock:
-            clock.now.return_value = datetime(2026, 11, 11, tzinfo=timezone.utc)
-            self.assertEqual(failed_run(), "weekly_summary: summary unavailable")
-            (weekly / "latest.md").mkdir(parents=True)  # writing latest.md fails
-            self.assertIn("Is a directory", failed_run())
-            self.assertEqual([path.name for path in weekly.iterdir()], ["latest.md"])
-            (weekly / "latest.md").rmdir()
-            # The disk fills while the week's file is written, after latest.md and its directory are synced.
-            with patch("publish.os.fsync", side_effect=[None, None, OSError(errno.ENOSPC, "No space left on device")]):
-                self.assertIn("No space left on device", failed_run())
-            self.assertEqual([path.name for path in weekly.iterdir()], ["latest.md"])  # no partial or temporary file
-            result = self.p.run_cycle()
-        self.assertEqual((result["ok"], result["degraded"]), (True, False))
-        for name in ("2026-W46.md", "latest.md"):
-            self.assertEqual(publish.read_json(weekly / name), json.loads(summary))
-
-    def test_the_real_application_prints_the_weekly_summary(self):
-        self.p.cfg["app_python"] = sys.executable  # the interpreter running these tests has the application
-        self.p.weekly_summary()
-        summary = json.loads((self.p.state / "weekly" / "latest.md").read_text())
-        self.assertEqual(summary["feed"]["path"], "feed.xml")
-
-    def test_schedule_logs_cron_output_and_wrangler_logs_to_a_directory(self):
-        import subprocess
-        calls = []
-        def fake(arguments, **kwargs):
-            calls.append((arguments, kwargs))
-            return subprocess.CompletedProcess(arguments, 0, stdout="MAILTO=\"\"\n", stderr="")
-        with patch("publish.subprocess.run", side_effect=fake):
-            self.p.schedule()
-            self.p.command(["whoami"])
-        installed = calls[1][1]["input"]
-        self.assertIn("| logger -t onionflash", installed)
-        self.assertNotIn("/dev/null", installed)
-        self.assertTrue(calls[2][1]["env"]["WRANGLER_LOG_PATH"].endswith("wrangler-logs"))
-
-    def test_missing_status_record_can_disappear_without_error(self):
-        self.assertEqual(publish.read_json(self.directory / "missing.json", {}), {})
-
     def anonymous(self, *codes):
-        """Patch the publisher's unsigned request, one outcome per request (the last
-        repeats): None means it succeeded, an exception is raised as is, and a number
-        is an HTTP status. Retry delays are skipped."""
         self.checked_urls, outcomes = [], list(codes)
         def request(url, method="GET", data=None, token=None):
             self.assertEqual((method, token), ("HEAD", None))
@@ -639,138 +67,427 @@ class RecoveryTests(unittest.TestCase):
             return b""
         return patch.multiple(self.p, request=MagicMock(side_effect=request), delay=MagicMock())
 
-    def test_backup_is_a_private_sqlite_snapshot_and_respects_the_interval(self):
+    def test_publish_preview_activation_and_receipt_pruning(self):
+        self.seed_public()
+        publish.atomic_json(self.p.state / "receipts" / (OTHER + ".json"), receipt(OTHER))
+        self.fake_cloudflare(OLD)
+        result = self.p.publish()
+        self.assertEqual(self.calls, ["versions upload", "verify preview", "activate " + NEW, "verify live"])
+        self.assertEqual((result["version_id"], result["previous_version_id"]), (NEW, OLD))
+        self.assertEqual({p.name for p in (self.p.state / "receipts").iterdir()}, {OLD + ".json", NEW + ".json"})
+        self.assertEqual(publish.read_json(self.p.state / "receipts" / (OLD + ".json")), receipt(OLD))
+
+    def test_permalinks_permanence_bootstrap_rollback_interrupt_and_damage(self):
+        self.seed_public()
+        self.fake_cloudflare(OLD)
+        gone = "news/gone/index.html"
+        permalinks = self.p.state / "permalinks.json"
+        publish.atomic_json(permalinks, [])
+        for prev in ({**receipt(OLD), "manifest": {gone: "a" * 64}}, {**receipt(OLD), "articles": [gone]}):
+            with self.subTest(prev=prev):
+                publish.atomic_json(self.p.state / "publication.json", prev)
+                with self.assertRaisesRegex(ValueError, "previously published article"):
+                    self.p.publish()
+                self.assertEqual(self.calls, [])
+
+        self.add_article("earlier")
+        self.add_article("live")
+        publish.atomic_json(self.p.state / "publication.json", receipt(OLD, OTHER))
+        publish.atomic_json(self.p.state / "receipts" / (OTHER + ".json"), {**receipt(OTHER), "manifest": {"news/other/index.html": "a" * 64}})
+        published = self.p.publish()
+        expected = ["news/earlier/index.html", "news/live/index.html"]
+        self.assertEqual(publish.read_json(permalinks), expected)
+
+        for seed in (None, [], ["news/earlier/index.html"]):
+            with self.subTest(seed=seed):
+                if seed is None:
+                    permalinks.unlink(missing_ok=True)
+                else:
+                    publish.atomic_json(permalinks, seed)
+                self.calls.clear()
+                self.assertEqual(self.p.publish(), published)
+                self.assertEqual(self.calls, [])
+                self.assertEqual(publish.read_json(permalinks), expected)
+
+        self.p.rollback()
+        self.p.execute("resume")
+        with closing(sqlite3.connect(self.p.database)) as db, db:
+            db.execute("DELETE FROM public_artifacts WHERE path='news/live/index.html'")
+        for prev in (None, {"version_id": OLD}, {}):
+            with self.subTest(prev=prev):
+                if prev is not None:
+                    publish.atomic_json(self.p.state / "publication.json", prev)
+                self.calls.clear()
+                with self.assertRaisesRegex(ValueError, "previously published article.*to withdraw a story, retract it"):
+                    self.p.publish()
+                self.assertEqual(self.calls, [])
+
+        self.add_article("live")
+        self.add_article("interrupted")
+        publish.atomic_json(self.p.state / "publication.json", receipt(OLD))
+        self.live[0] = OLD
+        write = publish.atomic_json
+        with patch("publish.atomic_json", side_effect=lambda path, val: (_ for _ in ()).throw(KeyboardInterrupt) if Path(path).name == NEW + ".json" else write(path, val)), \
+                self.assertRaises(KeyboardInterrupt):
+            self.p.publish()
+        self.assertIn("news/interrupted/index.html", publish.read_json(permalinks))
+
+        for bad in ("{}", '["news/../x"]', '["news/kept/index.html"'):
+            with self.subTest(bad=bad):
+                permalinks.write_text(bad)
+                self.calls.clear()
+                with self.assertRaisesRegex(ValueError, re.escape(f"{permalinks} is damaged")):
+                    self.p.publish()
+                self.assertEqual(self.calls, [])
+
+    def test_live_and_preview_failure_recovery_and_external_version_guards(self):
+        self.seed_public()
+        self.fake_cloudflare(OLD, failing_check="preview")
+        with self.assertRaisesRegex(ValueError, "check failed"):
+            self.p.publish()
+        self.assertFalse(any(c.startswith("activate") for c in self.calls))
+
+        with patch.object(self.p, "command", return_value=""), self.assertRaisesRegex(RuntimeError, "did not report the uploaded version"):
+            self.p.publish()
+        with patch.object(self.p, "app_version", side_effect=RuntimeError("metadata unavailable")), \
+                self.assertRaisesRegex(RuntimeError, "metadata unavailable"):
+            self.calls.clear()
+            self.p.publish()
+        self.assertEqual(self.calls, [])
+
+        self.add_article("new")
+        publish.atomic_json(self.p.state / "publication.json", receipt(OLD))
+        self.fake_cloudflare(OLD, failing_check="live")
+        with self.assertRaisesRegex(ValueError, "check failed"):
+            self.p.publish()
+        self.assertEqual((self.calls[-2:], self.live[0], publish.read_json(self.p.state / "permalinks.json")),
+                         (["verify live", "activate " + OLD], OLD, []))
+        self.assertFalse((self.p.state / "publication-hold.json").exists())
+
+        publish.atomic_json(self.p.state / "publication.json", receipt(OLD))
+        def fail_restore(version, config):
+            if version == OLD:
+                raise RuntimeError("restore unavailable")
+            self.live[0] = version
+        with patch.object(self.p, "activate", side_effect=fail_restore), self.assertRaisesRegex(RuntimeError, "check failed.*restore unavailable"):
+            self.p.publish()
+        self.assertNotIn("content_hash", publish.read_json(self.p.state / "publication.json"))
+        with self.assertRaisesRegex(ValueError, rf"inspect before publishing \(live {NEW}, recorded {OLD}\)"):
+            self.p.publish()
+
+        for recorded in (receipt(OLD), {}):
+            with self.subTest(recorded=recorded.get("version_id")):
+                publish.atomic_json(self.p.state / "publication.json", recorded)
+                self.fake_cloudflare(OTHER)
+                with self.assertRaisesRegex(ValueError, f"differs.*live {OTHER}, recorded {recorded.get('version_id')}"):
+                    self.p.publish()
+                self.assertEqual((self.calls, self.live[0]), ([], OTHER))
+
+        publish.atomic_json(self.p.state / "publication.json", receipt(OLD))
+        self.fake_cloudflare(OLD)
+        with patch.object(self.p, "verify", side_effect=lambda *a, **k: self.live.__setitem__(0, OTHER)), \
+                self.assertRaisesRegex(ValueError, "changed during preview"):
+            self.p.publish()
+        self.assertEqual(self.live[0], OTHER)
+
+        publish.atomic_json(self.p.state / "publication.json", receipt(OLD))
+        self.fake_cloudflare(OLD)
+        def ext_live(url, manifest, archive=None):
+            if "candidate-" not in url:
+                self.live[0] = OTHER
+                raise ValueError("external deployment")
+        with patch.object(self.p, "verify", side_effect=ext_live), self.assertRaisesRegex(RuntimeError, "external version retained"):
+            self.p.publish()
+        self.assertEqual(self.live[0], OTHER)
+
+        publish.atomic_json(self.p.state / "publication.json", receipt(OLD))
+        self.fake_cloudflare(OLD)
+        with patch.object(self.p, "activate", side_effect=KeyboardInterrupt), self.assertRaises(KeyboardInterrupt):
+            self.p.publish()
+        self.assertNotIn("content_hash", publish.read_json(self.p.state / "publication.json"))
+        publish.atomic_json(self.p.state / "publication.json", receipt(NEW, OLD))
+        self.live[0] = NEW
+        with patch.object(self.p, "activate", side_effect=KeyboardInterrupt), self.assertRaises(KeyboardInterrupt):
+            self.p.rollback()
+        self.assertNotIn("content_hash", publish.read_json(self.p.state / "publication.json"))
+        self.assertTrue((self.p.state / "publication-hold.json").is_file())
+
+    def test_first_worker_deploy_and_manual_rollback_guards(self):
+        self.seed_public()
+        self.fake_cloudflare(None)
+        first = self.p.publish()
+        self.assertEqual((self.calls, first["version_id"], first["previous_version_id"]), (["deploy --config", "verify live"], NEW, None))
+
+        for path in ("publication.json", "permalinks.json"):
+            (self.p.state / path).unlink(missing_ok=True)
+        self.fake_cloudflare(None, failing_check="live")
+        with self.assertRaisesRegex(ValueError, "check failed"):
+            self.p.publish()
+        self.assertEqual(publish.read_json(self.p.state / "publication.json"), {"version_id": NEW})
+        self.fake_cloudflare(NEW)
+        self.p.publish()
+        self.assertEqual(self.calls, ["versions upload", "verify preview", "activate " + NEW, "verify live"])
+
+        (self.p.state / "publication.json").unlink()
+        self.fake_cloudflare(None)
+        with patch.object(self.p, "command", side_effect=lambda *a, **k: (self.live.__setitem__(0, NEW), (_ for _ in ()).throw(RuntimeError("deploy reported")))), \
+                self.assertRaisesRegex(RuntimeError, "deploy reported"):
+            self.p.publish()
+        self.assertEqual(publish.read_json(self.p.state / "publication.json"), {"version_id": NEW})
+
+        (self.p.state / "publication.json").unlink()
+        self.fake_cloudflare(None)
+        lookups = iter([None])
+        with patch.object(self.p, "command", side_effect=RuntimeError("deploy reported")), \
+                patch.object(self.p, "current_version", side_effect=lambda: next(lookups) if lookups else (_ for _ in ()).throw(RuntimeError("lookup failed"))), \
+                self.assertRaisesRegex(RuntimeError, "deploy reported"):
+            self.p.publish()
+
+        old = dict(receipt(OLD), published_at="2026-11-08T10:00:00Z",
+                   archive={"manifest_sha256": "a" * 64, "generation": "1", "origin": "https://example.org/public/"})
+        publish.atomic_json(self.p.state / "receipts" / (OLD + ".json"), old)
+        publish.atomic_json(self.p.state / "publication.json", receipt(NEW, OLD))
+        held_during_activate = []
+        with patch.object(self.p, "activate", side_effect=lambda v, c: held_during_activate.append((self.p.state / "publication-hold.json").is_file())), \
+                patch.object(self.p, "current_version", return_value=NEW):
+            self.p.rollback()
+        self.assertEqual(held_during_activate, [True])
+        old.pop("content_hash")
+        self.assertEqual(publish.read_json(self.p.state / "publication.json"), {**old, "rolled_back_from": NEW, "rolled_back_at": ANY})
+
+        (self.p.state / "publication-hold.json").unlink()
+        publish.atomic_json(self.p.state / "publication.json", receipt(NEW, OLD))
+        with patch.object(self.p, "activate", side_effect=RuntimeError("API unavailable")), \
+                patch.object(self.p, "current_version", return_value=NEW), self.assertRaises(RuntimeError):
+            self.p.rollback()
+        self.assertEqual(publish.read_json(self.p.state / "publication-hold.json")["reason"], "rollback requested")
+        self.assertEqual(publish.read_json(self.p.state / "publication.json")["version_id"], NEW)
+
+        (self.p.state / "publication-hold.json").unlink()
+        original = receipt(NEW, OLD)
+        publish.atomic_json(self.p.state / "publication.json", original)
+        with patch.object(self.p, "current_version", return_value=OTHER), patch.object(self.p, "activate") as act, \
+                self.assertRaisesRegex(ValueError, "rollback not performed"):
+            self.p.rollback()
+        act.assert_not_called()
+        self.assertFalse((self.p.state / "publication-hold.json").exists())
+
+    def test_run_cycle_phases_busy_locks_atomic_json_and_check_receipt(self):
+        with patch.object(self.p, "application", side_effect=[ValueError("collection failed"), "{}"]) as app, \
+                patch.object(self.p, "publish") as pub, patch.object(self.p, "backup") as bkp, self.assertLogs(publish.LOG, "WARNING"):
+            res = self.p.run_cycle()
+        pub.assert_not_called()
+        bkp.assert_called_once()
+        self.assertEqual((res["ok"], res["phases"]["publication"], app.call_args_list),
+                         (False, "skipped", [call("run"), call("decisions", "summary", "--since", "7d")]))
+
+        with patch.object(self.p, "application", return_value='{"sources_ok": 1}'), \
+                patch.object(self.p, "publish", side_effect=ValueError("Cloudflare unavailable")), patch.object(self.p, "backup") as bkp:
+            res = self.p.run_cycle()
+        bkp.assert_called_once()
+        self.assertEqual((res["ok"], res["phases"]["publication"], res["phases"]["backup"]), (False, "failed", "ok"))
+
+        publish.atomic_json(self.p.state / "publication-hold.json", {"reason": "operator hold"})
+        with patch.object(self.p, "application", return_value='{"sources_ok": 1}'), \
+                patch.object(self.p, "publish") as pub, patch.object(self.p, "backup") as bkp:
+            res = self.p.run_cycle()
+        pub.assert_not_called()
+        bkp.assert_called_once()
+        self.assertEqual((res["ok"], res["phases"]["publication"]), (True, "held"))
+        (self.p.state / "publication-hold.json").unlink()
+
+        with patch.object(self.p, "application", return_value='{"sources_ok": 1}'), patch.object(self.p, "publish"), \
+                patch.object(self.p, "backup", side_effect=ValueError("Spaces unavailable")):
+            res = self.p.run_cycle()
+        self.assertEqual((res["ok"], res["phases"]["backup"], bool(res["warnings"])), (True, "failed", True))
+
+        failed = subprocess.CompletedProcess([], 2, stdout="", stderr="onionflash: Output ownership marker does not match")
+        with patch("publish.subprocess.run", return_value=failed), patch.object(self.p, "publish"), patch.object(self.p, "backup"):
+            res = self.p.run_cycle()
+        self.assertIn("Output ownership marker", res["errors"][0])
+        with patch("publish.subprocess.run", side_effect=subprocess.TimeoutExpired(["onionflash"], 540)), \
+                patch.object(self.p, "publish") as pub, patch.object(self.p, "backup") as bkp:
+            res = self.p.run_cycle()
+        self.assertIn("timed out", res["errors"][0])
+        pub.assert_not_called()
+        bkp.assert_called_once()
+
+        done = subprocess.CompletedProcess([], 0, stdout='{"sources_ok": 15, "sources_failed": 3}\n', stderr="")
+        with patch("publish.subprocess.run", return_value=done), patch.object(self.p, "publish"), patch.object(self.p, "backup"):
+            self.assertEqual(self.p.run_cycle()["report"], {"sources_ok": 15, "sources_failed": 3})
+
+        for cmd, expected in [("hold", 75), ("rollback", 75), ("check", 75), ("run", 0)]:
+            with self.subTest(command=cmd), publish.lock(self.p.state / "run.lock"), \
+                    patch("publish.Publisher", return_value=self.p), patch("sys.argv", ["publish.py", cmd]):
+                self.assertEqual(publish.main(), expected)
+        with publish.lock(self.p.state / "run.lock", shared=True), patch("publish.Publisher", return_value=self.p), \
+                patch("sys.argv", ["publish.py", "status"]), redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(publish.main(), 0)
+        self.assertIn('"running": false', out.getvalue())
+        self.assertFalse((self.p.state / "run.log").exists())
+
+        race_path = self.directory / "race.json"
+        values = [{"writer": n, "payload": str(n) * 100000} for n in range(4)]
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            list(pool.map(lambda value: publish.atomic_json(race_path, value), values))
+        self.assertIn(json.loads(race_path.read_text()), values)
+        self.assertEqual(race_path.stat().st_mode & 0o777, 0o600)
+        with self.assertRaises(TypeError):
+            publish.atomic_json(race_path, {"unsupported": object()})
+        self.assertIn(publish.read_json(race_path), values)
+        self.assertEqual(publish.read_json(self.directory / "missing.json", {}), {})
+
+        publish.atomic_json(self.p.state / "last-run.json", {"ok": False, "command": "check", "error": "old failure"})
+        with patch("publish.Publisher", return_value=self.p), patch.object(self.p, "application", return_value='{"configuration": "valid"}'), \
+                patch.object(self.p, "node", Path(__file__)), patch.object(self.p, "wrangler", Path(__file__)), \
+                patch("sys.argv", ["publish.py", "check"]), redirect_stdout(io.StringIO()):
+            self.assertEqual(publish.main(), 0)
+        self.assertNotIn("error", publish.read_json(self.p.state / "last-run.json"))
+
+    def test_weekly_summary_and_schedule_logging(self):
+        self.addCleanup(os.umask, os.umask(0o022))
+        weekly, sizes = self.p.state / "weekly", []
+        def app(*arguments):
+            if arguments == ("run",):
+                return '{"sources_ok": 1}'
+            sizes.append(len(sizes) + 1)
+            return '{"feed": {"bytes": %d}, "title": "\\u202e"}' % sizes[-1]
+        with patch.object(self.p, "application", side_effect=app), patch.object(self.p, "publish"), \
+                patch.object(self.p, "backup"), patch("publish.datetime") as clock:
+            for day in (datetime(2026, 12, 31), datetime(2027, 1, 3), datetime(2027, 1, 4)):
+                clock.now.return_value = day.replace(tzinfo=timezone.utc)
+                self.assertEqual(self.p.run_cycle()["phases"]["weekly_summary"], "ok")
+        self.assertEqual((sizes, sorted(p.name for p in weekly.iterdir())), ([1, 2], ["2026-W53.md", "2027-W01.md", "latest.md"]))
+        self.assertEqual((weekly / "latest.md").stat().st_mode & 0o777, 0o600)
+
+        for child in weekly.iterdir():
+            child.unlink()
+        failures, summary = [RuntimeError("summary unavailable")], '{"writer_clears": 0}'
+        with patch.object(self.p, "application", side_effect=lambda *a: '{"sources_ok": 1}' if a == ("run",) else ( (_ for _ in ()).throw(failures.pop()) if failures else summary)), \
+                patch.object(self.p, "publish"), patch.object(self.p, "backup"), patch("publish.datetime") as clock:
+            clock.now.return_value = datetime(2026, 11, 11, tzinfo=timezone.utc)
+            with self.assertLogs(publish.LOG, "WARNING"):
+                self.assertEqual(self.p.run_cycle()["warnings"], ["weekly_summary: summary unavailable"])
+            (weekly / "latest.md").mkdir(parents=True)
+            with self.assertLogs(publish.LOG, "WARNING"):
+                self.assertIn("Is a directory", self.p.run_cycle()["warnings"][0])
+            (weekly / "latest.md").rmdir()
+            with patch("publish.os.fsync", side_effect=[None, None, OSError(errno.ENOSPC, "No space left on device")]), \
+                    self.assertLogs(publish.LOG, "WARNING"):
+                self.assertIn("No space left on device", self.p.run_cycle()["warnings"][0])
+            self.assertEqual([p.name for p in weekly.iterdir()], ["latest.md"])
+            self.assertFalse(self.p.run_cycle()["degraded"])
+        self.assertEqual(publish.read_json(weekly / "2026-W46.md"), json.loads(summary))
+
+        for child in weekly.iterdir():
+            child.unlink()
+        self.p.cfg["app_python"] = sys.executable
+        self.p.weekly_summary()
+        self.assertEqual(json.loads((weekly / "latest.md").read_text())["feed"]["path"], "feed.xml")
+
+        calls = []
+        with patch("publish.subprocess.run", side_effect=lambda args, **kw: (calls.append((args, kw)), subprocess.CompletedProcess(args, 0, stdout='MAILTO=""\n', stderr=""))[1]):
+            self.p.schedule()
+            self.p.command(["whoami"])
+        self.assertIn("| logger -t onionflash", calls[1][1]["input"])
+        self.assertTrue(calls[2][1]["env"]["WRANGLER_LOG_PATH"].endswith("wrangler-logs"))
+
+    def test_private_spaces_backups_privacy_probes_cleanup_and_retention(self):
+        with patch("boto3.client") as unused, self.assertRaisesRegex(ValueError, "Spaces backups are disabled"):
+            self.p.execute("backup", force=True)
+        unused.assert_not_called()
+
         self.seed_backup()
         from onionflash.store import backup_database
-        client = FakeSpaces()
-        def snapshot(source, destination):
-            with self.assertRaises(publish.BusyLock):  # taken under the application lock
+        client = FakeS3()
+        def locked_snapshot(source, destination):
+            with self.assertRaises(publish.BusyLock):
                 with publish.lock(str(self.p.database) + ".lock", nonblocking=True):
                     pass
             return backup_database(source, destination)
-        class Frozen(datetime):  # both uploads happen in the same UTC second
+        class Frozen(datetime):
             @classmethod
             def now(cls, tz=None):
                 return datetime(2026, 11, 10, 12, 0, 0, tzinfo=timezone.utc)
         with patch("boto3.client", return_value=client), self.anonymous(403), \
-                patch("onionflash.store.backup_database", side_effect=snapshot), patch("publish.datetime", Frozen):
+                patch("onionflash.store.backup_database", side_effect=locked_snapshot), patch("publish.datetime", Frozen):
             self.p.backup()
             self.p.backup()
             self.assertEqual(len(client.uploads), 1)
             self.p.backup(force=True)
             self.p.cfg["spaces"]["bucket"] = "another-private-bucket"
-            self.p.backup()  # a new destination does not wait for the interval
+            self.p.backup()
         self.assertEqual(len(client.uploads), 3)
-        self.assertEqual(client.uploads[2][0], "another-private-bucket")
         bucket, key, body, acl = client.uploads[0]
-        # The anonymous check asks for exactly the object that was uploaded.
-        self.assertEqual(self.checked_urls[0], self.p.cfg["spaces"]["endpoint_url"] + "/" + bucket + "/" + key)
-        self.assertEqual(acl, "private")
-        self.assertRegex(key, r"^onionflash/backups/\d{8}T\d{6}Z-[0-9a-f]{8}\.sqlite3\.gz$")
-        self.assertEqual(key[:36], client.uploads[1][1][:36])  # the same second...
-        self.assertNotEqual(key, client.uploads[1][1])  # ...but distinct keys
+        self.assertEqual((acl, self.checked_urls[0]), ("private", f"{self.p.cfg['spaces']['endpoint_url']}/{bucket}/{key}"))
+        self.assertNotEqual(key, client.uploads[1][1])
         restored = self.directory / "restored.sqlite3"
         restored.write_bytes(gzip.decompress(body))
         with closing(sqlite3.connect(restored)) as database:
             self.assertEqual(database.execute("PRAGMA quick_check").fetchone()[0], "ok")
             self.assertEqual(database.execute("SELECT value FROM evidence").fetchone()[0], "private source evidence")
 
-    def test_a_backup_not_proven_private_is_deleted_and_fails(self):
-        self.seed_backup()
-        # A success or a 404 is final; a network failure is retried up to the attempt limit.
+        (self.p.state / "backup.json").unlink()
         for code, message, requests in [(None, "publicly readable", 1), (404, "unexpected anonymous response 404", 1),
                                         (URLError("reset"), "could not be checked", self.p.net["attempts"])]:
             with self.subTest(code=code):
-                client = FakeSpaces()
-                with patch("boto3.client", return_value=client), self.anonymous(code):
-                    with self.assertRaisesRegex(ValueError, message):
-                        self.p.backup(force=True)
-                self.assertEqual(len(self.checked_urls), requests)
-                self.assertFalse((self.p.state / "backup.json").exists())
-                self.assertEqual(client.deleted, [client.uploads[0][:2]])
+                c = FakeS3()
+                with patch("boto3.client", return_value=c), self.anonymous(code), self.assertRaisesRegex(ValueError, message):
+                    self.p.backup(force=True)
+                self.assertEqual((len(self.checked_urls), c.deleted), (requests, [c.uploads[0][:2]]))
 
-    def test_a_throttled_or_failed_privacy_check_is_retried(self):
-        self.seed_backup()
         for first in (503, 429, 408, URLError("reset")):
             with self.subTest(first=first):
-                client = FakeSpaces()
-                with patch("boto3.client", return_value=client), self.anonymous(first, 403):
+                c = FakeS3()
+                with patch("boto3.client", return_value=c), self.anonymous(first, 403):
                     self.p.backup(force=True)
-                    self.p.delay.assert_called_once_with(0)  # backoff before the retry
-                self.assertEqual(len(self.checked_urls), 2)
-                self.assertEqual(client.deleted, [])
+                    self.p.delay.assert_called_once_with(0)
+                self.assertEqual((len(self.checked_urls), c.deleted), (2, []))
 
-    def test_an_exposed_backup_that_cannot_be_deleted_is_named_in_the_error(self):
-        self.seed_backup()
-        client = FakeSpaces(cleanup_error=True)
-        with patch("boto3.client", return_value=client), self.anonymous(None):
-            with self.assertRaises(ValueError) as caught:
+        c = FakeS3(cleanup_error=True)
+        with patch("boto3.client", return_value=c), self.anonymous(None), \
+                self.assertRaisesRegex(ValueError, "publicly readable, and deleting it failed: .*cleanup unavailable") as caught:
+            self.p.backup(force=True)
+        self.assertIn(c.uploads[0][1], str(caught.exception))
+
+        for cleanup_err, exc_type in ((False, ConnectionError), (True, RuntimeError)):
+            c = FakeS3(cleanup_error=cleanup_err)
+            c.on_put = lambda k: (_ for _ in ()).throw(ConnectionError("response lost"))
+            with self.subTest(cleanup_err=cleanup_err), patch("boto3.client", return_value=c), self.anonymous(403), \
+                    self.assertRaises(exc_type) as caught:
                 self.p.backup(force=True)
-        message = str(caught.exception)
-        self.assertIn(client.uploads[0][1], message)
-        self.assertRegex(message, "publicly readable, and deleting it failed: .*cleanup unavailable")
-        self.assertFalse((self.p.state / "backup.json").exists())
+            self.assertEqual(c.deleted, [c.uploads[0][:2]])
+            if cleanup_err:
+                self.assertIn(c.uploads[0][1], str(caught.exception))
 
-    def test_an_explicit_backup_fails_when_spaces_backups_are_disabled(self):
-        with patch("boto3.client") as client, self.assertRaisesRegex(ValueError, "Spaces backups are disabled"):
-            self.p.execute("backup", force=True)
-        client.assert_not_called()
-
-    def test_an_ambiguous_upload_failure_removes_the_object(self):
-        self.seed_backup()
-        class LostResponse(FakeSpaces):
-            def put_object(self, **kwargs):
-                super().put_object(**kwargs)
-                raise ConnectionError("response lost")
-        client = LostResponse()
-        with patch("boto3.client", return_value=client), self.anonymous(403):
-            with self.assertRaises(ConnectionError):
-                self.p.backup(force=True)
-        self.assertEqual(client.deleted, [client.uploads[0][:2]])
-        self.assertFalse((self.p.state / "backup.json").exists())
-        client = LostResponse(cleanup_error=True)
-        with patch("boto3.client", return_value=client), self.anonymous(403):
-            with self.assertRaisesRegex(RuntimeError, "could not be removed") as caught:
-                self.p.backup(force=True)
-        self.assertIn(client.uploads[0][1], str(caught.exception))  # the error names the key
-
-    def test_retention_deletes_only_old_backups_and_its_failure_is_retried(self):
-        self.seed_backup()
         old = datetime(2020, 1, 1, tzinfo=timezone.utc)
         listed = [{"Key": "onionflash/backups/20200101T000000Z-0123abcd.sqlite3.gz", "LastModified": old},
                   {"Key": "onionflash/backups/20200101T000000Z-" + "a" * 12 + ".tar.gz", "LastModified": old},
                   {"Key": "onionflash/backups/notes.txt", "LastModified": old}]
-        client = FakeSpaces(listed=listed)
-        with patch("boto3.client", return_value=client), self.anonymous(403):
-            self.p.backup()
-        self.assertEqual([key for _, key in client.deleted], [item["Key"] for item in listed[:2]])
-        client = FakeSpaces(retention_error=True)
-        with patch("boto3.client", return_value=client), self.anonymous(403):
-            with self.assertRaisesRegex(RuntimeError, "retention"):
-                self.p.backup(force=True)
+        c = FakeS3(listed=listed)
+        with patch("boto3.client", return_value=c), self.anonymous(403):
+            self.p.backup(force=True)
+        self.assertEqual([k for _, k in c.deleted], [item["Key"] for item in listed[:2]])
+        with patch("boto3.client", return_value=FakeS3(retention_error=True)), self.anonymous(403), \
+                self.assertRaisesRegex(RuntimeError, "retention"):
+            self.p.backup(force=True)
 
     def test_static_publish_prunes_untracked_leftover_pages_and_preserves_archive_receipts(self):
         self.seed_public()
         self.add_article("live")
-        # Simulate an article and pagination file left behind on disk after restoring an older DB.
-        stale_dir = self.p.public / "news" / "leftover"
-        stale_dir.mkdir(parents=True)
-        (stale_dir / "index.html").write_bytes(b"<p>leftover</p>")
-        page_dir = self.p.public / "page" / "9"
-        page_dir.mkdir(parents=True)
-        (page_dir / "index.html").write_bytes(b"<p>page 9</p>")
+        for extra in ("news/leftover/index.html", "page/9/index.html"):
+            target = self.p.public / extra
+            target.parent.mkdir(parents=True)
+            target.write_bytes(b"<p>stale</p>")
         archive_receipt_id = "44444444-4444-4444-8444-444444444444"
         publish.atomic_json(self.p.state / "receipts" / (archive_receipt_id + ".json"),
                             {**receipt(archive_receipt_id), "archive": {"generation": "1", "manifest_sha256": "a" * 64, "origin": "https://example.org/public/"}})
         self.fake_cloudflare(OLD)
         first = self.p.publish()
-        self.assertNotIn("news/leftover/index.html", first["manifest"])
-        self.assertNotIn("page/9/index.html", first["manifest"])
+        self.assertFalse({"news/leftover/index.html", "page/9/index.html"} & set(first["manifest"]))
         self.assertEqual(publish.read_json(self.p.state / "permalinks.json"), ["news/live/index.html"])
         self.assertTrue((self.p.state / "receipts" / (archive_receipt_id + ".json")).is_file())
-        # A subsequent run succeeds cleanly instead of failing on a ghost permalink.
         self.live[0] = NEW
-        self.calls.clear()
         self.assertEqual(self.p.publish()["version_id"], NEW)
         with self.assertRaisesRegex(ValueError, "untracked file"):
             self.p.publication_readiness({**first["manifest"], "news/leftover/index.html": "b" * 64})

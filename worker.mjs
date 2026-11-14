@@ -3,9 +3,11 @@
 const HASH = /^[a-f0-9]{64}$/;
 const HTML_POLICY = "default-src 'none'; script-src 'none'; style-src 'self'; img-src 'self'; connect-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 const DATA_POLICY = "default-src 'none'; script-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
-// TTL matches the application's hot pages; MANIFEST_BYTES matches archive_store.MAX_MANIFEST_BYTES.
-const TTL = 60, OBJECT_TTL = 31536000, MANIFEST_BYTES = 8 * 1024 * 1024;
-const TIMEOUT_MS = 5000, ATTEMPTS = 2, BACKOFF_MS = 200, BACKOFF_CAP_MS = 1000;
+const TTL = 60, OBJECT_TTL = 31536000, MANIFEST_BYTES = 8 * 1024 * 1024, MANIFEST_RAW_BYTES = 16 * 1024 * 1024;
+const TIMEOUT_MS = 5000, ATTEMPTS = 2, BACKOFF_MS = 200, BACKOFF_CAP_MS = 1000, CACHE_LIMIT = 4;
+const MANIFEST_FORMAT = "onionflash-archive-manifest-v1";
+const manifestCache = new Map();
+const isRecord = value => Boolean(value) && typeof value === "object" && !Array.isArray(value);
 
 function archivePath(path) {
   const match = path.match(/^\/news\/([A-Za-z0-9_-]{1,64})(\/|\/index\.html|\/story\.json)?$/);
@@ -16,7 +18,7 @@ function archivePath(path) {
 
 function publicHeaders(key, sha, size) {
   const html = key.endsWith(".html");
-  const headers = new Headers({
+  return new Headers({
     "Content-Type": html ? "text/html; charset=utf-8" : "application/json; charset=utf-8",
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "strict-origin-when-cross-origin",
@@ -24,9 +26,8 @@ function publicHeaders(key, sha, size) {
     "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
     "Cache-Control": `public, max-age=${TTL}, must-revalidate`,
     "ETag": `"${sha}"`,
+    "Content-Length": String(size),
   });
-  if (size !== undefined) headers.set("Content-Length", String(size));
-  return headers;
 }
 
 function error(status) {
@@ -46,14 +47,11 @@ async function originRequest(url, method, consume) {
     const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
     let response;
     try {
-      // Workers rejects redirect: "error". With "manual" a 3xx comes back, and consume refuses it as not ok.
-      response = await fetch(url, { method, redirect: "manual", signal: controller.signal,
-        // Do not forward cookies, Authorization, Host, Range or arbitrary headers.
+      response = await fetch(url, {
+        method, redirect: "manual", signal: controller.signal,
         headers: { "Accept-Encoding": "identity" },
         cf: { cacheEverything: true, cacheTtlByStatus: { "200-299": OBJECT_TTL, "403-404": 0, "500-599": 0 } },
       });
-      // consume reads any body within this attempt's timeout and returns refusals rather than
-      // throwing, so only failed fetches or reads, 429 and 5xx are retried.
       if (response.status !== 429 && response.status < 500) return await consume(response);
       await response.body?.cancel();
     } catch (failure) {
@@ -70,9 +68,8 @@ async function originRequest(url, method, consume) {
   throw new Error("Archive request failed");
 }
 
-// The body if it has at most limit bytes and the expected SHA-256, otherwise null.
-async function verifiedBytes(response, limit, hash) {
-  const reader = response.body?.getReader();
+async function readLimited(stream, limit) {
+  const reader = stream?.getReader();
   if (!reader) return null;
   const chunks = [];
   let total = 0;
@@ -85,52 +82,62 @@ async function verifiedBytes(response, limit, hash) {
       chunks.push(value);
     }
   } finally {
-    await reader.cancel();
+    await reader.cancel().catch(() => {});
   }
-  const bytes = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
-  return await sha256(bytes) === hash ? bytes : null;
+  return new Uint8Array(await new Blob(chunks).arrayBuffer());
 }
 
-async function manifest(origin, hash) {
+async function verifiedBytes(response, limit, hash) {
+  const bytes = await readLimited(response.body, limit);
+  return bytes && await sha256(bytes) === hash ? bytes : null;
+}
+
+async function decompressGzip(bytes, limit) {
+  const stream = new DecompressionStream("gzip");
+  const writer = stream.writable.getWriter();
+  let failed = false;
+  const writeDone = writer.write(bytes).then(() => writer.close()).catch(() => { failed = true; });
+  const out = await readLimited(stream.readable, limit);
+  await writeDone;
+  return failed ? null : out;
+}
+
+async function manifestEntries(origin, hash) {
   if (!HASH.test(hash || "")) throw new Error("Invalid manifest identity");
-  // A refused manifest is null, which the root and shard checks reject.
-  return originRequest(new URL(`manifests/${hash}.json`, origin), "GET", async response => {
-    if (!response.ok) {
-      await response.body?.cancel();
-      return null;
-    }
-    const bytes = await verifiedBytes(response, MANIFEST_BYTES, hash);
-    return bytes && JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
-  });
+  const key = `${origin.href}|${hash}`;
+  if (manifestCache.has(key)) return manifestCache.get(key);
+  const gz = await originRequest(new URL(`manifests/${hash}.json.gz`, origin), "GET", async res =>
+    res.ok ? verifiedBytes(res, MANIFEST_BYTES, hash) : (await res.body?.cancel(), null));
+  const raw = gz && await decompressGzip(gz, MANIFEST_RAW_BYTES);
+  if (!raw) throw new Error("Missing or invalid archive manifest");
+  const parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(raw));
+  if (!isRecord(parsed) || parsed.format !== MANIFEST_FORMAT || !isRecord(parsed.entries)) throw new Error("Invalid archive manifest");
+  if (manifestCache.size >= CACHE_LIMIT) manifestCache.delete(manifestCache.keys().next().value);
+  manifestCache.set(key, parsed.entries);
+  return parsed.entries;
 }
 
 async function archived(request, env, key) {
-  // The publisher validated the origin before binding it to this version.
   const origin = new URL(env.ARCHIVE_ORIGIN);
-  const root = await manifest(origin, env.ARCHIVE_MANIFEST_SHA);
-  if (root?.schema !== 1 || !Number.isInteger(root.shard_chars) || root.shard_chars < 1 || root.shard_chars > 4 || !root.shards || typeof root.shards !== "object" || Array.isArray(root.shards)) throw new Error("Invalid archive root");
-  const shardHash = root.shards[(await sha256(new TextEncoder().encode(key))).slice(0, root.shard_chars)];
-  if (shardHash === undefined) return error(404);
-  const shard = await manifest(origin, shardHash);
-  if (shard?.schema !== 1 || !shard.entries || typeof shard.entries !== "object" || Array.isArray(shard.entries)) throw new Error("Invalid archive shard");
-  const entry = shard.entries[key];
-  if (entry === undefined) return error(404);
-  if (!entry || !HASH.test(entry.sha256 || "") || !Number.isSafeInteger(entry.size) || entry.size < 0) throw new Error("Invalid archive entry");
+  const entries = await manifestEntries(origin, env.ARCHIVE_MANIFEST_SHA);
+  if (!Object.hasOwn(entries, key)) return error(404);
+  const entry = entries[key];
+  if (!isRecord(entry) || !HASH.test(entry.sha256 || "") || entry.key !== `objects/${entry.sha256}` ||
+      !Number.isSafeInteger(entry.size) || entry.size < 0 || typeof entry.content_type !== "string" || !entry.content_type) {
+    throw new Error("Invalid archive entry");
+  }
   const headers = publicHeaders(key, entry.sha256, entry.size);
   if (request.headers.get("if-none-match") === headers.get("etag")) {
     headers.delete("Content-Length");
     return new Response(null, { status: 304, headers });
   }
-  return originRequest(new URL(`objects/${entry.sha256}`, origin), request.method, async response => {
-    if (!response.ok || Number(response.headers.get("content-length")) !== entry.size || response.headers.get("x-amz-meta-sha256") !== entry.sha256) {
-      await response.body?.cancel();
-      return error(response.status === 403 || response.status === 404 ? 404 : 503);
+  return originRequest(new URL(entry.key, origin), request.method, async res => {
+    if (!res.ok || Number(res.headers.get("content-length")) !== entry.size || res.headers.get("x-amz-meta-sha256") !== entry.sha256) {
+      await res.body?.cancel();
+      return error(res.status === 403 || res.status === 404 ? 404 : 503);
     }
-    if (request.method === "HEAD") return new Response(null, { status: 200, headers });
-    // Serve only the bytes the manifest names, so an object replaced in storage fails closed.
-    const bytes = await verifiedBytes(response, entry.size, entry.sha256);
+    if (request.method === "HEAD") { await res.body?.cancel(); return new Response(null, { status: 200, headers }); }
+    const bytes = await verifiedBytes(res, entry.size, entry.sha256);
     return bytes ? new Response(bytes, { status: 200, headers }) : error(503);
   });
 }

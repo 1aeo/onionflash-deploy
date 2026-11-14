@@ -130,11 +130,6 @@ existing `/tags/<topic>.xml` subscriptions remain available. HTML responses
 disable browser scripts and connections with `script-src 'none'` and
 `connect-src 'none'`.
 
-An upgrade from a release that shipped browser JavaScript rebuilds the articles in
-bounded batches on scheduled runs. Until that rebuild retires the old `app.js`,
-publication refuses it and the live site stays unchanged; see the application's
-[upgrade notes](https://github.com/1aeo/onionflash/blob/main/docs/PERMANENT_HISTORY.md#upgrade-from-the-browser-script-version).
-
 ## DigitalOcean Spaces
 
 Set `spaces.enabled = true`, an HTTPS endpoint, region, bucket and private prefix
@@ -223,7 +218,7 @@ before resuming; the first publication after resuming uploads again.
 `state/publication.json` records the live version, its predecessor and the exact
 file hashes. `state/receipts/` keeps that record for the live and previous
 versions, which rollback restores; with permanent storage it keeps one for every
-version, including its root. `state/permalinks.json` lists every article this
+version, including its manifest. `state/permalinks.json` lists every article this
 deployment has published and only grows: rollback leaves it alone, and a
 publication that lacks one of its articles is refused whatever the receipts say.
 To withdraw a story, retract it.
