@@ -122,12 +122,24 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(external_cfg.stat().st_mode & 0o777, 0o600)
         secrets_file = external_dir / "secrets.env"
         secrets_file.chmod(0o644)
+        moved_state = self.root / "moved-state-disk"
+        (external_dir / "state").rename(moved_state)
+        (external_dir / "state").symlink_to(moved_state, target_is_directory=True)
         run_install(external_cfg)
         self.assertEqual(secrets_file.stat().st_mode & 0o777, 0o600)
+        self.assertEqual((moved_state / "run.lock").stat().st_mode & 0o777, 0o600)
 
         victim = self.root / "victim.txt"
         victim.write_text("do not overwrite\n", encoding="utf-8")
         victim.chmod(0o644)
+        (moved_state / "run.lock").unlink()
+        (moved_state / "run.lock").symlink_to(victim)
+        with self.assertRaisesRegex(SystemExit, "symlink"):
+            run_install(external_cfg)
+        (external_dir / "state").unlink()
+        (external_dir / "state").symlink_to(self.root / "missing-disk", target_is_directory=True)
+        with self.assertRaisesRegex(SystemExit, "not an existing directory"):
+            run_install(external_cfg)
         symlink_dir = self.root / "symlink-cfg"
         symlink_dir.mkdir()
         (symlink_dir / "secrets.env").symlink_to(victim)

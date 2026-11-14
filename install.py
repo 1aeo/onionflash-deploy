@@ -65,11 +65,23 @@ def _open_parent_nofollow(path: Path, *, create: bool = False) -> tuple[int, str
 
 
 @contextmanager
-def _open_nofollow(path: Path, flags: int, mode: int = 0o600, *, create_parents: bool = False, missing_ok: bool = False):
+def _open_nofollow(path: Path, flags: int, mode: int = 0o600, *, create_parents: bool = False,
+                   missing_ok: bool = False, allow_symlink_parents: bool = False):
     fd = parent_fd = None
     try:
         try:
-            parent_fd, name = _open_parent_nofollow(path, create=create_parents)
+            if allow_symlink_parents:
+                target = Path(os.path.abspath(path))
+                if not target.name:
+                    raise SystemExit(f"Invalid configuration target path: {path}")
+                if create_parents:
+                    try:
+                        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                    except FileExistsError:
+                        raise SystemExit(f"Parent path is not an existing directory: {target.parent}") from None
+                parent_fd, name = os.open(target.parent, os.O_RDONLY | DIRECTORY), target.name
+            else:
+                parent_fd, name = _open_parent_nofollow(path, create=create_parents)
         except FileNotFoundError:
             if missing_ok:
                 yield None
@@ -128,7 +140,7 @@ def main(argv=None):
                 cfg = tomllib.load(stream)
     state = Path(os.path.abspath(config_dir / cfg.get("state_dir", "state")))
     venv, venv_python = root / ".venv", root / ".venv/bin/python"
-    with _open_nofollow(state / "run.lock", os.O_RDWR | os.O_CREAT, 0o600, create_parents=True) as lock_fd, tempfile.TemporaryDirectory(prefix="onionflash-") as tree:
+    with _open_nofollow(state / "run.lock", os.O_RDWR | os.O_CREAT, 0o600, create_parents=True, allow_symlink_parents=True) as lock_fd, tempfile.TemporaryDirectory(prefix="onionflash-") as tree:
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
         try:
             export(app, tree)
