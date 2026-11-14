@@ -306,6 +306,28 @@ class RetentionTests(unittest.TestCase):
         self.assertNotIn("raw-blob-secret", joined)
         self.assertNotIn("private", joined)
 
+    def test_item_corrupted_to_invalid_utf8_during_upload_is_preserved_without_operational_error(self):
+        self.item("corrupted-during-put", content="confidential item body")
+        self.item("healthy-item", content="healthy item body")
+
+        def corrupt_during_put(key):
+            with self.db() as db:
+                db.execute(
+                    "UPDATE items SET payload=replace(payload,'confidential',CAST(x'eda080' AS TEXT)) "
+                    "WHERE id='corrupted-during-put'"
+                )
+
+        self.s3.on_put = corrupt_during_put
+        result = self.sweep()
+        self.assertEqual(
+            (result["records_archived"], result["items_compacted"], result["changed_records_preserved"]),
+            (1, 1, 1),
+        )
+        self.assertEqual([row["record_id"] for row in self.rows("private_archive_refs")], ["healthy-item"])
+        with self.db() as db:
+            healthy_payload = json.loads(db.execute("SELECT payload FROM items WHERE id='healthy-item'").fetchone()[0])
+        self.assertNotIn("content", healthy_payload)
+
 
 if __name__ == "__main__":
     unittest.main()

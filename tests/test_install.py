@@ -1,8 +1,10 @@
 """The installer builds the application from its checked-out commit only."""
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
+import tomllib
 import unittest
 from unittest.mock import patch
 
@@ -108,3 +110,47 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(self.git(foreign, "status", "--porcelain").stdout, before_status)
         self.assertEqual((foreign / ".git/index").read_bytes(), before_index)
         self.assertEqual((foreign / "untracked.txt").read_text(), "leave untracked\n")
+
+    def test_external_deploy_config_points_app_python_to_installed_venv_and_refuses_symlinks(self):
+        repo_root = Path(install.__file__).resolve().parent
+        deploy_dir = self.root / "deploy"
+        deploy_dir.mkdir()
+        for name in ("deployment.example.toml", "secrets.env.example", "requirements.txt"):
+            shutil.copyfile(repo_root / name, deploy_dir / name)
+        external_dir = self.root / "etc-onionflash"
+        external_cfg = external_dir / "deployment.toml"
+        real_run = subprocess.run
+
+        def fake_run(arguments, **kwargs):
+            if arguments[0] in ("git", "tar"):
+                return real_run(arguments, **kwargs)
+            return subprocess.CompletedProcess(arguments, 0)
+
+        with (
+            patch.object(install, "__file__", str(deploy_dir / "install.py")),
+            patch.dict(os.environ, {"ONIONFLASH_DEPLOY_CONFIG": str(external_cfg)}),
+            patch("install.shutil.which", return_value="npm"),
+            patch("install.subprocess.run", side_effect=fake_run),
+        ):
+            install.main([str(self.app)])
+
+        parsed = tomllib.loads(external_cfg.read_text(encoding="utf-8"))
+        self.assertEqual(parsed["app_python"], str(deploy_dir.resolve() / ".venv/bin/python"))
+        self.assertEqual((external_cfg.stat().st_mode & 0o777), 0o600)
+        self.assertEqual(((external_dir / "secrets.env").stat().st_mode & 0o777), 0o600)
+
+        # Refuses symlink targets without modifying the pointed-to file:
+        victim = self.root / "victim.txt"
+        victim.write_text("do not overwrite\n", encoding="utf-8")
+        symlink_dir = self.root / "symlink-cfg"
+        symlink_dir.mkdir()
+        (symlink_dir / "secrets.env").symlink_to(victim)
+        with (
+            patch.object(install, "__file__", str(deploy_dir / "install.py")),
+            patch.dict(os.environ, {"ONIONFLASH_DEPLOY_CONFIG": str(symlink_dir / "deployment.toml")}),
+            patch("install.shutil.which", return_value="npm"),
+            patch("install.subprocess.run", side_effect=fake_run),
+            self.assertRaisesRegex(SystemExit, "symlink"),
+        ):
+            install.main([str(self.app)])
+        self.assertEqual(victim.read_text(encoding="utf-8"), "do not overwrite\n")
