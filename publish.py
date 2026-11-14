@@ -810,7 +810,8 @@ class Publisher:
         command = " ".join(shlex.quote(str(x)) for x in [self.path(self.cfg["app_python"]), ROOT / "publish.py", "--config", self.config_path, "run"])
         if "\n" in command or "\r" in command:
             raise ValueError("Scheduled command paths must not contain newlines")
-        block = f"{begin}\n*/{interval} * * * * {command.replace('%', r'\%')} 2>&1 | logger -t onionflash\n{end}\n"
+        escaped_command = command.replace("%", r"\%")
+        block = f"{begin}\n*/{interval} * * * * {escaped_command} 2>&1 | logger -t onionflash\n{end}\n"
         subprocess.run(["crontab", "-"], input=current.rstrip() + "\n" + block, text=True, check=True)
         LOG.info("Installed a %s-minute cron job", interval)
 

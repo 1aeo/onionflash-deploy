@@ -51,7 +51,7 @@ def archive_evidence(archive, now: datetime | None = None) -> dict:
         path = Path(temporary) / "bundle.json.gz"
         path.write_bytes(body)
         uploaded = archive.put_private(path, f"{archive.private_prefix}evidence/{checksum}.json.gz", checksum)
-    with archive._database() as db, db:
+    with archive._database() as db:
         compacted = compact_retained_rows(
             db, records, uploaded_key=uploaded["key"], uploaded_sha256=uploaded["sha256"],
             archived_at=_iso(now), destination_json=canonical_json(dest),

@@ -206,6 +206,20 @@ class ArchiveTests(unittest.TestCase):
         self.artifact("news/big/index.html", b"x" * 2048)
         with patch.object(archive_store, "MAX_OBJECT_BYTES", 1024), self.assertRaisesRegex(ValueError, "size"):
             self.archive.sync()
+        self.artifact("news/big/index.html", b"x")
+        with patch.object(archive_store, "MAX_MANIFEST_RAW_BYTES", 64), self.assertRaisesRegex(ValueError, "decompressed size limit"):
+            self.archive.sync()
+        migrated = self.archive.sync()
+        self.assertTrue(migrated["ready"])
+        stale_sha = "0" * 64
+        self.db.execute("DELETE FROM metadata WHERE key='archive_manifest_format'")
+        self.db.execute("UPDATE metadata SET value=? WHERE key='archive_manifest_sha256'", (stale_sha,))
+        self.db.commit()
+        puts_before = list(self.s3.puts)
+        del self.s3.objects[f"{self.prefix}manifests/{migrated['manifest_sha256']}.json.gz"]
+        upgraded = self.archive.sync()
+        self.assertEqual(upgraded["manifest_sha256"], migrated["manifest_sha256"])
+        self.assertEqual(self.s3.puts[len(puts_before):], [f"{self.prefix}manifests/{migrated['manifest_sha256']}.json.gz"])
 
     def test_unknown_paths_symlinks_credentials_and_ledger_validation(self):
         for path in ("private/evidence.json", "news/a/../../secrets.env"):

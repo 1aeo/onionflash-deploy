@@ -26,7 +26,7 @@ from publish import (
 SHA = re.compile(r"[a-f0-9]{64}\Z")
 CHUNK = 65536
 MAX_UPLOADS_PER_RUN, MAX_UPLOAD_BYTES_PER_RUN, SYNC_BUDGET_SECONDS = 500, 512 * 1024**2, 180
-MAX_OBJECT_BYTES, MAX_MANIFEST_BYTES = 256 * 1024**2, 8 * 1024**2
+MAX_OBJECT_BYTES, MAX_MANIFEST_BYTES, MAX_MANIFEST_RAW_BYTES = 256 * 1024**2, 8 * 1024**2, 16 * 1024**2
 MANIFEST_FORMAT = "onionflash-archive-manifest-v1"
 PENDING = "path GLOB 'news/*' AND (uploaded_sha256 IS NULL OR uploaded_sha256 != sha256)"
 
@@ -148,6 +148,9 @@ class ArchiveStore:
                 with db:
                     db.execute("UPDATE public_artifacts SET uploaded_sha256=NULL")
                     set_meta(db, archive_destination=destination, archive_manifest_sha256="", archive_manifest_generation="")
+            if get_meta(db, "archive_manifest_format") != MANIFEST_FORMAT:
+                with db:
+                    set_meta(db, archive_manifest_sha256="", archive_manifest_generation="", archive_manifest_format=MANIFEST_FORMAT)
 
     @staticmethod
     def _pending(db):
@@ -295,7 +298,10 @@ class ArchiveStore:
                     "key": f"objects/{sha}", "sha256": sha, "size": size,
                     "content_type": ctype or ("text/html; charset=utf-8" if path.endswith(".html") else "application/json; charset=utf-8"),
                 }
-        body = gzip.compress(canonical_json({"format": MANIFEST_FORMAT, "entries": entries}).encode("utf-8"), mtime=0)
+        raw = canonical_json({"format": MANIFEST_FORMAT, "entries": entries}).encode("utf-8")
+        if len(raw) > MAX_MANIFEST_RAW_BYTES:
+            raise ValueError("Archive manifest exceeds its decompressed size limit")
+        body = gzip.compress(raw, mtime=0)
         if len(body) > MAX_MANIFEST_BYTES:
             raise ValueError("Archive manifest exceeds its size limit")
         manifest_sha = hashlib.sha256(body).hexdigest()
@@ -334,6 +340,7 @@ class ArchiveStore:
                 with self._database() as db, db:
                     db.execute("UPDATE public_artifacts SET uploaded_sha256=? WHERE path=? AND sha256=?",
                                (row["sha256"], row["path"], row["sha256"]))
+                    set_meta(db, archive_manifest_generation="")
                 self._uploaded += 1
             manifest_sha = self._prepare_manifest(generation, snapshot)
         with self._database(shared=True) as db:
