@@ -328,6 +328,22 @@ class RetentionTests(unittest.TestCase):
             healthy_payload = json.loads(db.execute("SELECT payload FROM items WHERE id='healthy-item'").fetchone()[0])
         self.assertNotIn("content", healthy_payload)
 
+        # Pinned analyses skip _decode_row entirely before reading full analysis rows:
+        self.analysis("pinned-key")
+        self.analysis("unpinned-key")
+        decode_calls = []
+        real_decode = retention._decode_row
+
+        def spy_decode(db, table, columns, where, param, *, key_col):
+            if table == "analyses":
+                decode_calls.append(param)
+            return real_decode(db, table, columns, where, param, key_col=key_col)
+
+        with patch.object(retention, "_decode_row", side_effect=spy_decode), self.db() as db:
+            yielded = list(retention._analyses(db, retention.QUERIES[1][1], "9999-12-31T23:59:59Z", {"pinned-key"}))
+        self.assertEqual([r["cache_key"] for r in yielded], ["unpinned-key"])
+        self.assertEqual(len(decode_calls), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -98,6 +98,9 @@ def _analyses(db, query, cutoff, pinned_keys: set[str]):
     for rowid, raw_key in db.execute(query, (cutoff,)):
         label = raw_key.decode("utf-8", errors="replace") if isinstance(raw_key, bytes) else raw_key
         try:
+            key = raw_key.decode("utf-8") if isinstance(raw_key, bytes) else raw_key
+            if key in pinned_keys:
+                continue
             row = _decode_row(db, "analyses", columns, "rowid=?", rowid, key_col="cache_key")
         except (UnicodeError, ValueError, RecursionError) as error:
             LOG.warning("Skipping damaged retention analysis %r (%s)", label, type(error).__name__)

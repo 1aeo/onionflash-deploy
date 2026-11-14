@@ -113,7 +113,7 @@ class InstallTests(unittest.TestCase):
 
     def test_external_deploy_config_points_app_python_to_installed_venv_and_refuses_symlinks(self):
         repo_root = Path(install.__file__).resolve().parent
-        deploy_dir = self.root / "deploy"
+        deploy_dir = self.root / "deploy-\U0001f40d"
         deploy_dir.mkdir()
         for name in ("deployment.example.toml", "secrets.env.example", "requirements.txt"):
             shutil.copyfile(repo_root / name, deploy_dir / name)
@@ -136,12 +136,14 @@ class InstallTests(unittest.TestCase):
 
         parsed = tomllib.loads(external_cfg.read_text(encoding="utf-8"))
         self.assertEqual(parsed["app_python"], str(deploy_dir.resolve() / ".venv/bin/python"))
+        self.assertIn("\U0001f40d", parsed["app_python"])
         self.assertEqual((external_cfg.stat().st_mode & 0o777), 0o600)
         self.assertEqual(((external_dir / "secrets.env").stat().st_mode & 0o777), 0o600)
 
         # Refuses symlink targets without modifying the pointed-to file:
         victim = self.root / "victim.txt"
         victim.write_text("do not overwrite\n", encoding="utf-8")
+        victim.chmod(0o644)
         symlink_dir = self.root / "symlink-cfg"
         symlink_dir.mkdir()
         (symlink_dir / "secrets.env").symlink_to(victim)
@@ -154,3 +156,24 @@ class InstallTests(unittest.TestCase):
         ):
             install.main([str(self.app)])
         self.assertEqual(victim.read_text(encoding="utf-8"), "do not overwrite\n")
+        self.assertEqual((victim.stat().st_mode & 0o777), 0o644)
+
+        # Also refuses symlinked parent directory components (e.g. env_file = "linked/secrets.env"):
+        real_sub = self.root / "real-sub"
+        real_sub.mkdir()
+        sub_victim = real_sub / "secrets.env"
+        sub_victim.write_text("keep perms\n", encoding="utf-8")
+        sub_victim.chmod(0o644)
+        parent_link_dir = self.root / "parent-link-cfg"
+        parent_link_dir.mkdir()
+        (parent_link_dir / "linked").symlink_to(real_sub, target_is_directory=True)
+        (parent_link_dir / "deployment.toml").write_text('env_file = "linked/secrets.env"\n', encoding="utf-8")
+        with (
+            patch.object(install, "__file__", str(deploy_dir / "install.py")),
+            patch.dict(os.environ, {"ONIONFLASH_DEPLOY_CONFIG": str(parent_link_dir / "deployment.toml")}),
+            patch("install.shutil.which", return_value="npm"),
+            patch("install.subprocess.run", side_effect=fake_run),
+            self.assertRaisesRegex(SystemExit, "symlink"),
+        ):
+            install.main([str(self.app)])
+        self.assertEqual((sub_victim.stat().st_mode & 0o777), 0o644)
