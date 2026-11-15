@@ -215,6 +215,20 @@ class DeploymentTests(DeployTestCase):
              for path in (*publish.VERIFY_PATHS, "news/alpha/index.html")],
         )
 
+    def test_request_preserves_lowercase_caller_content_type_header(self):
+        captured = []
+        base = self.serve(lambda req: (
+            captured.append((req.headers.get_all("Content-Type"), req.headers.get("User-Agent"))),
+            self.reply(req, b"{}"),
+        ))
+        self.publisher.request(
+            base + "/post",
+            method="POST",
+            data={"detail": "test"},
+            headers={"content-type": "application/problem+json", "user-agent": "CustomPublisher"},
+        )
+        self.assertEqual(captured, [(["application/problem+json"], "CustomPublisher")])
+
     def test_routes_versions_unchanged_shortcut_offline_status_and_schedule(self):
         p = self.publisher
         publish.atomic_json(p.state / "publication.json", {"version_id": "live-version"})

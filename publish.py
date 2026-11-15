@@ -348,9 +348,13 @@ class Publisher:
 
     def request(self, url, method="GET", data=None, token=None, headers=None):
         """One bounded urllib request; HEAD reads no body."""
-        merged = {"User-Agent": "OnionFlashPublisher", "Accept-Encoding": "identity", **(headers or {})}
-        if data is not None:
-            merged.setdefault("Content-Type", "application/json")
+        merged = {"User-Agent": "OnionFlashPublisher", "Accept-Encoding": "identity"}
+        for name, value in (headers or {}).items():
+            for existing in [key for key in merged if key.lower() == name.lower()]:
+                del merged[existing]
+            merged[name] = value
+        if data is not None and not any(key.lower() == "content-type" for key in merged):
+            merged["Content-Type"] = "application/json"
         request = Request(url, None if data is None else json.dumps(data).encode(), merged, method=method)
         if token:
             request.add_unredirected_header("Authorization", "Bearer " + token)
