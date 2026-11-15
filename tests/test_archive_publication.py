@@ -175,7 +175,7 @@ class PermanentPublicationTests(DeployTestCase):
         bodies = {p: p.encode() for p in ("index.html", "feed.xml", "feed.json", "news/b/index.html", "news/a/index.html")}
         manifest = {p: hashlib.sha256(b).hexdigest() for p, b in bodies.items()}
         read = []
-        with patch.object(self.p, "request", side_effect=lambda url: (read.append(url.removeprefix(self.p.base_url)), bodies[read[-1]])[1]):
+        with patch.object(self.p, "request", side_effect=lambda url, headers=None: (read.append(url.removeprefix(self.p.base_url)), bodies[read[-1]])[1]):
             self.p.verify(self.p.base_url, manifest)
             self.assertEqual(read, ["index.html", "feed.xml", "feed.json"])
             read.clear()

@@ -14,6 +14,7 @@ from publish import BusyLock, Publisher, lock, redact
 
 @contextmanager
 def without_credentials(names):
+    """Temporarily strip named credential variables from os.environ and restore them on exit."""
     saved = {name: os.environ.pop(name) for name in names if name in os.environ}
     try:
         yield
@@ -24,6 +25,7 @@ def without_credentials(names):
 
 
 def main(argv=None):
+    """Validate operator arguments, lock mutating actions, and invoke the core CLI without deploy secrets."""
     os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("deployment_config", type=Path)
