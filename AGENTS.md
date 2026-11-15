@@ -29,7 +29,8 @@ standard environment variable names listed in the README.
 
 This repository uses the application only through its public interfaces:
 
-- `onionflash.config.load_config`, `onionflash.cli.main`,
+- `onionflash.config.load_config`, `onionflash.config.run_command_budget_seconds`,
+  `onionflash.cli.main`,
   `onionflash.cli.OPERATOR_ACTIONS`, `onionflash.cli.READ_ONLY_ACTIONS`, and
   the commands' JSON output;
 - `onionflash.store.backup_database`, `onionflash.store.get_meta`,
