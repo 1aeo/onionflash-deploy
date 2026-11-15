@@ -861,6 +861,12 @@ class Publisher:
     def application(self, *arguments):
         """Run one app command and return its output; failures carry the app's error."""
         budget = self.app["collection"]["run_budget_seconds"]
+        if arguments and arguments[0] == "run":
+            from onionflash import config as app_config
+            # Older app releases expose only the admission window. During a
+            # staged upgrade or rollback, keep their existing wrapper allowance.
+            if hasattr(app_config, "run_command_budget_seconds"):
+                budget = app_config.run_command_budget_seconds(self.app)
         private = self.private_names() - {self.app["llm"]["api_key_env"]}
         env = {k: v for k, v in os.environ.items() if k not in private}
         result = subprocess.run([str(self.path(self.cfg["app_python"])), "-m", "onionflash", *arguments,
