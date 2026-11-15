@@ -52,6 +52,7 @@ ARCHIVE_KEYS = {"enabled", "endpoint_url", "region", "bucket", "public_prefix", 
 
 
 def clean_https_url(value, label):
+    """Parse value and require an HTTPS URL without credentials, query string, or fragment."""
     parsed = urlsplit(value) if isinstance(value, str) else None
     if not parsed or parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
         raise ValueError(f"{label} must be a clean HTTPS URL")
@@ -59,6 +60,7 @@ def clean_https_url(value, label):
 
 
 def validate_s3_location(cfg, label):
+    """Validate S3-compatible endpoint URL, bucket name, and region settings."""
     clean_https_url(cfg.get("endpoint_url"), f"{label} endpoint")
     bucket = cfg.get("bucket")
     if not isinstance(bucket, str) or not re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", bucket):
@@ -68,24 +70,28 @@ def validate_s3_location(cfg, label):
 
 
 def require_uuid(value, message="Invalid version identity"):
+    """Return value when it matches the 36-character lowercase hex-and-hyphen UUID format."""
     if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f-]{36}\Z", value):
         raise ValueError(message)
     return value
 
 
 def require_cf_id(value, label):
+    """Return value when it is a 32-character lowercase hexadecimal Cloudflare identifier."""
     if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{32}\Z", value):
         raise ValueError(f"Invalid {label}")
     return value
 
 
 def require_env_name(value, message="Invalid credential-file assignment"):
+    """Return value when it is a valid uppercase POSIX environment variable name."""
     if not isinstance(value, str) or not ENV_NAME.fullmatch(value):
         raise ValueError(message)
     return value
 
 
 def atomic_json(path, value):
+    """Write formatted JSON atomically via fsynced temporary file and parent directory sync."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd, temporary = tempfile.mkstemp(prefix="." + path.name + "-", dir=path.parent)
@@ -115,6 +121,7 @@ def sync_directory(path):
 
 
 def read_json(path, default=None):
+    """Load JSON from path, returning default when the file does not exist."""
     try:
         return json.loads(Path(path).read_text())
     except FileNotFoundError:
@@ -132,6 +139,7 @@ def credential_values(names=()):
 
 
 def redact(value, names=()):
+    """Replace known credential values in text with [redacted] and bound output length."""
     result = str(value)
     for secret in credential_values(names):
         result = result.replace(secret, "[redacted]")
@@ -173,6 +181,7 @@ class BusyLock(BlockingIOError):
 
 @contextmanager
 def lock(path, shared=False, nonblocking=False):
+    """Acquire an advisory flock on path, raising BusyLock on nonblocking contention."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     with path.open("a+") as stream:
@@ -191,6 +200,7 @@ def lock(path, shared=False, nonblocking=False):
 
 @contextmanager
 def open_db(path, *, shared=False):
+    """Open the SQLite database under its companion lock in read-only or read-write mode."""
     target = Path(path).resolve(strict=True)
     uri = target.as_uri() + ("?mode=ro" if shared else "?mode=rw")
     with lock(f"{Path(path)}.lock", shared=shared), closing(sqlite3.connect(uri, uri=True)) as db:
@@ -199,6 +209,7 @@ def open_db(path, *, shared=False):
 
 
 def s3_client(publisher, cfg, access_key_env, secret_key_env, *, max_attempts=1, checksums=False):
+    """Construct a bounded boto3 S3 client using credentials from the named environment variables."""
     import boto3
     from botocore.config import Config
     extra = {"request_checksum_calculation": "when_required", "response_checksum_validation": "when_required"} if checksums else {}
@@ -212,6 +223,7 @@ def s3_client(publisher, cfg, access_key_env, secret_key_env, *, max_attempts=1,
 
 
 def verify_private_object(publisher, endpoint_url, bucket, key, label, delete=None):
+    """Ensure an uploaded object rejects unsigned reads with HTTP 403, deleting it on exposure."""
     problem = publisher.unsigned_read_problem(f"{endpoint_url.rstrip('/')}/{bucket}/{quote(key)}")
     if not problem:
         return
@@ -224,6 +236,7 @@ def verify_private_object(publisher, endpoint_url, bucket, key, label, delete=No
 
 
 def upload_private_stream(publisher, client, endpoint_url, bucket, key, stream, label):
+    """Upload a private gzipped object, clean up on failure, and verify anonymous access is denied."""
     delete = lambda: client.delete_object(Bucket=bucket, Key=key)
     try:
         client.put_object(Bucket=bucket, Key=key, Body=stream, ACL="private", ContentType="application/gzip")
@@ -251,6 +264,8 @@ def job_log(path):
 
 
 class Publisher:
+    """Validate deployment configuration and run guarded Worker publications, backups, and schedules."""
+
     def __init__(self, config_path, *, offline=False):
         self.config_path = Path(config_path).resolve()
         self.cfg = tomllib.loads(self.config_path.read_text())
@@ -299,17 +314,19 @@ class Publisher:
             self.token = self.secret(API_TOKEN)
 
     def path(self, value):
-        # Preserve the final executable symlink so .venv/bin/python keeps its venv.
+        """Resolve value relative to the config directory while preserving a final executable symlink."""
         return Path(os.path.abspath(self.directory / value))
 
     @staticmethod
     def secret(name):
+        """Return a required non-empty credential from os.environ."""
         value = os.environ.get(name, "")
         if not value:
             raise ValueError("Missing environment setting: " + name)
         return value
 
     def clean_error(self, value):
+        """Redact deployment and application secrets from an error value."""
         return redact(value, self.private_names())
 
     def private_names(self):
@@ -320,6 +337,7 @@ class Publisher:
         return names - {""}
 
     def secret_values(self):
+        """Return active secret strings long enough for safe output and artifact scanning."""
         return credential_values(self.private_names())
 
     def delay(self, attempt):
@@ -328,12 +346,16 @@ class Publisher:
                     + random.uniform(0, self.net["jitter_seconds"]))
         time.sleep(delay)
 
-    def request(self, url, method="GET", data=None, token=None):
+    def request(self, url, method="GET", data=None, token=None, headers=None):
         """One bounded urllib request; HEAD reads no body."""
-        headers = {"User-Agent": "OnionFlashPublisher", "Accept-Encoding": "identity"}
-        if data is not None:
-            headers["Content-Type"] = "application/json"
-        request = Request(url, None if data is None else json.dumps(data).encode(), headers, method=method)
+        merged = {"User-Agent": "OnionFlashPublisher", "Accept-Encoding": "identity"}
+        for name, value in (headers or {}).items():
+            for existing in [key for key in merged if key.lower() == name.lower()]:
+                del merged[existing]
+            merged[name] = value
+        if data is not None and not any(key.lower() == "content-type" for key in merged):
+            merged["Content-Type"] = "application/json"
+        request = Request(url, None if data is None else json.dumps(data).encode(), merged, method=method)
         if token:
             request.add_unredirected_header("Authorization", "Bearer " + token)
         with urlopen(request, timeout=self.net["timeout_seconds"]) as response:
@@ -363,6 +385,7 @@ class Publisher:
 
     @property
     def archive(self):
+        """Lazily initialized ArchiveStore when permanent archive storage is enabled, else None."""
         if not self.cfg.get("archive", {}).get("enabled", False):
             return None
         if self._archive is None:
@@ -371,10 +394,12 @@ class Publisher:
         return self._archive
 
     def close(self):
+        """Close the underlying archive S3 client when initialized."""
         if self._archive is not None and (close := getattr(self._archive.client, "close", None)):
             close()
 
     def api(self, suffix, method="GET", data=None, zone=False):
+        """Call the Cloudflare v4 JSON API with account or zone credentials and return result."""
         if not zone:
             self._load_cloudflare()
         token = self.secret(ZONE_TOKEN) if zone else self.token
@@ -384,12 +409,14 @@ class Publisher:
         return response.get("result")
 
     def record_first_version(self):
+        """Record the initial deployed Worker version in publication.json when present."""
         version = self.current_version()
         if version:
             atomic_json(self.state / "publication.json", {"version_id": version})
         return version
 
     def current_version(self):
+        """Return the single 100%-active Worker version UUID, or None before first deployment."""
         self._load_cloudflare()
         try:
             result = self.api(f"/accounts/{self.account}/workers/scripts/{self.cf['worker_name']}/deployments")
@@ -406,6 +433,7 @@ class Publisher:
         return require_uuid(versions[0].get("version_id"), "Cloudflare returned an invalid version identity")
 
     def command(self, arguments, metadata=None):
+        """Run the local Wrangler CLI with isolated Cloudflare credentials and sanitized output."""
         self._load_cloudflare()
         private = self.private_names()
         env = {k: v for k, v in os.environ.items() if k not in private}
@@ -421,9 +449,11 @@ class Publisher:
         return result.stdout
 
     def worker_vars(self, archive=None):
+        """Build Worker environment variables for the site mount path and optional archive manifest."""
         return {"BASE_PATH": self.base_path, **(self.archive.worker_vars(archive["manifest_sha256"]) if archive else {})}
 
     def publication_identity(self, manifest, archive=None):
+        """Compute a deterministic SHA-256 digest over manifest hashes, Worker code, vars, and compat date."""
         value = {"manifest": manifest, "worker": hashlib.sha256((ROOT / "worker.mjs").read_bytes()).hexdigest(),
                  "vars": self.worker_vars(archive), "compatibility_date": self.cf["compatibility_date"]}
         return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
@@ -436,6 +466,7 @@ class Publisher:
         return target
 
     def make_config(self, directory, archive=None):
+        """Write wrangler.json for uploading static assets and Worker bindings."""
         return self._write_wrangler_config(
             "wrangler.json", workers_dev=True, preview_urls=True, main=str(ROOT / "worker.mjs"),
             assets={"directory": str(directory), "binding": "ASSETS",
@@ -444,6 +475,7 @@ class Publisher:
         )
 
     def control_config(self):
+        """Write minimal wrangler-control.json for version activation and rollback commands."""
         return self._write_wrangler_config("wrangler-control.json")
 
     def prepare_assets(self, public):
@@ -460,6 +492,7 @@ class Publisher:
         return assets
 
     def validate(self, directory, *, preverified=False):
+        """Verify public directory paths, size budgets, required feeds, and absence of symlinks or secrets."""
         files, total = {}, 0
         secrets_bytes = [] if preverified else [value.encode() for value in self.secret_values()]
         for path in sorted(directory.rglob("*")):
@@ -493,13 +526,15 @@ class Publisher:
         return files
 
     def verify(self, base_url, manifest, *, archive=None):
+        """Fetch live or preview endpoints uncached with bounded retries and verify their SHA-256 digests."""
         paths = list(VERIFY_PATHS)
         if archive:  # One article also proves the Worker's route to permanent storage.
             paths += sorted(path for path in manifest if ARTICLE.fullmatch(path))[:1]
+        headers = {"Cache-Control": "no-cache", "Pragma": "no-cache"}
         for relative in paths:
             for attempt in range(VERIFY_ATTEMPTS):
                 try:
-                    actual = hashlib.sha256(self.request(base_url.rstrip("/") + "/" + relative)).hexdigest()
+                    actual = hashlib.sha256(self.request(base_url.rstrip("/") + "/" + relative, headers=headers)).hexdigest()
                     if actual != manifest[relative]:
                         raise ValueError("Published hash mismatch: " + relative)
                     break
@@ -511,6 +546,7 @@ class Publisher:
                     self.delay(attempt)
 
     def activate(self, version, config):
+        """Promote a validated Worker version UUID to 100% traffic, tolerating post-commit CLI timeouts."""
         require_uuid(version)
         try:
             self.command(["versions", "deploy", version + "@100%", "--yes", "--config", str(config)])
@@ -519,6 +555,7 @@ class Publisher:
                 raise
 
     def origin_url(self):
+        """Return the Worker's workers.dev origin URL including any configured base path."""
         self._load_cloudflare()
         subdomain = self.api(f"/accounts/{self.account}/workers/subdomain")["subdomain"]
         return f"https://{self.cf['worker_name']}.{subdomain}.workers.dev" + self.base_path
@@ -711,16 +748,19 @@ class Publisher:
             return receipt
 
     def app_version(self):
+        """Read the installed onionflash package version from the configured application virtualenv."""
         result = subprocess.run([str(self.path(self.cfg["app_python"])), "-c", "import importlib.metadata; print(importlib.metadata.version('onionflash'))"], capture_output=True, text=True, timeout=10)
         return result.stdout.strip() if result.returncode == 0 else "unknown"
 
     @staticmethod
     def git_commit(directory):
+        """Return the 40-hex HEAD commit SHA for directory, or None when unavailable."""
         result = subprocess.run(["git", "-C", str(directory), "rev-parse", "HEAD"], capture_output=True, text=True, timeout=10)
         value = result.stdout.strip()
         return value if result.returncode == 0 and re.fullmatch(r"[0-9a-f]{40}", value) else None
 
     def routes(self):
+        """Verify origin health, attach missing Cloudflare zone routes, and roll back new routes on failure."""
         receipt = json.loads((self.state / "publication.json").read_text())
         if "manifest" not in receipt:
             raise ValueError("The publication receipt lists no files to check; publish once, then attach routes")
@@ -750,6 +790,7 @@ class Publisher:
         LOG.info("Verified public website and RSS at %s", self.base_url)
 
     def validate_spaces(self):
+        """Validate Spaces backup retention, interval, bucket location, prefix, and credentials."""
         cfg = self.cfg.get("spaces", {})
         for key in ("retention_days", "backup_interval_seconds"):
             if type(cfg.get(key)) is not int or cfg[key] < 1:
@@ -763,6 +804,7 @@ class Publisher:
         return cfg
 
     def backup(self, force=False):
+        """Upload a gzipped private SQLite snapshot to Spaces when due and prune expired backups."""
         cfg = self.cfg.get("spaces", {})
         if not cfg.get("enabled"):
             return
@@ -796,6 +838,7 @@ class Publisher:
         LOG.info("Private Spaces backup %s", key)
 
     def schedule(self):
+        """Install or update the managed crontab block for periodic publish.py run execution."""
         interval = self.cfg.get("interval_minutes", 5)
         if not isinstance(interval, int) or not 1 <= interval <= 59:
             raise ValueError("interval_minutes must be 1..59")
@@ -829,6 +872,7 @@ class Publisher:
         return result.stdout.strip()
 
     def collect(self, result):
+        """Execute an application collection and build pass and attach its JSON report to result."""
         report = self.application("run")
         LOG.info("run: %s", self.clean_error(report.splitlines()[-1] if report else "no report"))
         try:
@@ -837,6 +881,7 @@ class Publisher:
             result["report"] = None
 
     def retain_private_history(self):
+        """Archive cold private evidence to Spaces and compact local rows when the retention interval elapses."""
         import retention
         previous = read_json(self.state / "retention.json", {})
         age = time.time() - previous.get("timestamp", 0)
@@ -848,6 +893,7 @@ class Publisher:
         atomic_json(self.state / "retention.json", {**result, "timestamp": time.time()})
 
     def weekly_summary(self):
+        """Write the current ISO week's editorial decisions summary to state/weekly when absent."""
         year, week, _ = datetime.now(timezone.utc).isocalendar()
         target = self.state / "weekly" / f"{year}-W{week:02d}.md"
         if not target.exists():
@@ -856,8 +902,10 @@ class Publisher:
             atomic_json(target, summary)
 
     def run_cycle(self):
+        """Run collection, guarded publication, backup, retention, and weekly summary phases."""
         result = {"phases": {}, "errors": [], "warnings": []}
         def attempt(phase, action, required=True):
+            """Run one cycle phase and record its outcome in result."""
             try:
                 action()
                 result["phases"][phase] = "ok"
@@ -883,6 +931,7 @@ class Publisher:
         return result
 
     def status(self):
+        """Print a JSON summary of lock state and recent deployment receipts without full file manifests."""
         try:
             with lock(self.state / "run.lock", shared=True, nonblocking=True):
                 running = False
@@ -898,6 +947,7 @@ class Publisher:
         print(json.dumps(report, indent=2))
 
     def execute(self, command, force=False):
+        """Dispatch a locked deployment CLI subcommand and return its run-receipt payload."""
         if command == "run":
             return self.run_cycle()
         if command == "check":
@@ -925,6 +975,7 @@ class Publisher:
 
 
 def main():
+    """Parse CLI arguments, coordinate locking and logging, and return a POSIX exit status."""
     os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default=str(ROOT / "deployment.toml"))

@@ -32,10 +32,11 @@ PENDING = "path GLOB 'news/*' AND (uploaded_sha256 IS NULL OR uploaded_sha256 !=
 
 
 class ArchiveBudgetReached(TimeoutError):
-    pass
+    """Raised when archive synchronization reaches its per-run time budget."""
 
 
 def validate_config(cfg):
+    """Validate archive bucket, origin, project prefixes, and credential variable names."""
     if unknown := set(cfg) - ARCHIVE_KEYS:
         raise ValueError("Unknown archive settings: " + ", ".join(sorted(unknown)))
     validate_s3_location(cfg, "Archive")
@@ -56,6 +57,8 @@ def validate_config(cfg):
 
 
 class ArchiveStore:
+    """Content-addressed public permalink archive and verified private object store in Spaces."""
+
     def __init__(self, publisher, client=None):
         self.publisher = publisher
         self.cfg = validate_config(publisher.cfg["archive"])
@@ -70,9 +73,11 @@ class ArchiveStore:
 
     @property
     def prefix(self) -> str:
+        """Configured S3 key prefix for public archive objects and manifests."""
         return self.cfg["public_prefix"]
 
     def worker_vars(self, manifest_sha):
+        """Return Worker environment bindings for the active archive origin and manifest digest."""
         if not SHA.fullmatch(str(manifest_sha)):
             raise ValueError("Invalid archive manifest identity")
         return {"ARCHIVE_ORIGIN": self.cfg["public_origin"], "ARCHIVE_MANIFEST_SHA": manifest_sha}
@@ -83,6 +88,7 @@ class ArchiveStore:
 
     @contextmanager
     def budget(self, seconds):
+        """Enforce a monotonic deadline across archive storage and copy operations."""
         self._deadline = time.monotonic() + seconds
         try:
             yield
@@ -211,6 +217,7 @@ class ArchiveStore:
                 raise ValueError("Unexpected archive object ACL")
 
     def verify_object(self, key, sha256, size):
+        """Confirm stored object length, SHA-256 metadata, owner ACL, and streamed content hash."""
         if not SHA.fullmatch(str(sha256)) or type(size) is not int or not 0 <= size <= MAX_OBJECT_BYTES:
             raise ValueError("Invalid archive verification bounds")
         head = self._head(key)
@@ -218,6 +225,7 @@ class ArchiveStore:
             raise ValueError("Archive object metadata verification failed")
         self._acl(key)
         def download():
+            """Stream and verify object bytes against the expected size and SHA-256."""
             result = self.client.get_object(Bucket=self.bucket, Key=key)
             digest, count = hashlib.sha256(), 0
             with closing(result["Body"]) as body:
@@ -240,6 +248,7 @@ class ArchiveStore:
     def _put(self, path, key, sha256, size, *, public, mime):
         md5 = self._md5(path)
         def upload():
+            """Upload one object with explicit length, Content-MD5, ACL, and cache policy."""
             with path.open("rb") as stream:
                 return self.client.put_object(
                     Bucket=self.bucket, Key=key, Body=stream, ContentLength=size,
@@ -251,6 +260,7 @@ class ArchiveStore:
         self._retry(upload)
 
     def put_private(self, path, key, sha256):
+        """Upload an immutable private gzipped bundle and verify both its contents and anonymous denial."""
         path = Path(path)
         if not key.startswith(self.private_prefix) or ".." in key.split("/") or path.is_symlink() or not path.is_file():
             raise ValueError("Unsafe private archive object")
@@ -350,6 +360,7 @@ class ArchiveStore:
                 "manifest_sha256": manifest_sha}
 
     def sync(self):
+        """Upload pending public article objects and refresh the generation manifest within the time budget."""
         self._uploaded = 0
         try:
             with self.budget(SYNC_BUDGET_SECONDS):

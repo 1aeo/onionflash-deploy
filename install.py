@@ -123,6 +123,7 @@ def _install_template(data: bytes, destination: Path, mode: int = 0o600, *, enfo
 
 
 def main(argv=None):
+    """Install the committed application, Node toolchain, and mode-0600 config templates under run.lock."""
     os.umask(0o077)
     arguments = sys.argv[1:] if argv is None else list(argv)
     root = Path(__file__).resolve().parent

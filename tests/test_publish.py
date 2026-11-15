@@ -188,6 +188,47 @@ class DeploymentTests(DeployTestCase):
             with self.assertRaisesRegex(ValueError, "Published hash mismatch: index.html"):
                 p.verify("https://example.com/onionflash", manifest)
 
+    def test_verify_sends_no_cache_headers_on_every_asset_request(self):
+        assets = {
+            "index.html": b"<html>index</html>",
+            "feed.xml": b"<rss version='2.0'></rss>",
+            "feed.json": b'{"items":[]}',
+            "news/alpha/index.html": b"<article>alpha</article>",
+            "news/bravo/index.html": b"<article>bravo</article>",
+        }
+        manifest = {path: publish.hashlib.sha256(body).hexdigest() for path, body in assets.items()}
+        received = []
+        base = self.serve(lambda req: (
+            received.append((req.path, req.headers.get("Cache-Control"), req.headers.get("Pragma"), req.headers.get("Accept-Encoding"))),
+            self.reply(req, assets[req.path.removeprefix("/onionflash/")]),
+        ))
+        self.publisher.verify(base + "/onionflash", manifest)
+        self.assertEqual(
+            received,
+            [(f"/onionflash/{path}", "no-cache", "no-cache", "identity") for path in publish.VERIFY_PATHS],
+        )
+        received.clear()
+        self.publisher.verify(base + "/onionflash", manifest, archive={"manifest_sha256": "a" * 64})
+        self.assertEqual(
+            received,
+            [(f"/onionflash/{path}", "no-cache", "no-cache", "identity")
+             for path in (*publish.VERIFY_PATHS, "news/alpha/index.html")],
+        )
+
+    def test_request_preserves_lowercase_caller_content_type_header(self):
+        captured = []
+        base = self.serve(lambda req: (
+            captured.append((req.headers.get_all("Content-Type"), req.headers.get("User-Agent"))),
+            self.reply(req, b"{}"),
+        ))
+        self.publisher.request(
+            base + "/post",
+            method="POST",
+            data={"detail": "test"},
+            headers={"content-type": "application/problem+json", "user-agent": "CustomPublisher"},
+        )
+        self.assertEqual(captured, [(["application/problem+json"], "CustomPublisher")])
+
     def test_routes_versions_unchanged_shortcut_offline_status_and_schedule(self):
         p = self.publisher
         publish.atomic_json(p.state / "publication.json", {"version_id": "live-version"})
