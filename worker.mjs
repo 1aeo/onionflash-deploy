@@ -48,7 +48,7 @@ async function originRequest(url, method, consume) {
       response = await fetch(url, {
         method, redirect: "manual", signal: AbortSignal.timeout(TIMEOUT_MS),
         headers: { "Accept-Encoding": "identity" },
-        cf: { cacheEverything: true, cacheTtlByStatus: { "200-299": OBJECT_TTL, "300-599": 0 } },
+        cf: { cacheEverything: true, cacheTtlByStatus: { "200-299": OBJECT_TTL, "300-599": -1 } },
       });
       if (response.status !== 429 && response.status < 500) return await consume(response);
       await response.body?.cancel();

@@ -482,13 +482,13 @@ class DeploymentTests(DeployTestCase):
         from onionflash import config
         ok = subprocess.CompletedProcess([], 0, stdout="{}", stderr="")
         for bound in (420, 850, 3850):
-            with self.subTest(bound=bound), patch.object(config, "run_command_budget_seconds", return_value=bound) as budget, \
+            with self.subTest(bound=bound), patch.object(config, "run_command_budget_seconds", create=True, return_value=bound) as budget, \
                     patch("publish.subprocess.run", return_value=ok) as run:
                 self.publisher.application("run")
                 budget.assert_called_once_with(self.publisher.app)
                 self.assertEqual(run.call_args.kwargs["timeout"], bound + 300)
         for command in ("check", "status", "retry", "build"):
-            with self.subTest(command=command), patch.object(config, "run_command_budget_seconds", side_effect=AssertionError("Run only")), \
+            with self.subTest(command=command), patch.object(config, "run_command_budget_seconds", create=True, side_effect=AssertionError("Run only")), \
                     patch("publish.subprocess.run", return_value=ok) as run:
                 self.publisher.application(command)
                 self.assertEqual(run.call_args.kwargs["timeout"], self.publisher.app["collection"]["run_budget_seconds"] + 300)
@@ -503,11 +503,11 @@ class DeploymentTests(DeployTestCase):
         finally:
             if helper is not absent:
                 config.run_command_budget_seconds = helper
-        with patch.object(config, "run_command_budget_seconds", None), \
+        with patch.object(config, "run_command_budget_seconds", None, create=True), \
                 patch("publish.subprocess.run") as run, self.assertRaises(TypeError):
             self.publisher.application("run")
         run.assert_not_called()
-        with patch.object(config, "run_command_budget_seconds", side_effect=ValueError("Invalid app budget")), \
+        with patch.object(config, "run_command_budget_seconds", create=True, side_effect=ValueError("Invalid app budget")), \
                 patch("publish.subprocess.run") as run, self.assertRaisesRegex(ValueError, "Invalid app budget"):
             self.publisher.application("run")
         run.assert_not_called()

@@ -176,7 +176,7 @@ test("zero-byte objects require explicit Content-Length, non-decimal lengths fai
       assert.equal(ok.headers.get("content-length"), "0");
     }
     for (const call of empty.calls) {
-      assert.deepEqual(call.options.cf.cacheTtlByStatus, { "200-299": 31536000, "300-599": 0 });
+      assert.deepEqual(call.options.cf.cacheTtlByStatus, { "200-299": 31536000, "300-599": -1 });
     }
   });
   for (const badHeader of [null, "", "   "]) {
