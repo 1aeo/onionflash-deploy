@@ -23,7 +23,9 @@ export function makeAssets(status = 200, basePath = "/onionflash") {
   return { calls, env: { BASE_PATH: basePath, ASSETS } };
 }
 
-export async function withFetch(responder, run) {
+const noOrigin = async () => { throw new Error("unexpected origin request"); };
+
+export async function withFetch(run, responder = noOrigin) {
   const mocked = mock.method(globalThis, "fetch", responder);
   try {
     return await run(mocked);
@@ -61,4 +63,4 @@ export function archiveFixture(contents = {}) {
   return { env, objects, manifestSha, entries, calls, assetCalls, respond };
 }
 
-export const withOrigin = (state, run, override) => withFetch(override || state.respond, () => run());
+export const withOrigin = (state, run, override = state.respond) => withFetch(run, override);

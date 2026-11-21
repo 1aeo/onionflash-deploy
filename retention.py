@@ -1,7 +1,4 @@
 """Copy cold private evidence to verified private objects, then compact it locally."""
-
-from __future__ import annotations
-
 from datetime import datetime, timedelta, timezone
 import gzip
 import hashlib
@@ -10,16 +7,12 @@ from pathlib import Path
 import tempfile
 
 from onionflash.store import compact_retained_rows, select_retention_candidates
-from onionflash.util import canonical_json
+from onionflash.util import canonical_json, format_utc
 
 HOT_DAYS, BATCH_SIZE, MAX_BUNDLE_BYTES = 90, 100, 16 * 1024**2
 RUN_BUDGET_SECONDS, INTERVAL_SECONDS = 60, 86400
 FORMAT = "onionflash-private-evidence-v1"
 LOG = logging.getLogger("onionflash.deploy")
-
-
-def _iso(value: datetime) -> str:
-    return value.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def destination(archive) -> dict:
@@ -30,7 +23,7 @@ def destination(archive) -> dict:
 def archive_evidence(archive, now: datetime | None = None) -> dict:
     """Bundle one batch of cold rows privately, then compact the rows unchanged meanwhile."""
     now = now or datetime.now(timezone.utc)
-    cutoff = _iso(now - timedelta(days=HOT_DAYS))
+    cutoff = format_utc(now - timedelta(days=HOT_DAYS))
     base_overhead = len(canonical_json({"format": FORMAT, "records": []}).encode("utf-8"))
     with archive._database() as db:
         records, over_limit = select_retention_candidates(
@@ -54,6 +47,6 @@ def archive_evidence(archive, now: datetime | None = None) -> dict:
     with archive._database() as db:
         compacted = compact_retained_rows(
             db, records, uploaded_key=uploaded["key"], uploaded_sha256=uploaded["sha256"],
-            archived_at=_iso(now), destination_json=canonical_json(dest),
+            archived_at=format_utc(now), destination_json=canonical_json(dest),
         )
     return {**result, **compacted, "object_key": uploaded["key"]}

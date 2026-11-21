@@ -50,7 +50,7 @@ test("canonical root/nested mounts work and redirecting never fetches or reads b
       assert.equal(response.headers.get("location"), base + path.slice(1));
     }
   }
-  await withFetch(async () => { throw new Error("redirect must not fetch"); }, async origin => {
+  await withFetch(async origin => {
     const request = new Request("https://onionflash.example.com/news/abc/", { method: "POST", body: "original payload" });
     const response = await worker.fetch(request, env);
     assert.equal(response.status, 308);

@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 """Run offline application commands with the deployment's protected configuration."""
-from __future__ import annotations
-
 import argparse
 from contextlib import contextmanager, nullcontext
 import os
@@ -9,17 +7,22 @@ from pathlib import Path
 import sys
 
 from onionflash import cli
-from publish import BusyLock, Publisher, lock, redact
+from publish import BusyLock, Publisher, clean_error, lock
 
 
 @contextmanager
 def without_credentials(names):
     """Temporarily strip named credential variables from os.environ and restore them on exit."""
-    saved = {name: os.environ.pop(name) for name in names if name in os.environ}
+    saved, stripped = {}, []
     try:
+        for name in names:
+            if isinstance(name, str) and name:
+                stripped.append(name)
+                if name in os.environ:
+                    saved[name] = os.environ.pop(name)
         yield
     finally:
-        for name in names:
+        for name in stripped:
             os.environ.pop(name, None)
         os.environ.update(saved)
 
@@ -57,8 +60,7 @@ def main(argv=None):
         print("onionflash app: another deployment is running; command not performed; retry after completion", file=sys.stderr)
         return 75
     except Exception as exc:
-        message = publisher.clean_error(exc) if publisher else redact(f"{type(exc).__name__}: {exc}")
-        print("onionflash app: " + message, file=sys.stderr)
+        print("onionflash app: " + clean_error(publisher, exc), file=sys.stderr)
         return 1
     finally:
         if publisher is not None:

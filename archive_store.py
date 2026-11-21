@@ -4,9 +4,6 @@ Article permalinks (news/<id>/index.html and story.json) are uploaded once as
 content-addressed public objects, routed by one compressed manifest built from
 the core's ledger. Every other public file ships in the Worker's own bundle.
 """
-
-from __future__ import annotations
-
 import base64
 from contextlib import closing, contextmanager
 import gzip
@@ -16,11 +13,15 @@ import re
 import tempfile
 import time
 
+from botocore.exceptions import (
+    ClientError, ConnectTimeoutError, ConnectionClosedError, EndpointConnectionError,
+    IncompleteReadError, ReadTimeoutError, ResponseStreamingError,
+)
 from onionflash.store import get_meta, set_meta
 from onionflash.util import canonical_json
 from publish import (
-    ARCHIVE_KEYS, ARTICLE, clean_https_url, open_db, public_files, public_path_allowed,
-    require_env_name, s3_client, validate_s3_location, verify_private_object,
+    ARCHIVE_KEYS, ARTICLE, MISSING_OBJECT_CODES, clean_https_url, file_md5, open_db, public_path_allowed,
+    reject_unknown_keys, require_env_name, require_public_files, s3_client, validate_s3_location, verify_private_object,
 )
 
 SHA = re.compile(r"[a-f0-9]{64}\Z")
@@ -29,6 +30,18 @@ MAX_UPLOADS_PER_RUN, MAX_UPLOAD_BYTES_PER_RUN, SYNC_BUDGET_SECONDS = 500, 512 * 
 MAX_OBJECT_BYTES, MAX_MANIFEST_BYTES, MAX_MANIFEST_RAW_BYTES = 256 * 1024**2, 8 * 1024**2, 16 * 1024**2
 MANIFEST_FORMAT = "onionflash-archive-manifest-v1"
 PENDING = "path GLOB 'news/*' AND (uploaded_sha256 IS NULL OR uploaded_sha256 != sha256)"
+TRANSIENT_ERRORS = (ConnectTimeoutError, ConnectionClosedError, EndpointConnectionError,
+                    IncompleteReadError, ReadTimeoutError, ResponseStreamingError)
+RETRYABLE_CODES = {"408", "429", "500", "502", "503", "504", "SlowDown",
+                   "RequestTimeout", "InternalError", "ServiceUnavailable"}
+
+
+def _valid_size(size):
+    return type(size) is int and 0 <= size <= MAX_OBJECT_BYTES
+
+
+def _matches_head(head, sha256, size):
+    return head is not None and head.get("ContentLength") == size and head.get("Metadata", {}).get("sha256") == sha256
 
 
 class ArchiveBudgetReached(TimeoutError):
@@ -37,8 +50,7 @@ class ArchiveBudgetReached(TimeoutError):
 
 def validate_config(cfg):
     """Validate archive bucket, origin, project prefixes, and credential variable names."""
-    if unknown := set(cfg) - ARCHIVE_KEYS:
-        raise ValueError("Unknown archive settings: " + ", ".join(sorted(unknown)))
+    reject_unknown_keys(cfg, ARCHIVE_KEYS, "archive")
     validate_s3_location(cfg, "Archive")
     origin = clean_https_url(cfg.get("public_origin"), "Archive public_origin")
     if not cfg["public_origin"].endswith("/"):
@@ -66,9 +78,9 @@ class ArchiveStore:
         self.private_prefix = self.cfg["private_prefix"]
         self.public = Path(publisher.public)
         self.database = Path(publisher.database)
-        self._deadline = None
+        self._deadline, self._uploaded = None, 0
         self.client = client or s3_client(
-            publisher, self.cfg, self.cfg["access_key_env"], self.cfg["secret_key_env"], checksums=True
+            publisher, self.cfg, self.cfg["access_key_env"], self.cfg["secret_key_env"]
         )
 
     @property
@@ -98,25 +110,14 @@ class ArchiveStore:
     def _database(self, shared=False):
         return open_db(self.database, shared=shared)
 
-    def _retry(self, action):
-        from botocore.exceptions import (
-            ClientError, ConnectTimeoutError, ConnectionClosedError, EndpointConnectionError,
-            IncompleteReadError, ReadTimeoutError, ResponseStreamingError,
-        )
+    def _retry(self, action, *, budgeted=True):
         for attempt in range(self.publisher.net["attempts"]):
-            self._budget()
+            if budgeted:
+                self._budget()
             try:
                 return action()
-            except ClientError as exc:
-                retryable = str(exc.response.get("Error", {}).get("Code")) in {
-                    "408", "429", "500", "502", "503", "504", "SlowDown",
-                    "RequestTimeout", "InternalError", "ServiceUnavailable",
-                }
-                if not retryable or attempt + 1 == self.publisher.net["attempts"]:
-                    raise
-            except (ConnectTimeoutError, ConnectionClosedError, EndpointConnectionError,
-                    IncompleteReadError, ReadTimeoutError, ResponseStreamingError):
-                if attempt + 1 == self.publisher.net["attempts"]:
+            except (ClientError, *TRANSIENT_ERRORS) as exc:
+                if (isinstance(exc, ClientError) and str(exc.response.get("Error", {}).get("Code")) not in RETRYABLE_CODES) or attempt + 1 == self.publisher.net["attempts"]:
                     raise
             self.publisher.delay(attempt)
 
@@ -124,11 +125,10 @@ class ArchiveStore:
         return self._retry(lambda: getattr(self.client, method)(Bucket=self.bucket, **kwargs))
 
     def _head(self, key):
-        from botocore.exceptions import ClientError
         try:
             return self._call("head_object", Key=key)
         except ClientError as exc:
-            if str(exc.response.get("Error", {}).get("Code")) in {"404", "NoSuchKey", "NotFound"}:
+            if str(exc.response.get("Error", {}).get("Code")) in MISSING_OBJECT_CODES:
                 return None
             raise
 
@@ -150,13 +150,13 @@ class ArchiveStore:
                 "CREATE INDEX IF NOT EXISTS public_artifacts_pending ON public_artifacts(path) "
                 "WHERE uploaded_sha256 IS NULL OR uploaded_sha256 != sha256;"
             )
-            if get_meta(db, "archive_destination") != destination:
+            dest_changed = get_meta(db, "archive_destination") != destination
+            if dest_changed or get_meta(db, "archive_manifest_format") != MANIFEST_FORMAT:
                 with db:
-                    db.execute("UPDATE public_artifacts SET uploaded_sha256=NULL")
-                    set_meta(db, archive_destination=destination, archive_manifest_sha256="", archive_manifest_generation="")
-            if get_meta(db, "archive_manifest_format") != MANIFEST_FORMAT:
-                with db:
-                    set_meta(db, archive_manifest_sha256="", archive_manifest_generation="", archive_manifest_format=MANIFEST_FORMAT)
+                    if dest_changed:
+                        db.execute("UPDATE public_artifacts SET uploaded_sha256=NULL")
+                    set_meta(db, archive_destination=destination, archive_manifest_sha256="",
+                             archive_manifest_generation="", archive_manifest_format=MANIFEST_FORMAT)
 
     @staticmethod
     def _pending(db):
@@ -167,6 +167,10 @@ class ArchiveStore:
 
     def _ready(self, db, generation):
         return self._same_generation(db, generation) and get_meta(db, "archive_manifest_generation") == generation
+
+    def _sync_status(self, db, *, generation=None, ready=False, manifest_sha=None, **extra):
+        return {"generation": self._generation(db) if generation is None else generation, "ready": bool(ready),
+                "uploaded": self._uploaded, "pending": 0 if ready else self._pending(db), "manifest_sha256": manifest_sha, **extra}
 
     def _file(self, relative):
         if not public_path_allowed(relative):
@@ -184,7 +188,7 @@ class ArchiveStore:
         return path
 
     def _copy(self, row, destination):
-        if not SHA.fullmatch(str(row["sha256"])) or type(row["size"]) is not int or not 0 <= row["size"] <= MAX_OBJECT_BYTES:
+        if not SHA.fullmatch(str(row["sha256"])) or not _valid_size(row["size"]):
             raise ValueError("Invalid public artifact metadata")
         path = self._file(row["path"])
         secrets = [value.encode() for value in self.publisher.secret_values()]
@@ -218,10 +222,9 @@ class ArchiveStore:
 
     def verify_object(self, key, sha256, size):
         """Confirm stored object length, SHA-256 metadata, owner ACL, and streamed content hash."""
-        if not SHA.fullmatch(str(sha256)) or type(size) is not int or not 0 <= size <= MAX_OBJECT_BYTES:
+        if not SHA.fullmatch(str(sha256)) or not _valid_size(size):
             raise ValueError("Invalid archive verification bounds")
-        head = self._head(key)
-        if head is None or head.get("ContentLength") != size or head.get("Metadata", {}).get("sha256") != sha256:
+        if not _matches_head(self._head(key), sha256, size):
             raise ValueError("Archive object metadata verification failed")
         self._acl(key)
         def download():
@@ -238,15 +241,9 @@ class ArchiveStore:
             if count != size or digest.hexdigest() != sha256:
                 raise ValueError("Archive object content verification failed")
         self._retry(download)
-        return head
-
-    @staticmethod
-    def _md5(path):
-        with path.open("rb") as stream:
-            return hashlib.file_digest(stream, lambda: hashlib.md5(usedforsecurity=False))
 
     def _put(self, path, key, sha256, size, *, public, mime):
-        md5 = self._md5(path)
+        md5 = file_md5(path)
         def upload():
             """Upload one object with explicit length, Content-MD5, ACL, and cache policy."""
             with path.open("rb") as stream:
@@ -271,23 +268,45 @@ class ArchiveStore:
             if hashlib.file_digest(stream, "sha256").hexdigest() != sha256:
                 raise ValueError("Private archive source hash changed")
         old = self._head(key)
-        if old is None:
+        if old is not None:
+            if not _matches_head(old, sha256, size):
+                raise ValueError("Refusing to overwrite immutable private archive object")
+            self.verify_object(key, sha256, size)
+            verify_private_object(self.publisher, self.cfg["endpoint_url"], self.bucket, key, "Private archive object")
+            return {"key": key, "sha256": sha256, "size": size}
+        attempted = False
+        def delete():
+            """Remove a newly uploaded private object without consulting the run time budget."""
+            nonlocal attempted
+            attempted = True
+            try:
+                self._retry(lambda: self.client.delete_object(Bucket=self.bucket, Key=key), budgeted=False)
+            except ClientError as exc:
+                if str(exc.response.get("Error", {}).get("Code")) not in MISSING_OBJECT_CODES:
+                    raise
+        try:
             self._put(path, key, sha256, size, public=False, mime="application/gzip")
-        elif old.get("Metadata", {}).get("sha256") != sha256 or old.get("ContentLength") != size:
-            raise ValueError("Refusing to overwrite immutable private archive object")
-        self.verify_object(key, sha256, size)
-        verify_private_object(
-            self.publisher, self.cfg["endpoint_url"], self.bucket, key, "Private archive object",
-            delete=(lambda: self._call("delete_object", Key=key)) if old is None else None,
-        )
+            self.verify_object(key, sha256, size)
+            verify_private_object(
+                self.publisher, self.cfg["endpoint_url"], self.bucket, key, "Private archive object", delete=delete
+            )
+        except BaseException as failure:
+            if not attempted:
+                try:
+                    delete()
+                except Exception as cleanup:
+                    raise RuntimeError(
+                        f"Private archive upload failed and {key} could not be removed: "
+                        f"{self.publisher.clean_error(failure)}; {self.publisher.clean_error(cleanup)}"
+                    ) from failure
+            raise
         return {"key": key, "sha256": sha256, "size": size}
 
     def _public_immutable(self, path, key, sha256, mime="application/octet-stream"):
         size, old = path.stat().st_size, self._head(key)
         if old is None:
             self._put(path, key, sha256, size, public=True, mime=mime)
-        elif (old.get("Metadata", {}).get("sha256") != sha256 or old.get("ContentLength") != size
-                or old.get("ETag", "").strip('"') != self._md5(path).hexdigest()):
+        elif not _matches_head(old, sha256, size) or old.get("ETag", "").strip('"') != file_md5(path).hexdigest():
             raise ValueError("Immutable public archive object changed outside this publisher")
         problem = self.publisher.unsigned_read_problem(self.cfg["public_origin"] + key.removeprefix(self.prefix), True)
         if problem:
@@ -332,13 +351,12 @@ class ArchiveStore:
             with self._database(shared=True) as db:
                 generation = self._generation(db)
                 if self._ready(db, generation):
-                    return {"generation": generation, "uploaded": 0, "pending": 0, "ready": True,
-                            "manifest_sha256": get_meta(db, "archive_manifest_sha256")}
+                    return self._sync_status(db, generation=generation, ready=True, manifest_sha=get_meta(db, "archive_manifest_sha256"))
                 rows = db.execute("SELECT path,sha256,size FROM public_artifacts WHERE " + PENDING + " ORDER BY path LIMIT ?",
                                   (MAX_UPLOADS_PER_RUN,)).fetchall()
                 selected, total = [], 0
                 for row in map(dict, rows):
-                    if type(row["size"]) is not int or not 0 <= row["size"] <= MAX_OBJECT_BYTES:
+                    if not _valid_size(row["size"]):
                         raise ValueError("Public archive object exceeds its size limit")
                     if total + row["size"] > MAX_UPLOAD_BYTES_PER_RUN:
                         break
@@ -354,10 +372,7 @@ class ArchiveStore:
                 self._uploaded += 1
             manifest_sha = self._prepare_manifest(generation, snapshot)
         with self._database(shared=True) as db:
-            pending = self._pending(db)
-            ready = bool(manifest_sha) and pending == 0 and self._generation(db) == generation
-        return {"generation": generation, "uploaded": self._uploaded, "pending": pending, "ready": ready,
-                "manifest_sha256": manifest_sha}
+            return self._sync_status(db, generation=generation, ready=bool(manifest_sha) and self._same_generation(db, generation), manifest_sha=manifest_sha)
 
     def sync(self):
         """Upload pending public article objects and refresh the generation manifest within the time budget."""
@@ -367,8 +382,7 @@ class ArchiveStore:
                 return self._sync()
         except ArchiveBudgetReached:
             with self._database(shared=True) as db:
-                return {"generation": self._generation(db), "pending": self._pending(db), "uploaded": self._uploaded,
-                        "ready": False, "manifest_sha256": None, "budget_reached": True}
+                return self._sync_status(db, budget_reached=True)
 
     def snapshot(self, destination, generation):
         """Copy this generation's hot files into destination and return the full publication manifest."""
@@ -383,6 +397,5 @@ class ArchiveStore:
                 elif not ARTICLE.fullmatch(row["path"]):
                     continue
                 manifest[row["path"]] = row["sha256"]
-        if missing := public_files() - manifest.keys():
-            raise ValueError("Missing required public file: " + min(missing))
+        require_public_files(manifest)
         return manifest
