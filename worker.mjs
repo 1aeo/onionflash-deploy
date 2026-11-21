@@ -43,27 +43,22 @@ async function sha256(bytes) {
 
 async function originRequest(url, method, consume) {
   for (let attempt = 0; attempt < ATTEMPTS; attempt++) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
     let response;
     try {
       response = await fetch(url, {
-        method, redirect: "manual", signal: controller.signal,
+        method, redirect: "manual", signal: AbortSignal.timeout(TIMEOUT_MS),
         headers: { "Accept-Encoding": "identity" },
-        cf: { cacheEverything: true, cacheTtlByStatus: { "200-299": OBJECT_TTL, "403-404": 0, "500-599": 0 } },
+        cf: { cacheEverything: true, cacheTtlByStatus: { "200-299": OBJECT_TTL, "300-599": -1 } },
       });
       if (response.status !== 429 && response.status < 500) return await consume(response);
       await response.body?.cancel();
     } catch (failure) {
       if (attempt + 1 === ATTEMPTS) throw failure;
-    } finally {
-      clearTimeout(timer);
     }
-    if (attempt + 1 < ATTEMPTS) {
-      const retryAfter = Number(response?.headers.get("retry-after"));
-      const wait = Math.min(BACKOFF_CAP_MS, Math.max(BACKOFF_MS * 2 ** attempt, Number.isFinite(retryAfter) ? retryAfter * 1000 : 0));
-      if (wait) await new Promise(resolve => setTimeout(resolve, wait));
-    }
+    if (attempt + 1 === ATTEMPTS) break;
+    const retryAfter = Number(response?.headers.get("retry-after"));
+    const wait = Math.min(BACKOFF_CAP_MS, Math.max(BACKOFF_MS * 2 ** attempt, Number.isFinite(retryAfter) ? retryAfter * 1000 : 0));
+    if (wait) await new Promise(resolve => setTimeout(resolve, wait));
   }
   throw new Error("Archive request failed");
 }
@@ -132,7 +127,7 @@ async function archived(request, env, key) {
     return new Response(null, { status: 304, headers });
   }
   return originRequest(new URL(entry.key, origin), request.method, async res => {
-    if (!res.ok || Number(res.headers.get("content-length")) !== entry.size || res.headers.get("x-amz-meta-sha256") !== entry.sha256) {
+    if (!res.ok || res.headers.get("content-length") !== String(entry.size) || res.headers.get("x-amz-meta-sha256") !== entry.sha256) {
       await res.body?.cancel();
       return error(res.status === 403 || res.status === 404 ? 404 : 503);
     }

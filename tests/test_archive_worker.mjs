@@ -18,17 +18,12 @@ test("article permalinks resolve immutable gzipped manifest objects in 1 manifes
       assert.equal(response.headers.get("etag"), `"${state.entries[key].sha256}"`);
       assert.equal(response.headers.get("set-cookie"), null);
       assert.equal(response.headers.get("x-content-type-options"), "nosniff");
-      assert.match(response.headers.get("content-security-policy"), /script-src 'none'/);
+      const csp = response.headers.get("content-security-policy");
+      assert.match(csp, /script-src 'none'/);
+      if (key.endsWith(".html")) assert.match(csp, /connect-src 'none'.*style-src 'self'|style-src 'self'.*connect-src 'none'/);
+      else assert.doesNotMatch(csp, /style-src|unsafe-inline/);
       assert.equal(state.calls.length, expectedCalls);
     }
-    assert.match(
-      (await worker.fetch(new Request("https://example.com/onionflash/news/a/"), state.env)).headers.get("content-security-policy"),
-      /connect-src 'none'.*style-src 'self'|style-src 'self'.*connect-src 'none'/,
-    );
-    assert.doesNotMatch(
-      (await worker.fetch(new Request("https://example.com/onionflash/news/a/story.json"), state.env)).headers.get("content-security-policy"),
-      /style-src|unsafe-inline/,
-    );
     assert.equal(state.assetCalls.length, 0);
     assert.ok(state.calls.every(call => call.url.startsWith(ORIGIN) && !call.url.includes("?")));
   });
@@ -166,6 +161,48 @@ test("rolled-back manifests keep historical articles and tampered objects are ne
         if (!String(input).includes("/objects/")) return state.respond(input, options);
         const headers = { "content-length": length, ...(metadata ? { "x-amz-meta-sha256": metadata } : {}) };
         return new Response(method === "HEAD" ? null : body, { headers });
+      });
+    }
+  }
+});
+
+test("zero-byte objects require explicit Content-Length, non-decimal lengths fail, and 3xx-5xx bypass edge cache", async () => {
+  const empty = archiveFixture({ "news/a/story.json": "" });
+  const emptySha = empty.entries["news/a/story.json"].sha256;
+  await withOrigin(empty, async () => {
+    for (const method of ["GET", "HEAD"]) {
+      const ok = await worker.fetch(new Request("https://example.com/onionflash/news/a/story.json", { method }), empty.env);
+      assert.equal(ok.status, 200);
+      assert.equal(ok.headers.get("content-length"), "0");
+    }
+    for (const call of empty.calls) {
+      assert.deepEqual(call.options.cf.cacheTtlByStatus, { "200-299": 31536000, "300-599": -1 });
+    }
+  });
+  for (const badHeader of [null, "", "   "]) {
+    for (const method of ["GET", "HEAD"]) {
+      await withOrigin(empty, async () => {
+        const res = await worker.fetch(new Request("https://example.com/onionflash/news/a/story.json", { method }), empty.env);
+        assert.equal(res.status, 503);
+      }, (input, options) => {
+        if (!String(input).includes("/objects/")) return empty.respond(input, options);
+        const headers = { "x-amz-meta-sha256": emptySha, ...(badHeader === null ? {} : { "content-length": badHeader }) };
+        return new Response(method === "HEAD" ? null : "unexpected", { headers });
+      });
+    }
+  }
+  const four = archiveFixture({ "news/a/story.json": "test" });
+  const fourSha = four.entries["news/a/story.json"].sha256;
+  for (const badLength of ["0x04", "04", "+4", "4.0"]) {
+    for (const method of ["GET", "HEAD"]) {
+      await withOrigin(four, async () => {
+        const res = await worker.fetch(new Request("https://example.com/onionflash/news/a/story.json", { method }), four.env);
+        assert.equal(res.status, 503);
+      }, (input, options) => {
+        if (!String(input).includes("/objects/")) return four.respond(input, options);
+        return new Response(method === "HEAD" ? null : "test", {
+          headers: { "content-length": badLength, "x-amz-meta-sha256": fourSha },
+        });
       });
     }
   }

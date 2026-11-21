@@ -1,7 +1,6 @@
 """Cold private evidence stays recoverable before any hot data is compacted."""
-from contextlib import closing, contextmanager
 from datetime import datetime, timezone
-import gzip, hashlib, json, sqlite3, time, unittest
+import gzip, hashlib, json, time, unittest
 from unittest.mock import patch
 
 from botocore.exceptions import EndpointConnectionError
@@ -18,29 +17,25 @@ RECENT = "2026-11-09T12:00:00Z"
 
 
 class RetentionTests(DeployTestCase):
+    """Tests for verified private evidence archiving and local SQLite row compaction."""
+
     def setUp(self):
+        """Initialize a symlinked state directory, retention-enabled archive, and baseline story."""
         super().setUp()
         self.p.state.rename(self.directory / "disk")
         self.p.state.symlink_to(self.directory / "disk")
-        self.p.cfg["archive"]["enabled"] = self.p.cfg["retention"]["enabled"] = True
-        self.s3 = FakeS3()
-        self.p._archive = ArchiveStore(self.p, client=self.s3)
-        self.p.delay = lambda attempt: None
-        self.exposure = None
-        exposure = patch.object(self.p, "unsigned_read_problem", side_effect=lambda *request: self.exposure)
-        exposure.start()
-        self.addCleanup(exposure.stop)
-        with Store(self.p.database) as store, store.db:
-            store.db.execute("INSERT INTO stories(id,cluster_key,payload,published_at,updated_at) VALUES(?,?,?,?,?)",
-                             ("story", "story", "public story must remain", OLD, OLD))
+        self.enable_archive(retention=True)
+        with Store(self.p.database):
+            pass
+        self.story("story", "public story must remain")
 
-    @contextmanager
-    def db(self):
-        with closing(sqlite3.connect(self.p.database)) as db, db:
-            db.row_factory = sqlite3.Row
-            yield db
+    def story(self, story_id, payload="{}", stamp=OLD):
+        """Insert a published story row into the test database."""
+        with self.db() as db:
+            db.execute("INSERT INTO stories(id,cluster_key,payload,published_at,updated_at) VALUES(?,?,?,?,?)", (story_id, story_id, payload, stamp, stamp))
 
     def item(self, identity="item", *, status="ignored", date=OLD, content="private body", story=None, **fields):
+        """Insert a collected source item row and return its decoded payload dictionary."""
         payload = {"title": "Source title", "content": content, "kind": "metrics_timeline", "updated_at": date,
                    "url": "https://example.org/" + identity, **fields}
         with self.db() as db:
@@ -51,27 +46,33 @@ class RetentionTests(DeployTestCase):
             )
         return payload
 
-    def analysis(self, key="cache", date=OLD, source_item_id="item"):
+    def analysis(self, key="cache", date=OLD, source_item_id="item", result='{"evidence":["private quote"]}'):
+        """Insert a cached editorial analysis row into the test database."""
         with self.db() as db:
             db.execute("INSERT INTO analyses(cache_key,result,created_at,source_payload,source_item_id) VALUES(?,?,?,?,?)",
-                       (key, '{"evidence":["private quote"]}', date, '{"content":"collected source snapshot"}', source_item_id))
+                       (key, result, date, '{"content":"collected source snapshot"}', source_item_id))
 
     def rows(self, table):
+        """Return all rows from table as plain dictionaries."""
         with self.db() as db:
             return [dict(row) for row in db.execute("SELECT * FROM " + table)]
 
     def hot(self, identity):
+        """Return True when item identity still retains its uncompacted content field."""
         with self.db() as db:
             return "content" in json.loads(db.execute("SELECT payload FROM items WHERE id=?", (identity,)).fetchone()[0])
 
     def sweep(self):
+        """Run one retention archive_evidence pass at timestamp NOW."""
         return retention.archive_evidence(self.p.archive, NOW)
 
     def run_cycle(self):
+        """Run one publisher cycle with collection and publication stubbed out."""
         with patch.object(self.p, "application", return_value="{}"), patch.object(self.p, "publish"):
             return self.p.run_cycle()
 
     def test_only_old_ignored_unreferenced_items_and_unpinned_analyses_compact(self):
+        """Compact only cold, ignored, unreferenced items and unpinned analyses after upload."""
         payload = self.item()
         self.item("published", status="published", story="story")
         self.item("story-source", story="story")
@@ -83,9 +84,7 @@ class RetentionTests(DeployTestCase):
         for key, src in [("keep-pub", "published"), ("keep-src", "story-source"), ("keep-pend", "pending"),
                          ("keep-held", "held"), ("keep-story-pin", None)]:
             self.analysis(key, source_item_id=src)
-        with self.db() as db:
-            db.execute("INSERT INTO stories(id,cluster_key,payload,published_at,updated_at) VALUES(?,?,?,?,?)",
-                       ("pinned", "pinned", '{"editorial_analysis_key":"keep-story-pin"}', OLD, OLD))
+        self.story("pinned", '{"editorial_analysis_key":"keep-story-pin"}')
         before_item = next(row for row in self.rows("items") if row["id"] == "item")
         before_analysis = next(row for row in self.rows("analyses") if row["cache_key"] == "cache")
         result = self.sweep()
@@ -101,6 +100,7 @@ class RetentionTests(DeployTestCase):
         self.assertEqual(len(self.s3.puts), 1)
 
     def test_unverified_or_readable_bundle_never_compacts(self):
+        """Keep local rows intact when private bundle upload, verification, or privacy checks fail."""
         self.item()
         self.analysis()
         before = self.rows("items"), self.rows("analyses")
@@ -117,9 +117,13 @@ class RetentionTests(DeployTestCase):
                     self.sweep()
                 self.assertEqual((self.rows("items"), self.rows("analyses")), before)
                 self.assertEqual(self.rows("private_archive_refs"), [])
-        self.assertEqual(s3.objects, {})
+                self.assertEqual(s3.objects, {})
+        s3.on_put = None
+        self.exposure = None
+        self.assertEqual(self.sweep()["records_archived"], 2)
 
     def test_concurrent_mutations_and_corruption_during_upload_preserve_rows(self):
+        """Preserve rows mutated or corrupted concurrently while a retention upload is in flight."""
         self.item()
         self.analysis()
         self.item("race-item")
@@ -128,6 +132,7 @@ class RetentionTests(DeployTestCase):
         self.item("healthy-item", content="healthy item body")
 
         def concurrent(key):
+            """Mutate in-flight candidate rows during FakeS3 put_object."""
             with self.db() as db:
                 db.execute("UPDATE items SET status='pending' WHERE id='item'")
                 db.execute("UPDATE analyses SET result='new analysis' WHERE cache_key='cache'")
@@ -144,6 +149,7 @@ class RetentionTests(DeployTestCase):
         self.assertEqual({r["record_id"] for r in self.rows("private_archive_refs")}, {"healthy-item"})
 
     def test_damaged_rows_are_skipped_without_payload_leaks_and_pinned_analyses_skip_decode(self):
+        """Skip malformed rows without logging private payloads and avoid decoding pinned analyses."""
         for identity, damage in {
             "broken": "'{'", "infinity": "replace(payload,'\"Source title\"','Infinity')",
             "array": "'[1]'", "blob": "CAST(payload AS BLOB)", "bytes": "replace(payload,'Source',x'eda080')",
@@ -154,13 +160,11 @@ class RetentionTests(DeployTestCase):
                 db.execute("UPDATE items SET payload=" + damage + " WHERE id=?", (identity,))
         self.item("clean-item")
         self.analysis("clean-cache", source_item_id="clean-item")
+        self.story("pin-story", '{"editorial_analysis_key":"pinned-bad-utf8"}')
+        for key, res in [("bad-utf8", '{"secret":"sensitive text"}'), ("pinned-bad-utf8", '{"secret":"pinned"}'),
+                         ("bad-blob", b"raw-blob-secret"), ("bad-nan", '{"ok":true}')]:
+            self.analysis(key, source_item_id=None, result=res)
         with self.db() as db:
-            db.execute("INSERT INTO stories(id,cluster_key,payload,published_at,updated_at) VALUES(?,?,?,?,?)",
-                       ("pin-story", "pin-story", '{"editorial_analysis_key":"pinned-bad-utf8"}', OLD, OLD))
-            for key, res in [("bad-utf8", '{"secret":"sensitive text"}'), ("pinned-bad-utf8", '{"secret":"pinned"}'),
-                             ("bad-blob", b"raw-blob-secret"), ("bad-nan", '{"ok":true}')]:
-                db.execute("INSERT INTO analyses(cache_key,result,created_at,source_payload,source_item_id) VALUES(?,?,?,?,?)",
-                           (key, res, OLD, '{"content":"private"}', None))
             db.execute("UPDATE analyses SET result=replace(result,'secret',x'eda080') WHERE cache_key IN ('bad-utf8','pinned-bad-utf8')")
             db.execute("ALTER TABLE analyses ADD COLUMN score REAL")
             db.execute("UPDATE analyses SET score=1e999 WHERE cache_key='bad-nan'")
@@ -174,6 +178,7 @@ class RetentionTests(DeployTestCase):
             self.assertNotIn(secret, joined)
 
     def test_revisions_bucket_changes_batch_limits_and_schedule_intervals(self):
+        """Track per-bundle destinations across bucket changes, batch size limits, and intervals."""
         self.item("old-item")
         self.analysis("old-analysis", source_item_id="old-item")
         first = self.sweep()
@@ -193,6 +198,7 @@ class RetentionTests(DeployTestCase):
         self.item("a")
         self.item("large", content="x" * 10000)
         def run():
+            """Execute one retention cycle and return the persisted retention.json marker."""
             self.assertEqual(self.run_cycle()["phases"]["retention"], "ok")
             return publish.read_json(self.p.state / "retention.json")
         with patch.object(retention, "MAX_BUNDLE_BYTES", 2048):
@@ -208,6 +214,20 @@ class RetentionTests(DeployTestCase):
         self.p.cfg["retention"]["enabled"] = False
         self.assertNotIn("retention", self.run_cycle()["phases"])
         self.assertTrue(self.hot("disabled-item"))
+
+    def test_retention_budget_expiry_still_deletes_exposed_private_bundle(self):
+        """Delete an exposed private evidence bundle even when the retention budget expires."""
+        import archive_store
+        self.item()
+        self.analysis()
+        clock = [0.0]
+        with patch.object(archive_store.time, "monotonic", lambda: clock[0]), \
+                patch.object(self.p, "unsigned_read_problem", side_effect=lambda *req: clock.__setitem__(0, 1e9) or "was publicly readable"), \
+                self.assertRaisesRegex(ValueError, "publicly readable"):
+            self.p.retain_private_history()
+        self.assertEqual(len(self.s3.deleted), 1)
+        self.assertEqual(self.s3.objects, {})
+        self.assertTrue(self.hot("item"))
 
 
 if __name__ == "__main__":
